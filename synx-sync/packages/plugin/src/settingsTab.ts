@@ -16,6 +16,7 @@ export class SynxSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     const settings = this.plugin.settings;
     containerEl.empty();
+    containerEl.addClass('synx-settings');
     this.renderServer(containerEl, settings);
     this.renderAccount(containerEl, settings);
     if (settings.jwt) this.renderStorage(containerEl, settings);
