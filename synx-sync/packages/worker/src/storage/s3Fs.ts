@@ -57,7 +57,7 @@ export class S3Fs implements WorkerFs {
     let continuationToken: string | undefined;
     do {
       const token = continuationToken ? `&continuation-token=${encodeURIComponent(continuationToken)}` : '';
-      const url = `${this.base}?list-type=2&prefix=${encodeURIComponent(prefix)}${token}`;
+      const url = `${this.base}?list-type=2&prefix=${encodeS3Prefix(prefix)}${token}`;
       const res = await this.client.fetch(url, { method: 'GET' });
       if (!res.ok) throw new Error(`s3 list failed (${res.status})`);
       const xml = await res.text();
@@ -97,6 +97,20 @@ export class S3Fs implements WorkerFs {
 
 function escapeXml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+/**
+ * S3 ListObjectsV2 的 prefix 查询参数编码。
+ *
+ * 对象操作（put/get/head）把 key 原样放进 URL path，aws4fetch 对其中已有的合法
+ * `%XX` 序列不再二次编码；S3 服务端对 path 解码一次后得到原始 key。
+ * list 若直接对 prefix 做 encodeURIComponent，会把 prefix 里已有的 `%XX` 二次编码
+ * 成 `%25XX`，S3 服务端解码一次后仍是 `%XX`（未还原），与对象 key（已还原）不匹配，
+ * 导致元数据 List 不到、getVersion 抛 "no current"。这里把 `%25XX` 还原为 `%XX`，
+ * 使 prefix 与对象 key 采用同一种编码，服务端解码后两侧一致。
+ */
+function encodeS3Prefix(prefix: string): string {
+  return encodeURIComponent(prefix).replace(/%25[0-9A-Fa-f]{2}/g, (m) => `%${m.slice(3)}`);
 }
 
 function parseListValues(xml: string, tag: string): string[] {
