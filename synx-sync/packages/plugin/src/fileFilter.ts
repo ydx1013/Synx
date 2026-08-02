@@ -9,8 +9,9 @@ export function evaluateFile(path: string, size: number, settings: FilterSetting
   if (matchesGlob(normalized, '.trash/**')) return skipped('回收站路径不参与同步', '.trash/**', size);
   if (matchesGlob(normalized, '.synx-ignore/**') || normalized === '.synx-ignore') return skipped('Synx 忽略标记路径', '.synx-ignore/**', size);
   if (matchesGlob(normalized, '.synx-conflicts/**') || normalized === '.synx-conflicts') return skipped('Synx 冲突副本不参与同步', '.synx-conflicts/**', size);
-  // workspace / workspace.json 是设备工作区状态，同步会互相覆盖
-  if (normalized === '.obsidian/workspace' || normalized === '.obsidian/workspace.json') {
+  // workspace / workspace.json / workspace-mobile.json 是设备工作区状态（打开的标签页/布局），
+  // 每台设备各自维护且高频变化，同步会互相覆盖并造成 pull/push 抖动，不参与同步。
+  if (normalized === '.obsidian/workspace' || normalized === '.obsidian/workspace.json' || normalized === '.obsidian/workspace-mobile.json') {
     return skipped('工作区状态不参与同步', '.obsidian/workspace*', size);
   }
   // synx 运行时状态文件（reports/pendingDeletions 等），永不同步
@@ -22,10 +23,17 @@ export function evaluateFile(path: string, size: number, settings: FilterSetting
   if (normalized === '.obsidian/plugins/synx-sync/data.json') {
     return skipped('Synx 自身配置不参与同步（每设备独立）', 'synx-sync/data.json', size);
   }
+  // synx 插件自身的 main.js/manifest.json/styles.css 也不参与同步：
+  // 各设备通过 BRAT/插件市场各自管理 synx 版本，若被同步，iPad 上运行的 synx 插件
+  // 会因 main.js 被覆盖而被 Obsidian 重新加载，读到写一半的文件 → 插件打不开。
+  if (normalized.startsWith('.obsidian/plugins/synx-sync/')) {
+    return skipped('Synx 自身插件文件不参与同步', 'synx-sync/**', size);
+  }
   // 诊断日志写在 vault 根目录（iOS 上只显示 .md 文件，必须用 .md 后缀），
-  // 该文件必须被排除，否则会被同步到远端。旧版 .log 同名文件也一并排除。
-  if (normalized === 'synx-debug.md' || normalized === 'synx-debug.log') {
-    return skipped('Synx 诊断日志不参与同步', 'synx-debug.*', size);
+  // 该文件必须被排除，否则会被同步到远端。
+  // 文件名带设备名（synx-debug-<device>.md），旧版固定名 synx-debug.md / .log 也一并排除。
+  if (normalized === 'synx-debug.md' || normalized === 'synx-debug.log' || normalized.startsWith('synx-debug-')) {
+    return skipped('Synx 诊断日志不参与同步', 'synx-debug*', size);
   }
   if (!settings.syncConfigDir && (normalized === '.obsidian' || matchesGlob(normalized, '.obsidian/**'))) return skipped('配置目录同步已关闭', '.obsidian/**', size);
   if (!settings.syncUnderscorePaths && normalized.split('/').some((segment) => segment.startsWith('_'))) return skipped('下划线路径同步已关闭', '_*', size);

@@ -27,10 +27,12 @@ describe('evaluateFile', () => {
     // synx-state.json 永不同步
     expect(evaluateFile('.obsidian/plugins/synx-sync/synx-state.json', 1, base)).toMatchObject({ sync: false, rule: 'synx-state.json' });
     // 诊断日志写在 vault 根目录（iOS 可见，必须 .md 后缀），同样必须排除，避免同步到远端
-    expect(evaluateFile('synx-debug.md', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug.*' });
+    expect(evaluateFile('synx-debug.md', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug*' });
     expect(evaluateFile('synx-debug.md', 1, { ...base, syncConfigDir: true })).toMatchObject({ sync: false });
     // 旧版 .log 后缀也排除（v0.1.8 曾写入 synx-debug.log）
-    expect(evaluateFile('synx-debug.log', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug.*' });
+    expect(evaluateFile('synx-debug.log', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug*' });
+    // v0.1.13+ 文件名带设备名（synx-debug-<device>.md），同样排除
+    expect(evaluateFile('synx-debug-obsidian-k9kpib.md', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug*' });
   });
 
   it('always skips .obsidian/workspace and workspace.json regardless of syncConfigDir', () => {
@@ -38,9 +40,12 @@ describe('evaluateFile', () => {
     const settings = { ...base, syncConfigDir: true };
     expect(evaluateFile('.obsidian/workspace', 1, settings)).toMatchObject({ sync: false, rule: '.obsidian/workspace*' });
     expect(evaluateFile('.obsidian/workspace.json', 1, settings)).toMatchObject({ sync: false, rule: '.obsidian/workspace*' });
+    expect(evaluateFile('.obsidian/workspace-mobile.json', 1, settings)).toMatchObject({ sync: false, rule: '.obsidian/workspace*' });
     // 其他 .obsidian 配置文件应正常通过
     expect(evaluateFile('.obsidian/app.json', 1, settings)).toEqual({ sync: true });
-    expect(evaluateFile('.obsidian/plugins/synx-sync/main.js', 1, settings)).toEqual({ sync: true });
+    // synx 插件自身目录整体排除（main.js 被同步会让运行中的插件被覆盖重载而打不开）
+    expect(evaluateFile('.obsidian/plugins/synx-sync/main.js', 1, settings)).toMatchObject({ sync: false, rule: 'synx-sync/**' });
+    expect(evaluateFile('.obsidian/plugins/synx-sync/manifest.json', 1, settings)).toMatchObject({ sync: false, rule: 'synx-sync/**' });
   });
 
   it('skips oversized files and reports size before content is read', () => {

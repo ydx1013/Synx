@@ -49,8 +49,10 @@ const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
 // .obsidian 同步诊断日志：每次同步后写入 vault 根目录。
 // 注意：必须写成 .md 后缀——iOS 文件 App / Obsidian 内只显示 .md 文件，
 // .log 等附件后缀在移动端不可见（实测 iOS 只能看到 .md）。
+// 文件名带设备名，避免两端同写 synx-debug.md 互相覆盖、看不出是谁写的。
 // 该文件在 fileFilter 中被排除，不会被同步到远端。
-const OBS_DEBUG_FILE = 'synx-debug.md';
+// 说明：早期版本用固定名 synx-debug.md，现在用 getter 动态生成带设备名的文件名。
+const OBS_DEBUG_FILE = 'synx-debug.md'; // 兼容旧版本号（用于事件忽略判断）
 
 // #region debug-point Z:helper
 // 之前版本把日志 POST 到 http://127.0.0.1:7777/event（本地调试服务器），
@@ -101,7 +103,7 @@ export default class SynxSyncPlugin extends Plugin {
       this.registerEvent(this.app.vault.on(event as 'rename', (file) => {
         // 诊断日志写入 vault 根目录会触发 modify/create 事件，
         // 必须忽略，否则每次同步写日志 → 触发同步 → 再写日志，无限循环
-        if (file?.path === OBS_DEBUG_FILE) return;
+        if (file?.path && (file.path === OBS_DEBUG_FILE || file.path.startsWith('synx-debug-'))) return;
         // #region debug-point A:vault-event
         dbg('A', 'main.ts:onload', `${event} vault event`, {
           path: file?.path ?? null,
@@ -285,7 +287,7 @@ export default class SynxSyncPlugin extends Plugin {
   private async onLocalDelete(file: TAbstractFile): Promise<void> {
     if (this.internalDeletes.delete(file.path)) return;
     // 诊断日志删除不触发同步
-    if (file.path === OBS_DEBUG_FILE) return;
+    if (file.path === OBS_DEBUG_FILE || file.path.startsWith('synx-debug-')) return;
     const storageId = this.settings.storageId;
     if (!(file instanceof TFile) || !storageId || !this.settings.syncFolder) {
       this.scheduler.notifySave();
@@ -869,6 +871,11 @@ export default class SynxSyncPlugin extends Plugin {
    * 本地/远端 .obsidian 文件数、被过滤的文件及原因、计划动作分布、执行失败项。
    * 文件位于插件目录，不会被同步到远端。
    */
+  /** 带设备名的诊断文件名，如 synx-debug-obsidian-k9kpib.md（旧版固定 synx-debug.md 不再写入） */
+  private get obsDebugFile(): string {
+    return `synx-debug-${this.settings.deviceName}.md`;
+  }
+
   private async writeObsSyncDebug(
     localFiles: LocalFile[],
     localSkipped: ExecutableSyncAction[],
@@ -914,10 +921,10 @@ export default class SynxSyncPlugin extends Plugin {
         obsWriteBackMtimes: this.obsWriteBackMtimes,
       };
       await this.app.vault.adapter.write(
-        OBS_DEBUG_FILE,
+        this.obsDebugFile,
         `> [!note] Synx 同步诊断（.obsidian 配置目录）\n> 将本文件内容发给作者排查移动端看不到插件/主题的问题。\n\n\`\`\`json\n${JSON.stringify(diag, null, 2)}\n\`\`\`\n`,
       );
-      console.log('[synx] .obsidian 同步诊断已写入', OBS_DEBUG_FILE, diag);
+      console.log('[synx] .obsidian 同步诊断已写入', this.obsDebugFile, diag);
     } catch (error) {
       console.warn('[synx] 写 .obsidian 诊断日志失败', error instanceof Error ? error.message : String(error));
     }
