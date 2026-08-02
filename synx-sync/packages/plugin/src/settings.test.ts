@@ -105,4 +105,31 @@ describe('loadPluginSettings', () => {
     expect(loadPluginSettings({ massDeleteProtectPercent: 101 }, false).massDeleteProtectPercent).toBe(50);
     expect(loadPluginSettings({ massDeleteProtectPercent: 55.5 }, false).massDeleteProtectPercent).toBe(50);
   });
+
+  it('defaults retention policy to hourly 60 / daily 24 / monthly 30 / yearly 3', () => {
+    const settings = loadPluginSettings({}, false);
+    expect(settings.retention.hourlyWindowHours).toBe(60);
+    expect(settings.retention.dailyWindowDays).toBe(24);
+    expect(settings.retention.monthlyWindowMonths).toBe(30);
+    expect(settings.retention.yearlyWindowYears).toBe(3);
+    expect(settings.retention.maxVersionsPerFile).toBe(1000);
+  });
+
+  it('loads a custom retention policy', () => {
+    const settings = loadPluginSettings({
+      retention: { hourlyWindowHours: 12, dailyWindowDays: 7, monthlyWindowMonths: 2, yearlyWindowYears: 1, maxVersionsPerFile: 50 },
+    }, false);
+    expect(settings.retention.hourlyWindowHours).toBe(12);
+    expect(settings.retention.dailyWindowDays).toBe(7);
+    expect(settings.retention.maxVersionsPerFile).toBe(50);
+  });
+
+  it('falls back to defaults for invalid retention fields', () => {
+    const settings = loadPluginSettings({
+      retention: { hourlyWindowHours: -3, dailyWindowDays: 7.5, monthlyWindowMonths: 'x' },
+    }, false);
+    expect(settings.retention.hourlyWindowHours).toBe(60);
+    expect(settings.retention.dailyWindowDays).toBe(7); // 7.5 向下取整为 7
+    expect(settings.retention.monthlyWindowMonths).toBe(30);
+  });
 });

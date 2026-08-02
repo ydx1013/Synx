@@ -1,4 +1,4 @@
-import type { StorageSummary } from '@synx/shared';
+import type { RetentionPolicy, StorageSummary } from '@synx/shared';
 
 export type ConflictStrategy = 'newer-with-copy' | 'keep-local' | 'keep-remote' | 'pause';
 
@@ -32,6 +32,8 @@ export interface SynxPluginSettings {
   massDeleteProtectPercent: number;
   /** 仅当打开此开关时，骤降保护下才真正执行 delete-remote；否则一律转 pull */
   allowBatchRemoteDelete: boolean;
+  /** 版本保留策略（按 storage 独立存储于远端） */
+  retention: RetentionPolicy;
 }
 
 export const SYNX_LOGIN_URL = 'https://synx.yueyang.eu.org/login';
@@ -65,6 +67,14 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   showMarkdownUuid: false,
   massDeleteProtectPercent: 50,
   allowBatchRemoteDelete: false,
+  retention: {
+    maxFileSize: 20 * 1024 * 1024,
+    hourlyWindowHours: 60,
+    dailyWindowDays: 24,
+    monthlyWindowMonths: 30,
+    yearlyWindowYears: 3,
+    maxVersionsPerFile: 1000,
+  },
 };
 
 const conflictStrategies = new Set<ConflictStrategy>(['newer-with-copy', 'keep-local', 'keep-remote', 'pause']);
@@ -103,6 +113,24 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     showMarkdownUuid: booleanValue(source.showMarkdownUuid, defaults.showMarkdownUuid),
     massDeleteProtectPercent: validPercentage(source.massDeleteProtectPercent) ? source.massDeleteProtectPercent : defaults.massDeleteProtectPercent,
     allowBatchRemoteDelete: booleanValue(source.allowBatchRemoteDelete, defaults.allowBatchRemoteDelete),
+    retention: normalizeRetention(source.retention, defaults.retention),
+  };
+}
+
+/** 校验并归一化保留策略：每层窗口取非负整数，非法字段回退默认 */
+function normalizeRetention(value: unknown, fallback: RetentionPolicy): RetentionPolicy {
+  const source = isRecord(value) ? value : {};
+  const num = (field: string): number => {
+    const n = source[field];
+    return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback[field as keyof RetentionPolicy] as number;
+  };
+  return {
+    maxFileSize: num('maxFileSize'),
+    hourlyWindowHours: num('hourlyWindowHours'),
+    dailyWindowDays: num('dailyWindowDays'),
+    monthlyWindowMonths: num('monthlyWindowMonths'),
+    yearlyWindowYears: num('yearlyWindowYears'),
+    maxVersionsPerFile: num('maxVersionsPerFile'),
   };
 }
 

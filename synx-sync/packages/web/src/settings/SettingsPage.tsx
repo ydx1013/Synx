@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Check, Cloud, LogOut, Pencil, Plus, Settings, Trash2 } from 'lucide-react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { authApi, storageApi } from '../api/queries';
 import { useAuth } from '../auth/AuthProvider';
 import { Dialog } from '../components/Dialog';
@@ -18,7 +18,7 @@ export function SettingsLayout() {
 }
 
 function SettingsContent() {
-  const path = location.pathname;
+  const path = useLocation().pathname;
   if (path === '/settings/storage/new' || /^\/settings\/storage\/[^/]+$/.test(path)) return <StorageForm />;
   if (path === '/settings/storage') return <StorageList />;
   return <GeneralSettings />;
@@ -78,7 +78,7 @@ function StorageForm() {
     try { await storageApi.save(storageId, storageId ? { name: data.name.trim(), config } : { name: data.name.trim(), type: 'webdav', config }); navigate('/settings/storage'); }
     catch (error) { setStatus(error instanceof Error ? error.message : '保存失败'); }
   }
-  async function test(event: FormEvent<HTMLFormElement>) { const data = Object.fromEntries(new FormData(event.currentTarget)) as Record<string, string>; try { await storageApi.test({ type: 'webdav', config: { address: data.address, username: data.username, password: data.password, authType: 'basic', remoteBaseDir: data.remoteBaseDir, customHeaders: data.customHeaders }, storageId }); setStatus('连接测试成功'); } catch (error) { setStatus(error instanceof Error ? error.message : '连接失败'); } }
+  async function test(form: HTMLFormElement) { const data = Object.fromEntries(new FormData(form)) as Record<string, string>; try { await storageApi.test({ type: 'webdav', config: { address: data.address, username: data.username, password: data.password, authType: 'basic', remoteBaseDir: data.remoteBaseDir, customHeaders: data.customHeaders }, storageId }); setStatus('连接测试成功'); } catch (error) { setStatus(error instanceof Error ? error.message : '连接失败'); } }
   const values = storage.data?.storage;
   return <main className="settings-content narrow"><header className="settings-heading"><Link className="back-link" to="/settings/storage"><ArrowLeft size={16} />存储管理</Link><h1>{storageId ? '编辑 WebDAV' : '添加 WebDAV'}</h1><p>凭证会加密保存，文件内容仍存储在你的 WebDAV。</p></header>
     <form className="settings-form storage-form" key={values?.id ?? 'new'} onSubmit={submit} onReset={event => { event.preventDefault(); void test(event.currentTarget); }}>

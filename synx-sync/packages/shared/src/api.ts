@@ -22,6 +22,7 @@ export const API = {
   storageTest: '/api/storage/test',
   storageDelete: '/api/storage/:id',
   storagePurge: '/api/storage/:id/purge',
+  storageRetention: '/api/storage/:id/retention',
   // 同步
   put: '/api/put',
   get: '/api/get',
@@ -81,6 +82,12 @@ export interface StorageSummary extends Omit<Storage, 'config'> {
 export interface StorageListResponse {
   storages: StorageSummary[];
 }
+
+export interface RetentionPolicyResponse {
+  policy: RetentionPolicy;
+}
+
+export interface UpdateRetentionPolicyRequest extends Partial<RetentionPolicy> {}
 
 // ===== 同步 API =====
 

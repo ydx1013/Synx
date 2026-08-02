@@ -187,7 +187,20 @@ export default class SynxSyncPlugin extends Plugin {
 
   async onStorageChanged(): Promise<void> {
     this.rebuildClient();
+    await this.syncRetentionFromRemote();
     await this.triggerSync();
+  }
+
+  /** 从远端拉取当前 storage 的版本保留策略（远端为权威，覆盖本地显示） */
+  async syncRetentionFromRemote(): Promise<void> {
+    if (!this.client || !this.settings.storageId) return;
+    try {
+      const policy = await this.client.getRetentionPolicy();
+      this.settings.retention = policy;
+      await this.persist();
+    } catch (error) {
+      console.warn('synx: failed to fetch remote retention policy', error);
+    }
   }
 
   async triggerSync(): Promise<void> {
@@ -375,9 +388,9 @@ export default class SynxSyncPlugin extends Plugin {
         });
       }
       if (guardedDeletes > 0) {
-        console.warn('synx: mass local deletion detected, protected remote files from delete', { local: files.length, prevSync: prevSyncMap.size, guarded: guardedDeletes, protectPercent });
+        console.warn('synx: mass local deletion detected, protected remote files from delete', { local: files.length, prevSync: prevSyncMap?.size ?? 0, guarded: guardedDeletes, protectPercent });
         // #region debug-point B:mass-deletion-guard
-        dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount: prevSyncMap.size, guardedDeletes, protectPercent });
+        dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount: prevSyncMap?.size ?? 0, guardedDeletes, protectPercent });
         // #endregion
       }
       const actions: ExecutableSyncAction[] = [

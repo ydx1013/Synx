@@ -29,8 +29,8 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
     const request = route.request();
     const url = new URL(request.url());
     const pathname = url.pathname;
-    if (pathname === '/api/storage' && request.method() === 'GET') {
-      await route.fulfill({ json: { storages: [{ id: 's1', name: '演示', type: 'webdav' }] } });
+    if (pathname === '/api/auth/me' && request.method() === 'GET') {
+      await route.fulfill({ json: { user: { id: 'user-1', username: 'browser-user' }, preferences: { defaultStorageId: 's1', defaultSyncFolder: 'my-vault/' } } });
       return;
     }
     if (pathname === '/api/list' && request.method() === 'GET') {
@@ -56,13 +56,9 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
     await route.fulfill({ status: 404, json: { error: 'not found' } });
   });
 
-  await page.goto('/notes.html');
+  await page.goto('/notes');
 
-  // 加载存储与文件
-  await page.selectOption('#storage-select', 's1');
-  await page.fill('#sync-folder', 'my-vault/');
-  await page.click('#load-files');
-  await expect(page.locator('.tree-item')).toContainText(['全部笔记', '笔记']);
+  // 笔记列表加载（默认存储已设置为 s1）
   await expect(page.locator('.note-item')).toHaveCount(2);
 
   // 打开笔记 → 阅读模式渲染 Markdown
@@ -72,17 +68,17 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
   await expect(page.locator('.markdown-body pre code')).toContainText('const a = 1');
 
   // 切换编辑 → CodeMirror 出现并输入
-  await page.click('#toggle-mode');
+  await page.getByRole('button', { name: '编辑' }).click();
   await expect(page.locator('.cm-editor')).toBeVisible();
   await page.locator('.cm-content').click();
   await page.keyboard.press('End');
   await page.keyboard.insertText('\n补充内容');
   await expect(page.locator('.cm-content')).toContainText('补充内容');
-  await expect(page.locator('.status')).toContainText('未保存');
+  await expect(page.locator('.document-title')).toContainText('未保存');
 
   // 保存 → 携带 baseVersionId
-  await page.click('#save-note');
-  await expect(page.locator('.status')).toContainText('已保存');
+  await page.getByRole('button', { name: '保存' }).click();
+  await expect(page.locator('.document-title')).toContainText('已保存');
   expect(putBodies.length).toBeGreaterThan(0);
   const last = putBodies[putBodies.length - 1];
   expect(last.path).toBe('笔记/会议记录.md');
@@ -90,7 +86,7 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
   expect(last.baseVersionId).toBe('v1');
 
   // 历史面板
-  await page.click('#history-toggle');
-  await expect(page.locator('.version-list .version-item')).toHaveCount(2);
-  await expect(page.locator('.version-item.is-current')).toContainText('当前');
+  await page.getByRole('button', { name: '历史', exact: true }).click();
+  await expect(page.locator('.history-drawer li')).toHaveCount(2);
+  await expect(page.locator('.history-drawer .default-tag')).toContainText('当前');
 });

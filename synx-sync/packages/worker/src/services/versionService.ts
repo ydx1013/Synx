@@ -6,7 +6,7 @@ import {
   type WorkerFs,
 } from '@synx/shared';
 import type { Env } from '../types.js';
-import { getRetentionPolicy } from './retention.js';
+import { getRetentionPolicy, selectVersionsToKeep } from './retention.js';
 
 function metadataRoot(syncFolder: string): string {
   return `${syncFolder.replace(/\/+$/, '')}/.synx/files/`;
@@ -305,9 +305,13 @@ export async function putVersion(input: PutVersionInput): Promise<VersionRecord>
   }
 
   const policy = await getRetentionPolicy(env, storageId);
-  if (policy.maxVersionsPerFile > 0) {
-    const currentHistory = await readRecords(fs, metadataPrefix(syncFolder, identity));
-    for (const old of currentHistory.slice(policy.maxVersionsPerFile)) {
+  // 时间桶分层保留：每小时/每天/每月/每年各保留桶内最新 1 份，超窗口删除。
+  // 仅当策略未禁用（各层窗口不全为 0）时才裁剪。
+  const currentHistory = await readRecords(fs, metadataPrefix(syncFolder, identity));
+  const keep = selectVersionsToKeep(currentHistory, policy);
+  if (keep.size < currentHistory.length) {
+    for (const old of currentHistory) {
+      if (keep.has(old.versionId)) continue;
       const oldMetadataKey = metadataKey(syncFolder, identity, old.versionId);
       try {
         await fs.delete(old.storageKey);

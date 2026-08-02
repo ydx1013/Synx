@@ -14,6 +14,8 @@ import {
   type AuthResponse,
   type StorageSummary,
   type StorageListResponse,
+  type RetentionPolicy,
+  type RetentionPolicyResponse,
 } from '@synx/shared';
 
 /**
@@ -161,6 +163,20 @@ export class WorkerClient {
     if (!res.ok) throw new WorkerApiError(res.status, await safeErrorText(res));
     const data = (await res.json()) as StorageListResponse;
     return data.storages;
+  }
+
+  /** 读取当前 storage 的保留策略（未配置时返回服务端默认） */
+  async getRetentionPolicy(): Promise<RetentionPolicy> {
+    const storageId = this.opts.storageId;
+    const res = await this.request<RetentionPolicyResponse>('GET', API.storageRetention.replace(':id', encodeURIComponent(storageId)));
+    return res.policy;
+  }
+
+  /** 保存当前 storage 的保留策略（服务端会归一化非法字段） */
+  async setRetentionPolicy(policy: Partial<RetentionPolicy>): Promise<RetentionPolicy> {
+    const storageId = this.opts.storageId;
+    const res = await this.request<RetentionPolicyResponse>('PUT', API.storageRetention.replace(':id', encodeURIComponent(storageId)), policy);
+    return res.policy;
   }
 
   // ===== 内部：带重试的请求 =====

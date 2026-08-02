@@ -77,8 +77,8 @@ describe('normalizePolicy', () => {
 });
 
 describe('selectVersionsToKeep', () => {
-  // 使用「整点对齐」的参考时间，保证每个版本落在确定的桶边界内
-  const now = 1_700_000_000_000 - (1_700_000_000_000 % MS_HOUR); // 对齐到整点
+  // 参考时间设为「整点 + 30 分钟」，保证测试版本做分钟级偏移时不跨桶边界
+  const now = 1_700_000_000_000 - (1_700_000_000_000 % MS_HOUR) + 30 * 60 * 1000; // 22:30 整
   const DEFAULT_TEST_POLICY: RetentionPolicy = {
     maxFileSize: 0,
     hourlyWindowHours: 24,
@@ -113,8 +113,8 @@ describe('selectVersionsToKeep', () => {
       makeVersion('d3b', now - 1 * MS_DAY - 30 * 60 * 1000),
       makeVersion('d2a', now - 2 * MS_DAY),
       makeVersion('d2b', now - 2 * MS_DAY - 30 * 60 * 1000),
-      makeVersion('d1a', now - 3 * MS_DAY),
-      makeVersion('d1b', now - 3 * MS_DAY - 30 * 60 * 1000),
+      makeVersion('d1a', now - 3 * MS_DAY + 60 * 60 * 1000), // age < 3 天，严格在窗口内
+      makeVersion('d1b', now - 3 * MS_DAY + 30 * 60 * 1000),
     ];
     const keep = selectVersionsToKeep(history, { ...DEFAULT_TEST_POLICY, hourlyWindowHours: 0, dailyWindowDays: 3, monthlyWindowMonths: 0, yearlyWindowYears: 0 }, now);
     expect(keep.size).toBe(3); // 每天桶 1 份

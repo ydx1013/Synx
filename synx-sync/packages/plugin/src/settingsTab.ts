@@ -1,4 +1,5 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from 'obsidian';
+import type { RetentionPolicy } from '@synx/shared';
 import type SynxSyncPlugin from './main.js';
 import type { ConflictStrategy, SynxPluginSettings } from './settings.js';
 import { WorkerApiError, WorkerClient } from './workerClient.js';
@@ -23,6 +24,7 @@ export class SynxSettingTab extends PluginSettingTab {
     this.renderPerformance(containerEl, settings);
     this.renderConflicts(containerEl, settings);
     this.renderDeletionGuard(containerEl, settings);
+    this.renderRetention(containerEl, settings);
     this.renderReports(containerEl, settings);
   }
 
@@ -217,6 +219,50 @@ export class SynxSettingTab extends PluginSettingTab {
           void this.applyPatch({ allowBatchRemoteDelete: false });
         }
       }));
+  }
+
+  /** 版本保留策略：每层时间窗口内保留最新 1 份，保存到本地并上传远端（按 storage） */
+  private renderRetention(container: HTMLElement, settings: SynxPluginSettings): void {
+    container.createEl('h3', { text: '版本保留' });
+    container.createEl('p', {
+      text: '按时间分层保留版本：窗口内每个时间段保留最新 1 份，旧版本自动清理。设为 0 表示该层不保留。',
+      cls: 'setting-item-description',
+    });
+
+    const fields: { key: keyof RetentionPolicy; label: string; desc: string }[] = [
+      { key: 'hourlyWindowHours', label: '每小时', desc: '保留最近 N 小时内、每小时最新 1 份（例：24 = 最近 24 小时每小时 1 份）' },
+      { key: 'dailyWindowDays', label: '每天', desc: '保留最近 N 天内、每天最新 1 份' },
+      { key: 'monthlyWindowMonths', label: '每月', desc: '保留最近 N 个月内、每月最新 1 份' },
+      { key: 'yearlyWindowYears', label: '每年', desc: '保留最近 N 年内、每年最新 1 份；超过 N 年自动删除' },
+      { key: 'maxVersionsPerFile', label: '总版本上限', desc: '单文件最多保留的版本总数（兜底，0=不限）' },
+    ];
+
+    for (const field of fields) {
+      new Setting(container).setName(field.label).setDesc(field.desc).addText((text) => {
+        text.setValue(String(settings.retention[field.key]));
+        text.inputEl.type = 'number';
+        text.inputEl.min = '0';
+        text.inputEl.max = '99999';
+        text.onChange(async (value) => {
+          const number = Number(value);
+          if (!Number.isInteger(number) || number < 0) return;
+          const next = { ...settings.retention, [field.key]: number };
+          await this.applyPatch({ retention: next });
+          await this.pushRetentionToRemote(next);
+        });
+      });
+    }
+  }
+
+  /** 将保留策略上传到远端（已登录且有 storageId 时） */
+  private async pushRetentionToRemote(policy: RetentionPolicy): Promise<void> {
+    const client = this.plugin.getWorkerClient();
+    if (!client || !this.plugin.settings.storageId) return;
+    try {
+      await client.setRetentionPolicy(policy);
+    } catch (error) {
+      this.showError('保存版本保留策略到服务器失败', error);
+    }
   }
 
   private renderReports(container: HTMLElement, settings: SynxPluginSettings): void {

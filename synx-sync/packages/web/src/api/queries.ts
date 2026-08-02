@@ -11,9 +11,18 @@ export const authApi = {
   updatePreferences: (body: UpdatePreferencesRequest) => api<PreferencesResponse>('/api/auth/me/preferences', { method: 'PATCH', body: JSON.stringify(body) }),
 };
 
+/** GET /api/storage/:id 返回带明文 config 的存储详情 */
+export interface StorageDetail {
+  id: string;
+  name: string;
+  type: string;
+  config: Record<string, string>;
+  createdAt: number;
+}
+
 export const storageApi = {
   list: () => api<StorageListResponse>('/api/storage'),
-  get: (id: string) => api<{ storage: StorageSummary & { config: Record<string, string> } }>(`/api/storage/${encodeURIComponent(id)}`),
+  get: (id: string) => api<{ storage: StorageDetail }>(`/api/storage/${encodeURIComponent(id)}`),
   save: (id: string | undefined, body: unknown) => api<{ storage: StorageSummary }>(id ? `/api/storage/${encodeURIComponent(id)}` : '/api/storage', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) }),
   test: (body: unknown) => api<{ ok: boolean; message?: string }>('/api/storage/test', { method: 'POST', body: JSON.stringify(body) }),
   remove: (id: string) => api<{ ok: true; remoteFilesPreserved: true }>(`/api/storage/${encodeURIComponent(id)}`, { method: 'DELETE' }),

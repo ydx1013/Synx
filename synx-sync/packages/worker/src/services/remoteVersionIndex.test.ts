@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkerFs } from '@synx/shared';
+import type { Env } from '../types.js';
 import { deleteFile, getHistory, getVersion, listFiles, putVersion, rollback, VersionConflict, VersionDeleted, VersionNotFound } from './versionService.js';
 
 const USER = 'user-1';
@@ -8,6 +9,21 @@ const SYNC_FOLDER = 'vault';
 const UUID = '550e8400-e29b-41d4-a716-446655440000';
 const PATH = 'notes/idea.md';
 const META_PREFIX = `vault/.synx/files/${UUID}/versions/`;
+
+/**
+ * 返回一个禁用保留裁剪的 env：各层窗口为 0，保留全部历史版本。
+ * 这些测试关注同步/索引行为本身，版本保留策略由 retention.test.ts 单独覆盖。
+ */
+function makeNoPruneEnv(): Env {
+  const noPrune = JSON.stringify({ hourlyWindowHours: 0, dailyWindowDays: 0, monthlyWindowMonths: 0, yearlyWindowYears: 0 });
+  return {
+    DB: {
+      prepare: () => ({
+        bind: () => ({ first: async () => ({ retention_policy: noPrune }) }),
+      }),
+    },
+  } as unknown as Env;
+}
 
 function makeMemoryFs(): WorkerFs & { store: Map<string, Uint8Array> } {
   const store = new Map<string, Uint8Array>();
@@ -63,7 +79,7 @@ describe('remote version index', () => {
 
   it('uses UUID as note identity and updates path after rename', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, fileUuid: UUID };
     await putVersion({ ...input, path: 'notes/old.md', content: new TextEncoder().encode('old'), mtime: 1 });
     await putVersion({ ...input, path: 'notes/new.md', content: new TextEncoder().encode('new'), mtime: 2 });
 
@@ -78,7 +94,7 @@ describe('remote version index', () => {
   it('keeps independently written file metadata when listing files', async () => {
     const fs = makeMemoryFs();
     const secondUuid = '6ba7b810-9dad-41d1-80b4-00c04fd430c8';
-    const base = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
+    const base = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
     await putVersion({ ...base, path: PATH, fileUuid: UUID, content: new TextEncoder().encode('one'), mtime: 1 });
     await putVersion({ ...base, path: 'notes/two.md', fileUuid: secondUuid, content: new TextEncoder().encode('two'), mtime: 2 });
 
@@ -91,7 +107,7 @@ describe('remote version index', () => {
     // 否则文件数超过 50 时会触发 Cloudflare Workers 单请求子请求上限（累计 50 次）。
     // 内容对象是否存在由 getVersion（内容层）校验并抛 VersionNotFound。
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const version = await putVersion({ ...input, content: new TextEncoder().encode('deleted'), mtime: 1 });
     await fs.delete(version.storageKey);
 
@@ -103,7 +119,7 @@ describe('remote version index', () => {
 
   it('throws VersionNotFound when metadata references a deleted content object', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const version = await putVersion({ ...input, content: new TextEncoder().encode('deleted'), mtime: 1 });
     await fs.delete(version.storageKey);
 
@@ -112,7 +128,7 @@ describe('remote version index', () => {
 
   it('preserves concurrent writes to the same UUID', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     await Promise.all([
       putVersion({ ...input, content: new TextEncoder().encode('one'), mtime: 1 }),
       putVersion({ ...input, content: new TextEncoder().encode('two'), mtime: 2 }),
@@ -123,7 +139,7 @@ describe('remote version index', () => {
 
   it('rejects an overwrite when the remote current moved since it was opened', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     await putVersion({ ...input, content: new TextEncoder().encode('second'), mtime: 2 });
 
@@ -139,7 +155,7 @@ describe('remote version index', () => {
 
   it('accepts an overwrite when the base version still matches the remote current', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
 
     const saved = await putVersion({ ...input, content: new TextEncoder().encode('web edit'), mtime: 2, baseVersionId: first.versionId });
@@ -151,7 +167,7 @@ describe('remote version index', () => {
 
   it('rejects an overwrite when the remote file was deleted since it was opened', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     await deleteFile(input);
 
@@ -162,7 +178,7 @@ describe('remote version index', () => {
 
   it('reads current and historical content from the remote index', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     await putVersion({ ...input, content: new TextEncoder().encode('second'), mtime: 2 });
 
@@ -174,7 +190,7 @@ describe('remote version index', () => {
 
   it('rolls back from remote metadata and appends a version', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     await putVersion({ ...input, content: new TextEncoder().encode('second'), mtime: 2 });
     await rollback({ ...input, versionId: first.versionId });
@@ -186,7 +202,7 @@ describe('remote version index', () => {
 
   it('removes current but preserves history and keeps a 30 day tombstone', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     const second = await putVersion({ ...input, content: new TextEncoder().encode('second'), mtime: 2 });
 
@@ -202,7 +218,7 @@ describe('remote version index', () => {
 
   it('restores a deleted note from preserved history', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     await deleteFile(input);
 
@@ -216,7 +232,7 @@ describe('remote version index', () => {
 
   it('allows upload after an expired tombstone is removed', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     fs.store.set(`vault/.synx/files/${UUID}/tombstone.json`, new TextEncoder().encode(JSON.stringify({ expiresAt: Date.now() - 1 })));
     await expect(putVersion({ ...input, content: new TextEncoder().encode('new'), mtime: 1 })).resolves.toBeDefined();
     expect(fs.store.has(`vault/.synx/files/${UUID}/tombstone.json`)).toBe(false);
@@ -224,7 +240,7 @@ describe('remote version index', () => {
 
   it('garbage collects history objects once the tombstone expires', async () => {
     const fs = makeMemoryFs();
-    const input = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
     const first = await putVersion({ ...input, content: new TextEncoder().encode('first'), mtime: 1 });
     const second = await putVersion({ ...input, content: new TextEncoder().encode('second'), mtime: 2 });
     await deleteFile(input);
@@ -247,7 +263,7 @@ describe('remote version index', () => {
   it('rejects markdown notes without UUID', async () => {
     const fs = makeMemoryFs();
     await expect(putVersion({
-      env: {} as any,
+      env: makeNoPruneEnv(),
       userId: USER,
       storageId: STORAGE_ID,
       syncFolder: SYNC_FOLDER,
@@ -261,7 +277,7 @@ describe('remote version index', () => {
   it('heals a manifest that lost entries and still lists those files', async () => {
     const fs = makeMemoryFs();
     const secondUuid = '6ba7b810-9dad-41d1-80b4-00c04fd430c8';
-    const base = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
+    const base = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
     const first = await putVersion({ ...base, path: PATH, fileUuid: UUID, content: new TextEncoder().encode('one'), mtime: 1 });
     const second = await putVersion({ ...base, path: 'notes/two.md', fileUuid: secondUuid, content: new TextEncoder().encode('two'), mtime: 2 });
 
@@ -285,7 +301,7 @@ describe('remote version index', () => {
 
   it('deduplicates content by current.json even when manifest lost the entry', async () => {
     const fs = makeMemoryFs();
-    const base = { env: {} as any, userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
+    const base = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
     const first = await putVersion({ ...base, path: PATH, fileUuid: UUID, content: new TextEncoder().encode('same'), mtime: 1 });
 
     // 模拟 manifest 丢失（内容对象与 current.json 仍在）

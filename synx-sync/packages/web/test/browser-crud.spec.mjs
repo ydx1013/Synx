@@ -23,6 +23,10 @@ test('浏览器完成注册、新增、编辑和删除 WebDAV', async ({ page })
       await route.fulfill({ status: 201, json: { token: 'browser-token', user: { id: 'user-1', username: 'browser-user' } } });
       return;
     }
+    if (url.pathname === '/api/auth/me' && request.method() === 'GET') {
+      await route.fulfill({ json: { user: { id: 'user-1', username: 'browser-user' }, preferences: { defaultStorageId: null, defaultSyncFolder: 'my-vault/' } } });
+      return;
+    }
     if (url.pathname === '/api/storage' && request.method() === 'GET') {
       await route.fulfill({ json: { storages: created ? [storage] : [] } });
       return;
@@ -55,37 +59,42 @@ test('浏览器完成注册、新增、编辑和删除 WebDAV', async ({ page })
     await route.fulfill({ status: 404, json: { error: 'not found' } });
   });
 
-  await page.goto('/register.html');
+  await page.goto('/register');
   await page.getByLabel('用户名').fill('browser-user');
   await page.getByLabel('邮箱').fill('browser@example.com');
   await page.getByLabel('密码').fill('browser-password');
   await page.getByRole('button', { name: '注册' }).click();
-  await expect(page).toHaveURL(/dashboard\.html$/);
+  await expect(page).toHaveURL(/\/notes$/);
+  await expect(page.locator('.center-state')).toContainText('设置你的默认存储');
 
-  await page.getByRole('link', { name: '添加 WebDAV' }).click();
+  // 从笔记页进入设置 → 存储管理
+  await page.getByRole('link', { name: '前往设置' }).click();
+  await page.getByRole('link', { name: '存储管理' }).click();
+  await expect(page.getByRole('heading', { name: '存储管理' })).toBeVisible();
+  await expect(page.locator('.empty-settings')).toContainText('还没有远程存储');
+
+  // 新增 WebDAV
+  await page.getByRole('link', { name: '添加 WebDAV' }).first().click();
   await page.getByLabel('名称', { exact: true }).fill(storage.name);
   await page.getByLabel('HTTPS 地址').fill(storage.config.address);
   await page.getByLabel('用户名', { exact: true }).fill(storage.config.username);
   await page.getByLabel('应用密码').fill('browser-app-password');
   await page.getByLabel('远程目录').fill(storage.config.remoteBaseDir);
   await page.getByRole('button', { name: '保存配置' }).click();
-  await expect(page.getByRole('status')).toHaveText('配置已保存，尚未验证连接');
-
-  await page.goto('/dashboard.html');
+  await expect(page).toHaveURL(/\/settings\/storage$/);
   await expect(page.getByRole('heading', { name: storage.name })).toBeVisible();
+
+  // 编辑
   await page.getByRole('link', { name: '编辑' }).click();
   await expect(page.getByRole('heading', { name: '编辑 WebDAV' })).toBeVisible();
   await page.getByLabel('名称', { exact: true }).fill('浏览器 WebDAV 已编辑');
   await page.getByRole('button', { name: '保存配置' }).click();
-  await expect(page.getByRole('status')).toHaveText('配置已保存，尚未验证连接');
-
-  await page.goto('/dashboard.html');
+  await expect(page).toHaveURL(/\/settings\/storage$/);
   await expect(page.getByRole('heading', { name: '浏览器 WebDAV 已编辑' })).toBeVisible();
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toContain('WebDAV 中的文件不会被删除');
-    await dialog.accept();
-  });
+
+  // 移除
   await page.getByRole('button', { name: '移除' }).click();
-  await expect(page.getByRole('status')).toHaveText('存储已从 Synx 移除，WebDAV 文件已保留；已删除 0 条版本元数据');
-  await expect(page.getByRole('heading', { name: '浏览器 WebDAV 已编辑' })).toHaveCount(0);
+  await expect(page.getByRole('dialog')).toContainText('WebDAV 中的文件不会被删除');
+  await page.getByRole('button', { name: '确认移除' }).click();
+  await expect(page.locator('.empty-settings')).toContainText('还没有远程存储');
 });

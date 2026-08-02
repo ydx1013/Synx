@@ -1,5 +1,6 @@
-﻿import { Hono } from 'hono';
+import { Hono } from 'hono';
 import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { DEFAULT_RETENTION } from '@synx/shared';
 import { storage } from './storage.js';
 import { signJwt } from '../auth/jwt.js';
 import { decryptString, encryptString } from '../auth/crypto.js';
@@ -524,6 +525,60 @@ describe('PATCH /api/storage/:id', () => {
       makeEnv({ DB: db, KV: kv }),
     );
     expect(res.status).toBe(400);
+  });
+});
+
+describe('GET/PUT /api/storage/:id/retention', () => {
+  it('returns the default policy when no custom policy is stored', async () => {
+    const db = makeD1Mock({ first: { retention_policy: null } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+    expect(res.status).toBe(200);
+    const data = await res.json<any>();
+    expect(data.policy.hourlyWindowHours).toBe(60);
+  });
+
+  it('returns the stored policy', async () => {
+    const stored = JSON.stringify({ hourlyWindowHours: 12, dailyWindowDays: 7, monthlyWindowMonths: 2, yearlyWindowYears: 1, maxVersionsPerFile: 200 });
+    const db = makeD1Mock({ first: { retention_policy: stored } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+    expect(res.status).toBe(200);
+    const data = await res.json<any>();
+    expect(data.policy.hourlyWindowHours).toBe(12);
+    expect(data.policy.maxVersionsPerFile).toBe(200);
+  });
+
+  it('saves a normalized policy', async () => {
+    const db = makeD1Mock({ first: { id: 's1', user_id: USER, retention_policy: null } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+    const res = await app.request(
+      '/api/storage/s1/retention',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...(await authHeader()) },
+        body: JSON.stringify({ hourlyWindowHours: 24, dailyWindowDays: 5 }),
+      },
+      makeEnv({ DB: db, KV: kv }),
+    );
+    expect(res.status).toBe(200);
+    const bindArgs = (db as any)._stmt.bind.mock.calls.at(-1);
+    const saved = JSON.parse(bindArgs[0]);
+    expect(saved.hourlyWindowHours).toBe(24);
+    expect(saved.dailyWindowDays).toBe(5);
+    expect(saved.monthlyWindowMonths).toBe(DEFAULT_RETENTION.monthlyWindowMonths);
+    expect(saved.maxFileSize).toBe(DEFAULT_RETENTION.maxFileSize);
+  });
+
+  it('returns 404 when storage not found', async () => {
+    const db = makeD1Mock({ first: null });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+    const res = await app.request('/api/storage/none/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+    expect(res.status).toBe(404);
   });
 });
 

@@ -6,7 +6,7 @@ export default defineConfig({
   build: { outDir: 'dist', emptyOutDir: true },
   test: {
     environment: 'jsdom',
-    environmentOptions: { jsdom: { url: 'http://localhost/' } },
+    include: ['src/**/*.test.{ts,tsx}'],
     setupFiles: './src/test-setup.ts',
   },
 });
