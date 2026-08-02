@@ -23,6 +23,14 @@ describe('evaluateFile', () => {
     expect(evaluateFile('_draft.md', 1, { ...base, syncConfigDir: true, syncUnderscorePaths: true })).toEqual({ sync: true });
   });
 
+  it('always skips synx runtime state and vault-root debug log', () => {
+    // synx-state.json 永不同步
+    expect(evaluateFile('.obsidian/plugins/synx-sync/synx-state.json', 1, base)).toMatchObject({ sync: false, rule: 'synx-state.json' });
+    // 诊断日志写在 vault 根目录（iOS 可见），同样必须排除，避免同步到远端
+    expect(evaluateFile('synx-debug.log', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug.log' });
+    expect(evaluateFile('synx-debug.log', 1, { ...base, syncConfigDir: true })).toMatchObject({ sync: false });
+  });
+
   it('always skips .obsidian/workspace and workspace.json regardless of syncConfigDir', () => {
     // 工作区状态文件即使开启同步配置目录也不应同步（避免覆盖其他设备的工作区）
     const settings = { ...base, syncConfigDir: true };

@@ -46,9 +46,11 @@ function isStateData(raw: unknown): raw is SynxStateData {
 }
 
 const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
-// .obsidian 同步诊断日志：每次同步后写入（不会被 listObsConfigFiles 同步到远端，
-// 因为插件目录只同步标准文件）。手机上看不到控制台时，可把该文件内容发回排查。
-const OBS_DEBUG_FILE = '.obsidian/plugins/synx-sync/synx-debug.log';
+// .obsidian 同步诊断日志：每次同步后写入 vault 根目录。
+// 注意：必须写在 vault 根目录而不是 .obsidian 内——iOS 上 .obsidian 是隐藏
+// 目录，文件 App 看不到，用户无法导出诊断；vault 根目录的文件 iOS 直接可见。
+// 该文件在 fileFilter 中被排除，不会被同步到远端。
+const OBS_DEBUG_FILE = 'synx-debug.log';
 
 // #region debug-point Z:helper
 // 之前版本把日志 POST 到 http://127.0.0.1:7777/event（本地调试服务器），
@@ -97,6 +99,9 @@ export default class SynxSyncPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => void this.ensureHistoryPane());
     for (const event of ['modify', 'create', 'rename'] as const) {
       this.registerEvent(this.app.vault.on(event as 'rename', (file) => {
+        // 诊断日志写入 vault 根目录会触发 modify/create 事件，
+        // 必须忽略，否则每次同步写日志 → 触发同步 → 再写日志，无限循环
+        if (file?.path === OBS_DEBUG_FILE) return;
         // #region debug-point A:vault-event
         dbg('A', 'main.ts:onload', `${event} vault event`, {
           path: file?.path ?? null,
@@ -279,6 +284,8 @@ export default class SynxSyncPlugin extends Plugin {
 
   private async onLocalDelete(file: TAbstractFile): Promise<void> {
     if (this.internalDeletes.delete(file.path)) return;
+    // 诊断日志删除不触发同步
+    if (file.path === OBS_DEBUG_FILE) return;
     const storageId = this.settings.storageId;
     if (!(file instanceof TFile) || !storageId || !this.settings.syncFolder) {
       this.scheduler.notifySave();
