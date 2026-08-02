@@ -2,6 +2,7 @@ name: Release Obsidian Plugin
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
       - "[0-9]*"
@@ -15,6 +16,40 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 手动打 tag（v* 或 0.1.0）时用 tag 版本；
+      # push main 时自动读取最新 tag，patch 版本 +1 并打新 tag（GITHUB_TOKEN 推送的 tag 不会递归触发本工作流）。
+      - name: Compute release version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "release_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "trigger=tag" >> "$GITHUB_OUTPUT"
+          else
+            git fetch --tags --force
+            LATEST=$(git tag --sort=-v:refname | grep -E '^(v|)[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+            if [[ -z "$LATEST" ]]; then
+              NEW_TAG="v0.1.1"
+            else
+              V="${LATEST#v}"
+              IFS='.' read -r MAJ MIN PATCH <<< "$V"
+              NEW_TAG="v${MAJ}.${MIN}.$((PATCH+1))"
+            fi
+            echo "release_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${NEW_TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "trigger=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auto tag patch release
+        if: steps.version.outputs.trigger == 'main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.release_tag }}"
+          git push origin "${{ steps.version.outputs.release_tag }}"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -37,7 +72,7 @@ jobs:
           cp synx-sync/packages/plugin/main.js release/
           cp synx-sync/packages/plugin/styles.css release/
           # 将 tag 版本写入 manifest，避免 BRAT 提示版本不匹配
-          jq --arg v "${GITHUB_REF_NAME#v}" '.version = $v' \
+          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' \
             synx-sync/packages/plugin/manifest.json > release/manifest.json
           echo "--- manifest.json ---"
           cat release/manifest.json
@@ -46,6 +81,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
           files: |
             release/manifest.json
             release/main.js
