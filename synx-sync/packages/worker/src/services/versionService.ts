@@ -230,7 +230,17 @@ export interface PutVersionInput {
 export async function putVersion(input: PutVersionInput): Promise<VersionRecord> {
   const { env, userId, storageId, syncFolder, fs, path, fileUuid, content, mtime, author, baseVersionId } = input;
   const identity = fileIdentity(path, fileUuid);
-  if (await hasActiveTombstone(fs, syncFolder, identity)) throw new VersionDeleted(`file ${path} was deleted`);
+  // tombstone 保护的是"已删除文件的身份"：md 笔记用 UUID 唯一标识身份，被删后不应被误恢复；
+  // 但 .obsidian/ 等无 UUID 的配置文件用 path 作身份，路径本身可以复用（插件更新/重装=同一路径新文件），
+  // 此时 tombstone 会误伤合法上传，因此遇到 path 身份的 tombstone 应视为"路径重新出现"，清除后继续。
+  if (await hasActiveTombstone(fs, syncFolder, identity)) {
+    if (identity.startsWith('path:')) {
+      await fs.delete(tombstoneKey(syncFolder, identity));
+      console.info('synx: cleared path-identity tombstone for recreated path', { path });
+    } else {
+      throw new VersionDeleted(`file ${path} was deleted`);
+    }
+  }
   const hash = await sha256Hex(content);
 
   // 权威：每文件独立的 current.json 指针（单对象原子 PUT，跨实例一致）。
@@ -291,7 +301,12 @@ export async function putVersion(input: PutVersionInput): Promise<VersionRecord>
 
   await fs.put(storageKey, content);
   try {
-    if (await hasActiveTombstone(fs, syncFolder, identity)) throw new VersionDeleted(`file ${path} was deleted`);
+    // 写入前的二次检查：并发场景下 tombstone 可能被重新写入。
+    // 对 path 身份（无 UUID 的配置文件）同样视为路径复用，清除后继续。
+    if (await hasActiveTombstone(fs, syncFolder, identity)) {
+      if (identity.startsWith('path:')) await fs.delete(tombstoneKey(syncFolder, identity));
+      else throw new VersionDeleted(`file ${path} was deleted`);
+    }
     const encodedVersion = new TextEncoder().encode(JSON.stringify(version));
     await fs.put(metadataKey(syncFolder, identity, versionId), encodedVersion);
     await fs.put(currentKey(syncFolder, identity), encodedVersion);

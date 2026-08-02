@@ -176,6 +176,25 @@ describe('remote version index', () => {
     ).rejects.toBeInstanceOf(VersionDeleted);
   });
 
+  it('re-uploads a non-UUID config path even when a tombstone exists (path identity is reusable)', async () => {
+    // .obsidian/ 等无 UUID 的配置文件用 path 作身份：插件更新/重装=同一路径新文件，
+    // tombstone 不应阻止合法上传，应自动清除后继续。
+    const fs = makeMemoryFs();
+    const obsPath = '.obsidian/plugins/editing-toolbar/main.js';
+    const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: obsPath };
+    const first = await putVersion({ ...input, content: new TextEncoder().encode('v1'), mtime: 1 });
+    // 该路径曾被删除 → 留下 tombstone
+    await deleteFile(input);
+    const encoded = encodeURIComponent(`path:${obsPath}`);
+    expect(fs.store.has(`vault/.synx/files/${encoded}/tombstone.json`)).toBe(true);
+
+    // 本地文件仍存在（插件更新），push 应成功且 tombstone 被清除
+    const revived = await putVersion({ ...input, content: new TextEncoder().encode('v2'), mtime: 2 });
+    expect(revived).toBeDefined();
+    expect(fs.store.has(`vault/.synx/files/${encoded}/tombstone.json`)).toBe(false);
+    expect((await getHistory(input)).map((v) => v.path)).toEqual([obsPath]);
+  });
+
   it('reads current and historical content from the remote index', async () => {
     const fs = makeMemoryFs();
     const input = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs, path: PATH, fileUuid: UUID };
