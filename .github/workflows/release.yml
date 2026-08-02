@@ -1,0 +1,53 @@
+name: Release Obsidian Plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: synx-sync/package-lock.json
+
+      - name: Install dependencies
+        working-directory: synx-sync
+        run: npm ci
+
+      - name: Build plugin
+        working-directory: synx-sync/packages/plugin
+        run: npm run build
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          cp synx-sync/packages/plugin/main.js release/
+          cp synx-sync/packages/plugin/styles.css release/
+          # 将 tag 版本写入 manifest，避免 BRAT 提示版本不匹配
+          jq --arg v "${GITHUB_REF_NAME#v}" '.version = $v' \
+            synx-sync/packages/plugin/manifest.json > release/manifest.json
+          echo "--- manifest.json ---"
+          cat release/manifest.json
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/manifest.json
+            release/main.js
+            release/styles.css
+          generate_release_notes: true
