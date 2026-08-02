@@ -777,10 +777,14 @@ export default class SynxSyncPlugin extends Plugin {
 
   private async executePull(path: string, fileUuid?: string): Promise<void> {
     if (!this.client) return;
+    const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
     const content = await this.client.readFile(path, undefined, fileUuid);
     // .obsidian/ 内的文件用 adapter 写入
     if (path.startsWith('.obsidian/')) {
-      await this.writeLocalViaAdapter(path, content);
+      // 显式设置 mtime（模仿 remotely-save 的 adapter.writeBinary(key, content, { mtime, ctime })）。
+      // 若不设置，iOS 上写入后 mtime=当前时间，下次同步会误判"本地更新"，
+      // 反复 push/pull，且 Obsidian 检测到插件文件变化会热加载到写一半的文件 → 插件"打不开"。
+      await this.writeLocalViaAdapter(path, content, remote?.mtime ?? 0);
       return;
     }
     const target = this.app.vault.getAbstractFileByPath(path);
@@ -800,10 +804,14 @@ export default class SynxSyncPlugin extends Plugin {
     else await this.app.vault.createBinary(path, content);
   }
 
-  /** 写入 .obsidian/ 等非 vault 追踪路径，使用底层 adapter */
-  private async writeLocalViaAdapter(path: string, content: ArrayBuffer): Promise<void> {
+  /** 写入 .obsidian/ 等非 vault 追踪路径，使用底层 adapter；mtime>0 时显式设置写入时间戳 */
+  private async writeLocalViaAdapter(path: string, content: ArrayBuffer, mtime = 0): Promise<void> {
     await this.ensureParentDirViaAdapter(path);
-    await this.app.vault.adapter.writeBinary(path, content);
+    if (mtime > 0) {
+      await this.app.vault.adapter.writeBinary(path, content, { mtime, ctime: mtime });
+    } else {
+      await this.app.vault.adapter.writeBinary(path, content);
+    }
   }
 
   private async ensureParentDir(path: string): Promise<void> {

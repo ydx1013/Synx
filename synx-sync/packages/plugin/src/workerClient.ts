@@ -199,7 +199,8 @@ export class WorkerClient {
       try {
         const headers = this.headers(body !== undefined, isBinary);
         const bodyData = body !== undefined && !isBinary ? JSON.stringify(body) : body;
-        console.log('synx request', { method, url, attempt: attempt + 1, bodyLen: bodyData?.length ?? 0, timeoutMs });
+        const bodyLen = typeof bodyData === 'string' ? bodyData.length : bodyData instanceof ArrayBuffer ? bodyData.byteLength : 0;
+        console.log('synx request', { method, url, attempt: attempt + 1, bodyLen, timeoutMs });
         const res = await this.fetchImpl(url, {
           method,
           headers,

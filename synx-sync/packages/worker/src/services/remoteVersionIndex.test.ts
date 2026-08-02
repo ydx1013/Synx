@@ -313,4 +313,36 @@ describe('remote version index', () => {
     const history = await getHistory({ ...base, path: PATH });
     expect(history).toHaveLength(1);
   });
+
+  it('keeps only the latest version for .obsidian config files', async () => {
+    const fs = makeMemoryFs();
+    // 注意：env 使用"保留全部历史"策略——即使策略不裁剪，.obsidian 也必须只留 1 份
+    const base = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs };
+    const obsPath = '.obsidian/plugins/foo/main.js';
+    const uuid = '5a1f5c2e-9a1a-4c3b-8f0a-123456789abc';
+    const prefix = `vault/.synx/files/${uuid}/versions/`;
+
+    await putVersion({ ...base, path: obsPath, fileUuid: uuid, content: new TextEncoder().encode('v1'), mtime: 1 });
+    await putVersion({ ...base, path: obsPath, fileUuid: uuid, content: new TextEncoder().encode('v2'), mtime: 2 });
+    await putVersion({ ...base, path: obsPath, fileUuid: uuid, content: new TextEncoder().encode('v3'), mtime: 3 });
+
+    // .obsidian 配置文件只保留最新 1 份版本
+    const history = await getHistory({ ...base, path: obsPath, fileUuid: uuid });
+    expect(history).toHaveLength(1);
+    expect(history[0].path).toBe(obsPath);
+
+    // 元数据与内容对象都只留 1 份（旧版本对象应被裁剪删除）
+    const metaKeys = [...fs.store.keys()].filter((key) => key.startsWith(prefix));
+    expect(metaKeys).toHaveLength(1);
+    const obsStorageKeys = [...fs.store.keys()].filter((key) => key.includes('main.js'));
+    expect(obsStorageKeys).toHaveLength(1);
+
+    // 普通 .md 文件不受影响：v1/v2 版本仍然保留（无裁剪策略时全保留）
+    const fs2 = makeMemoryFs();
+    const base2 = { env: makeNoPruneEnv(), userId: USER, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER, fs: fs2 };
+    await putVersion({ ...base2, path: PATH, fileUuid: UUID, content: new TextEncoder().encode('one'), mtime: 1 });
+    await putVersion({ ...base2, path: PATH, fileUuid: UUID, content: new TextEncoder().encode('two'), mtime: 2 });
+    const mdHistory = await getHistory({ ...base2, path: PATH });
+    expect(mdHistory).toHaveLength(2);
+  });
 });

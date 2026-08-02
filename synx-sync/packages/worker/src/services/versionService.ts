@@ -308,7 +308,11 @@ export async function putVersion(input: PutVersionInput): Promise<VersionRecord>
   // 时间桶分层保留：每小时/每天/每月/每年各保留桶内最新 1 份，超窗口删除。
   // 仅当策略未禁用（各层窗口不全为 0）时才裁剪。
   const currentHistory = await readRecords(fs, metadataPrefix(syncFolder, identity));
-  const keep = selectVersionsToKeep(currentHistory, policy);
+  // .obsidian/ 配置文件（插件、主题、设置）无需版本历史：始终只保留最新 1 份。
+  // 配置高频变化且回滚无意义，保留历史只会让存储无限膨胀（对照 remotely-save 的镜像式覆盖）。
+  const keep = path.startsWith('.obsidian/')
+    ? new Set([currentHistory[0]?.versionId])
+    : selectVersionsToKeep(currentHistory, policy);
   if (keep.size < currentHistory.length) {
     for (const old of currentHistory) {
       if (keep.has(old.versionId)) continue;
