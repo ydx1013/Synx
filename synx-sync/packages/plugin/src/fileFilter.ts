@@ -17,6 +17,11 @@ export function evaluateFile(path: string, size: number, settings: FilterSetting
   if (normalized === '.obsidian/plugins/synx-sync/synx-state.json') {
     return skipped('Synx 运行时状态不参与同步', 'synx-state.json', size);
   }
+  // synx 自身 data.json 含每设备不同的登录态/设备名（jwt、deviceName、storageId 等），
+  // 跨设备同步会互相覆盖登录信息并造成"本地新→push→远端新→pull"的抖动，不参与同步。
+  if (normalized === '.obsidian/plugins/synx-sync/data.json') {
+    return skipped('Synx 自身配置不参与同步（每设备独立）', 'synx-sync/data.json', size);
+  }
   // 诊断日志写在 vault 根目录（iOS 上只显示 .md 文件，必须用 .md 后缀），
   // 该文件必须被排除，否则会被同步到远端。旧版 .log 同名文件也一并排除。
   if (normalized === 'synx-debug.md' || normalized === 'synx-debug.log') {

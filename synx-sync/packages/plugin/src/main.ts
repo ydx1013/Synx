@@ -775,6 +775,9 @@ export default class SynxSyncPlugin extends Plugin {
     return false;
   }
 
+  /** .obsidian 写入后回读的实际 mtime（诊断 iOS 写 mtime 是否生效） */
+  private obsWriteBackMtimes: Record<string, { expected: number; actual: number | null }> = {};
+
   private async executePull(path: string, fileUuid?: string): Promise<void> {
     if (!this.client) return;
     const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
@@ -784,7 +787,15 @@ export default class SynxSyncPlugin extends Plugin {
       // 显式设置 mtime（模仿 remotely-save 的 adapter.writeBinary(key, content, { mtime, ctime })）。
       // 若不设置，iOS 上写入后 mtime=当前时间，下次同步会误判"本地更新"，
       // 反复 push/pull，且 Obsidian 检测到插件文件变化会热加载到写一半的文件 → 插件"打不开"。
-      await this.writeLocalViaAdapter(path, content, remote?.mtime ?? 0);
+      const expected = remote?.mtime ?? 0;
+      await this.writeLocalViaAdapter(path, content, expected);
+      // 回读 stat，诊断 iOS 是否真的写入了指定 mtime
+      try {
+        const st = await this.app.vault.adapter.stat(path);
+        this.obsWriteBackMtimes[path] = { expected, actual: st?.mtime ?? null };
+      } catch {
+        this.obsWriteBackMtimes[path] = { expected, actual: null };
+      }
       return;
     }
     const target = this.app.vault.getAbstractFileByPath(path);
@@ -867,10 +878,25 @@ export default class SynxSyncPlugin extends Plugin {
   ): Promise<void> {
     try {
       const isObs = (p: string) => p.startsWith('.obsidian/');
-      const planObs: Record<string, number> = {};
+      const localByPath = new Map(localFiles.map((f) => [f.path, f]));
+      const remoteByPath = new Map(this.remoteEntities.map((e) => [e.key.replace(/^\/+/, ''), e]));
+      // 记录每个 .obsidian 动作的明细（路径/原因/两端 hash·mtime·size），
+      // 用于定位"反复 pull/push 抖动"——抖动会导致 Obsidian 热加载到写一半的插件文件。
+      const planObs: Record<string, Array<Record<string, unknown>>> = {};
       for (const a of plan.actions) {
         if (!isObs(a.path)) continue;
-        planObs[a.type] = (planObs[a.type] ?? 0) + 1;
+        const l = localByPath.get(a.path);
+        const r = remoteByPath.get(a.path);
+        (planObs[a.type] ??= []).push({
+          path: a.path,
+          reason: (a as { reason?: string }).reason,
+          lHash: l?.hash ?? null,
+          lMtime: l?.mtime ?? null,
+          lSize: l?.size ?? null,
+          rHash: r?.hash ?? r?.etag ?? null,
+          rMtime: r?.mtime ?? null,
+          rSize: r?.size ?? null,
+        });
       }
       const failedObs = (report?.items ?? [])
         .filter((item) => item.status === 'failed' && isObs(item.path))
@@ -885,6 +911,7 @@ export default class SynxSyncPlugin extends Plugin {
         remoteObsSkipped: remoteSkipped.filter((a) => isObs(a.path)).map((a) => ({ path: a.path, reason: (a as { reason?: string }).reason })),
         planObs,
         executedObsFailed: failedObs,
+        obsWriteBackMtimes: this.obsWriteBackMtimes,
       };
       await this.app.vault.adapter.write(
         OBS_DEBUG_FILE,
