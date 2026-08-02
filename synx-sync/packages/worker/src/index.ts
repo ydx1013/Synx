@@ -9,8 +9,14 @@ import { sync } from './routes/sync.js';
 
 const app = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
+// Obsidian 各端点的请求 Origin：
+// - 桌面端 app://obsidian.md
+// - 移动端（iOS/Android Capacitor）capacitor://localhost，部分 Android 环境为 http://localhost
+// 只放行这些受信 Origin；其他来源一律不加 CORS 头（浏览器会拦截响应）。
+const OBSIDIAN_ORIGINS = new Set(['app://obsidian.md', 'capacitor://localhost', 'http://localhost']);
+
 app.use('/api/*', cors({
-  origin: (origin) => origin === 'app://obsidian.md' ? origin : '',
+  origin: (origin) => (origin && OBSIDIAN_ORIGINS.has(origin) ? origin : ''),
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Authorization', 'Content-Type', 'X-Storage-Id', 'X-Sync-Folder'],
 }));

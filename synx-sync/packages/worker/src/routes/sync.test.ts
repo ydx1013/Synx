@@ -1,4 +1,4 @@
-﻿import { describe, it, expect, beforeAll, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, vi, beforeEach } from 'vitest';
 import app from '../index.js';
 import { signJwt } from '../auth/jwt.js';
 import { makeEnv, makeD1Mock } from '../test/helpers.js';
@@ -247,13 +247,32 @@ describe('GET /api/list', () => {
 
 
 describe('CORS origin allowlist', () => {
-  it.each(['capacitor://localhost', 'http://localhost', 'https://unknown.example.com'])('does not allow %s', async (origin) => {
+  // 回归：Obsidian 移动端（iOS/Android Capacitor）Origin 为 capacitor://localhost，
+  // Android 部分环境为 http://localhost。此前只放行桌面端 app://obsidian.md，
+  // 导致移动端登录被浏览器 CORS 拦截（iOS 显示 "Load failed"）。
+  it.each(['app://obsidian.md', 'capacitor://localhost', 'http://localhost'])('allows %s', async (origin) => {
     const res = await makeApp().request(
       '/api/list',
       {
         method: 'OPTIONS',
         headers: {
           Origin: origin,
+          'Access-Control-Request-Method': 'GET',
+        },
+      },
+      makeEnv(),
+    );
+
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe(origin);
+  });
+
+  it('does not allow unknown origins', async () => {
+    const res = await makeApp().request(
+      '/api/list',
+      {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://unknown.example.com',
           'Access-Control-Request-Method': 'GET',
         },
       },
