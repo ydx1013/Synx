@@ -115,4 +115,32 @@ describe('listObsConfigFiles', () => {
     // cache.db 是非标准文件，必须被跳过
     expect(paths).not.toContain('.obsidian/plugins/synx-sync/cache.db');
   });
+
+  it('keeps file when both mtime and ctime are 0 (mobile metadata quirk), instead of silently dropping', async () => {
+    const vault = makeVault(
+      { '.obsidian': { files: ['.obsidian/app.json'], folders: [] } },
+      // 部分移动端平台 stat 返回 mtime=0, ctime=0
+      { '.obsidian/app.json': { type: 'file', ctime: 0, mtime: 0, size: 50 } },
+    );
+
+    const result = await listObsConfigFiles(vault, { configDir: '.obsidian', pluginId: 'synx-sync' });
+    // 之前该场景会被静默丢弃 → 手机本地 .obsidian 文件永远不参与同步
+    expect(result.map((f) => f.path)).toEqual(['.obsidian/app.json']);
+    expect(result[0].mtime).toBe(0);
+  });
+
+  it('surfaces list() failures instead of silently treating them as empty', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const vault = makeVault({}, {});
+    (vault.adapter.list as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      throw new Error('EACCES: permission denied, scandir');
+    });
+    (vault.adapter.list as ReturnType<typeof vi.fn>).mockClear();
+
+    const result = await listObsConfigFiles(vault, { configDir: '.obsidian', pluginId: 'synx-sync' });
+    expect(result).toEqual([]);
+    // 错误必须可见（否则手机端 .obsidian 同步失败完全无迹可寻）
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('listObsConfigFiles'), expect.stringContaining('EACCES'));
+    warn.mockRestore();
+  });
 });

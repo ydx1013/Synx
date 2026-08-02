@@ -41,8 +41,10 @@ export async function listObsConfigFiles(
     let listed;
     try {
       listed = await vault.adapter.list(folder);
-    } catch {
-      // .obsidian 可能不存在（移动端精简模式等），直接返回空
+    } catch (error) {
+      // .obsidian 可能不存在（移动端精简模式等），但必须让问题可见，
+      // 否则移动端 .obsidian 同步会"神秘地"缺失且无任何日志（remotely-save 会抛错）。
+      console.warn(`[synx] listObsConfigFiles: 无法枚举 ${folder}`, error instanceof Error ? error.message : String(error));
       continue;
     }
 
@@ -88,13 +90,23 @@ function isInsidePluginDir(path: string, configDir: string, pluginId: string): b
 async function safeStat(vault: Vault, path: string) {
   try {
     const stat = await vault.adapter.stat(path);
-    if (!stat || stat.type !== 'file') return null;
+    if (!stat || stat.type !== 'file') {
+      console.warn(`[synx] listObsConfigFiles: ${path} stat 非文件或缺失`, stat ?? 'stat=null');
+      return null;
+    }
     if (!Number.isFinite(stat.mtime) || stat.mtime <= 0) {
       // Obsidian 部分平台可能给 0，回退到 ctime
-      if (!Number.isFinite(stat.ctime) || stat.ctime <= 0) return null;
+      if (!Number.isFinite(stat.ctime) || stat.ctime <= 0) {
+        // 移动端部分文件 mtime/ctime 都为 0（remotely-save 对此直接抛错）。
+        // 这里不静默丢弃，而是保留该文件（mtime 用 0，上层按"较旧"处理），
+        // 避免 .obsidian 文件因 stat 元数据缺失而永远不参与同步。
+        console.warn(`[synx] listObsConfigFiles: ${path} mtime/ctime 均为 0，保留文件`);
+        return { ...stat, mtime: 0, ctime: 0 };
+      }
     }
     return stat;
-  } catch {
+  } catch (error) {
+    console.warn(`[synx] listObsConfigFiles: ${path} stat 失败`, error instanceof Error ? error.message : String(error));
     return null;
   }
 }

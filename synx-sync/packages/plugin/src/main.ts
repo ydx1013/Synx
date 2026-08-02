@@ -9,7 +9,7 @@ import { hideMarkdownUuidExtension } from './markdownUuidEditor.js';
 import { listObsConfigFiles } from './obsConfigLister.js';
 import { loadPluginSettings, type SynxPluginSettings } from './settings.js';
 import { SynxSettingTab } from './settingsTab.js';
-import { hashContent, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction } from './syncAlgo.js';
+import { hashContent, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
 import { enqueueDeletion, pendingForTarget, type PendingDeletion } from './deletionQueue.js';
 import { SyncDetailsView, SYNC_DETAILS_VIEW_TYPE } from './syncDetailsView.js';
 import { SyncExecutor, type ExecutableSyncAction, type SyncExecutionResult } from './syncExecutor.js';
@@ -46,12 +46,17 @@ function isStateData(raw: unknown): raw is SynxStateData {
 }
 
 const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
+// .obsidian 同步诊断日志：每次同步后写入（不会被 listObsConfigFiles 同步到远端，
+// 因为插件目录只同步标准文件）。手机上看不到控制台时，可把该文件内容发回排查。
+const OBS_DEBUG_FILE = '.obsidian/plugins/synx-sync/synx-debug.log';
 
 // #region debug-point Z:helper
-const DBG_URL = 'http://127.0.0.1:7777/event';
+// 之前版本把日志 POST 到 http://127.0.0.1:7777/event（本地调试服务器），
+// 手机上该地址无人监听，日志全部丢失 → 排查 .obsidian 同步问题时"没有日志"。
+// 改为 console.log：Obsidian 移动端开发者控制台 / 桌面端控制台可见。
 function dbg(hyp: string, location: string, msg: string, data?: Record<string, unknown>): void {
   try {
-    void fetch(DBG_URL, { method: 'POST', body: JSON.stringify({ sessionId: 'sync-loop', runId: 'pre-fix', hypothesisId: hyp, location, msg: `[DEBUG] ${msg}`, data: data ?? {}, ts: Date.now() }) }).catch(() => {});
+    console.log(`[synx:dbg] [${hyp}] ${location}: ${msg}`, data ?? '');
   } catch { /* ignore */ }
 }
 // #endregion
@@ -405,6 +410,8 @@ export default class SynxSyncPlugin extends Plugin {
       this.refreshHistoryPanes(true);
       const report = this.reportStore.current;
       if (report && report.stats.push === 0 && report.stats.pull === 0 && report.stats.failed === 0) new Notice('Synx: 已是最新，无需同步');
+      // 写 .obsidian 同步诊断日志（移动端排查用）
+      await this.writeObsSyncDebug(files, skipped, skippedRemote, plan, report);
       // 主存储同步完成后，把本地内容镜像到备份存储（仅 push，不 pull）
       await this.mirrorToBackupStorages(files);
       // 同步全部成功后重建 prevSync 快照（失败时不重建，下次同步重试）
@@ -829,6 +836,46 @@ export default class SynxSyncPlugin extends Plugin {
       reason: action ? labelSyncReason(action.reason) : undefined,
       error: result.error,
     };
+  }
+
+  /**
+   * 写 .obsidian 同步诊断日志（每次同步后调用），便于移动端排查：
+   * 本地/远端 .obsidian 文件数、被过滤的文件及原因、计划动作分布、执行失败项。
+   * 文件位于插件目录，不会被同步到远端。
+   */
+  private async writeObsSyncDebug(
+    localFiles: LocalFile[],
+    localSkipped: ExecutableSyncAction[],
+    remoteSkipped: ExecutableSyncAction[],
+    plan: SyncPlan,
+    report: SyncReport | null,
+  ): Promise<void> {
+    try {
+      const isObs = (p: string) => p.startsWith('.obsidian/');
+      const planObs: Record<string, number> = {};
+      for (const a of plan.actions) {
+        if (!isObs(a.path)) continue;
+        planObs[a.type] = (planObs[a.type] ?? 0) + 1;
+      }
+      const failedObs = (report?.items ?? [])
+        .filter((item) => item.status === 'failed' && isObs(item.path))
+        .map((item) => `${item.path}${item.error ? ` (${item.error.message})` : ''}`);
+      const diag = {
+        ts: new Date().toISOString(),
+        device: this.settings.deviceName,
+        syncConfigDir: this.settings.syncConfigDir,
+        localObsCount: localFiles.filter((f) => isObs(f.path)).length,
+        localObsSkipped: localSkipped.filter((a) => isObs(a.path)).map((a) => ({ path: a.path, reason: (a as { reason?: string }).reason })),
+        remoteObsCount: this.remoteEntities.filter((e) => isObs(e.key.replace(/^\/+/, ''))).length,
+        remoteObsSkipped: remoteSkipped.filter((a) => isObs(a.path)).map((a) => ({ path: a.path, reason: (a as { reason?: string }).reason })),
+        planObs,
+        executedObsFailed: failedObs,
+      };
+      await this.app.vault.adapter.write(OBS_DEBUG_FILE, JSON.stringify(diag, null, 2));
+      console.log('[synx] .obsidian 同步诊断已写入', OBS_DEBUG_FILE, diag);
+    } catch (error) {
+      console.warn('[synx] 写 .obsidian 诊断日志失败', error instanceof Error ? error.message : String(error));
+    }
   }
 
   private async persist(): Promise<void> {
