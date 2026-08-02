@@ -26,9 +26,11 @@ describe('evaluateFile', () => {
   it('always skips synx runtime state and vault-root debug log', () => {
     // synx-state.json 永不同步
     expect(evaluateFile('.obsidian/plugins/synx-sync/synx-state.json', 1, base)).toMatchObject({ sync: false, rule: 'synx-state.json' });
-    // 诊断日志写在 vault 根目录（iOS 可见），同样必须排除，避免同步到远端
-    expect(evaluateFile('synx-debug.log', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug.log' });
-    expect(evaluateFile('synx-debug.log', 1, { ...base, syncConfigDir: true })).toMatchObject({ sync: false });
+    // 诊断日志写在 vault 根目录（iOS 可见，必须 .md 后缀），同样必须排除，避免同步到远端
+    expect(evaluateFile('synx-debug.md', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug.*' });
+    expect(evaluateFile('synx-debug.md', 1, { ...base, syncConfigDir: true })).toMatchObject({ sync: false });
+    // 旧版 .log 后缀也排除（v0.1.8 曾写入 synx-debug.log）
+    expect(evaluateFile('synx-debug.log', 1, base)).toMatchObject({ sync: false, rule: 'synx-debug.*' });
   });
 
   it('always skips .obsidian/workspace and workspace.json regardless of syncConfigDir', () => {

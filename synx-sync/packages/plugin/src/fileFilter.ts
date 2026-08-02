@@ -17,9 +17,11 @@ export function evaluateFile(path: string, size: number, settings: FilterSetting
   if (normalized === '.obsidian/plugins/synx-sync/synx-state.json') {
     return skipped('Synx 运行时状态不参与同步', 'synx-state.json', size);
   }
-  // 诊断日志写在 vault 根目录（iOS 上 .obsidian 是隐藏目录，文件 App 看不到），
-  // 该文件必须被排除，否则会被同步到远端。
-  if (normalized === 'synx-debug.log') return skipped('Synx 诊断日志不参与同步', 'synx-debug.log', size);
+  // 诊断日志写在 vault 根目录（iOS 上只显示 .md 文件，必须用 .md 后缀），
+  // 该文件必须被排除，否则会被同步到远端。旧版 .log 同名文件也一并排除。
+  if (normalized === 'synx-debug.md' || normalized === 'synx-debug.log') {
+    return skipped('Synx 诊断日志不参与同步', 'synx-debug.*', size);
+  }
   if (!settings.syncConfigDir && (normalized === '.obsidian' || matchesGlob(normalized, '.obsidian/**'))) return skipped('配置目录同步已关闭', '.obsidian/**', size);
   if (!settings.syncUnderscorePaths && normalized.split('/').some((segment) => segment.startsWith('_'))) return skipped('下划线路径同步已关闭', '_*', size);
   if (settings.maxFileSizeMb > 0 && size > settings.maxFileSizeMb * 1024 * 1024) {

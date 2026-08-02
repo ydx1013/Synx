@@ -47,10 +47,10 @@ function isStateData(raw: unknown): raw is SynxStateData {
 
 const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
 // .obsidian 同步诊断日志：每次同步后写入 vault 根目录。
-// 注意：必须写在 vault 根目录而不是 .obsidian 内——iOS 上 .obsidian 是隐藏
-// 目录，文件 App 看不到，用户无法导出诊断；vault 根目录的文件 iOS 直接可见。
+// 注意：必须写成 .md 后缀——iOS 文件 App / Obsidian 内只显示 .md 文件，
+// .log 等附件后缀在移动端不可见（实测 iOS 只能看到 .md）。
 // 该文件在 fileFilter 中被排除，不会被同步到远端。
-const OBS_DEBUG_FILE = 'synx-debug.log';
+const OBS_DEBUG_FILE = 'synx-debug.md';
 
 // #region debug-point Z:helper
 // 之前版本把日志 POST 到 http://127.0.0.1:7777/event（本地调试服务器），
@@ -878,7 +878,10 @@ export default class SynxSyncPlugin extends Plugin {
         planObs,
         executedObsFailed: failedObs,
       };
-      await this.app.vault.adapter.write(OBS_DEBUG_FILE, JSON.stringify(diag, null, 2));
+      await this.app.vault.adapter.write(
+        OBS_DEBUG_FILE,
+        `> [!note] Synx 同步诊断（.obsidian 配置目录）\n> 将本文件内容发给作者排查移动端看不到插件/主题的问题。\n\n\`\`\`json\n${JSON.stringify(diag, null, 2)}\n\`\`\`\n`,
+      );
       console.log('[synx] .obsidian 同步诊断已写入', OBS_DEBUG_FILE, diag);
     } catch (error) {
       console.warn('[synx] 写 .obsidian 诊断日志失败', error instanceof Error ? error.message : String(error));
