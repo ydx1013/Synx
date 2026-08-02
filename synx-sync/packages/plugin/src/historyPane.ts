@@ -56,6 +56,10 @@ export class HistoryPaneView extends ItemView {
     this.popover.close();
   }
 
+  renderCurrentStyle(): void {
+    if (this.currentFile && this.versions.length > 0) this.renderVersions();
+  }
+
   async refresh(silent = false) {
     const path = this.currentFile;
     const client = this.plugin.getWorkerClient();
@@ -125,9 +129,11 @@ export class HistoryPaneView extends ItemView {
       this.contentEl.createEl('p', { text: '无版本记录。' });
       return;
     }
-    const list = this.contentEl.createEl('ul', { cls: 'synx-version-list' });
+    const timeline = this.plugin.settings.historyStyle === 'timeline';
+    const list = this.contentEl.createEl('ul', { cls: `synx-version-list${timeline ? ' synx-version-timeline' : ''}` });
     for (const version of this.versions) {
       const item = list.createEl('li', { cls: `synx-version-item${version.isCurrent ? ' is-current' : ''}` });
+      if (timeline) item.createSpan({ cls: 'synx-version-dot', attr: { 'aria-hidden': 'true' } });
       const meta = item.createEl('div', { cls: 'synx-version-meta' });
       meta.createEl('span', { text: this.formatDate(version.createdAt) });
       if (version.isCurrent) meta.createEl('span', { text: '当前', cls: 'synx-tag-current' });

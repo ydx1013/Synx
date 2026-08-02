@@ -3,9 +3,11 @@ import { cors } from 'hono/cors';
 import type { Env, AppVars } from './types.js';
 import { auth } from './routes/auth.js';
 import { history } from './routes/history.js';
+import { inbox } from './routes/inbox.js';
 import { onedrive } from './routes/onedrive.js';
 import { storage } from './routes/storage.js';
 import { sync } from './routes/sync.js';
+import { tokens } from './routes/tokens.js';
 
 const app = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
@@ -26,7 +28,9 @@ app.get('/api/health', (c) => c.json({ ok: true, ts: Date.now() }));
 
 app.route('/api/auth', auth);
 app.route('/api/storage', storage);
+app.route('/api/tokens', tokens);
 app.route('/api/onedrive', onedrive);
+app.route('/api/inbox', inbox);
 app.route('/api', sync);
 app.route('/api', history);
 

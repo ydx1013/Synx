@@ -1,5 +1,6 @@
 import type {
-  AuthResponse, FileMeta, HistoryResponse, ListResponse, MeResponse,
+  AuthResponse, ApiTokenListResponse, CreateApiTokenRequest, CreateApiTokenResponse,
+  FileMeta, HistoryResponse, ListResponse, MeResponse,
   PreferencesResponse, StorageListResponse, StorageSummary, UpdatePreferencesRequest,
 } from '@synx/shared';
 import { ApiError, api, clearSession } from './client';
@@ -27,6 +28,12 @@ export const storageApi = {
   test: (body: unknown) => api<{ ok: boolean; message?: string }>('/api/storage/test', { method: 'POST', body: JSON.stringify(body) }),
   remove: (id: string) => api<{ ok: true; remoteFilesPreserved: true }>(`/api/storage/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   purge: (id: string) => api<{ total: number; deleted: number; failed: number }>(`/api/storage/${encodeURIComponent(id)}/purge`, { method: 'POST' }),
+};
+
+export const tokenApi = {
+  list: () => api<ApiTokenListResponse>('/api/tokens'),
+  create: (body: CreateApiTokenRequest) => api<CreateApiTokenResponse>('/api/tokens', { method: 'POST', body: JSON.stringify(body) }),
+  remove: (id: string) => api<{ ok: true }>(`/api/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 };
 
 /** OneDrive OAuth2 PKCE 流程（后端中转站不存储 token） */

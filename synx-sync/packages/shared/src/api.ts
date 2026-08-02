@@ -23,6 +23,11 @@ export const API = {
   storageDelete: '/api/storage/:id',
   storagePurge: '/api/storage/:id/purge',
   storageRetention: '/api/storage/:id/retention',
+  // 专用 API Token 与外部添加笔记
+  tokenList: '/api/tokens',
+  tokenCreate: '/api/tokens',
+  tokenDelete: '/api/tokens/:id',
+  inboxNoteCreate: '/api/inbox/notes',
   // 同步
   put: '/api/put',
   get: '/api/get',
@@ -85,6 +90,43 @@ export interface StorageListResponse {
 
 export interface RetentionPolicyResponse {
   policy: RetentionPolicy;
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  tokenPrefix: string;
+  storageId: string;
+  storageName?: string;
+  syncFolder: string;
+  targetFolder: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+}
+
+export interface CreateApiTokenRequest {
+  name: string;
+  storageId: string;
+  syncFolder: string;
+  targetFolder: string;
+}
+
+export interface CreateApiTokenResponse {
+  token: string;
+  apiToken: ApiToken;
+}
+
+export interface ApiTokenListResponse {
+  tokens: ApiToken[];
+}
+
+export interface CreateInboxNoteRequest {
+  title: string;
+  content: string;
+}
+
+export interface CreateInboxNoteResponse {
+  note: { path: string; fileUuid: string; versionId: string; createdAt: number };
 }
 
 export interface UpdateRetentionPolicyRequest extends Partial<RetentionPolicy> {}

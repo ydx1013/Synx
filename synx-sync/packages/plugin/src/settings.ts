@@ -1,6 +1,7 @@
 import type { RetentionPolicy, StorageSummary } from '@synx/shared';
 
 export type ConflictStrategy = 'newer-with-copy' | 'keep-local' | 'keep-remote' | 'pause';
+export type HistoryStyle = 'cards' | 'timeline';
 
 export interface SynxPluginSettings {
   serverUrl: string;
@@ -28,6 +29,7 @@ export interface SynxPluginSettings {
   showStatusBar: boolean;
   reportRetention: number;
   showMarkdownUuid: boolean;
+  historyStyle: HistoryStyle;
   /** 批量删除保护：本地文件数低于上次同步记录该百分比时，视为"骤降"（默认 50） */
   massDeleteProtectPercent: number;
   /** 仅当打开此开关时，骤降保护下才真正执行 delete-remote；否则一律转 pull */
@@ -67,6 +69,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   showStatusBar: true,
   reportRetention: 1,
   showMarkdownUuid: false,
+  historyStyle: 'cards',
   massDeleteProtectPercent: 50,
   allowBatchRemoteDelete: false,
   enableDebugLog: false,
@@ -81,6 +84,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
 };
 
 const conflictStrategies = new Set<ConflictStrategy>(['newer-with-copy', 'keep-local', 'keep-remote', 'pause']);
+const historyStyles = new Set<HistoryStyle>(['cards', 'timeline']);
 const saveDelays = new Set([0, 5, 10, 30]);
 const concurrencyValues = new Set([1, 2, 3, 5, 10]);
 const fileSizeValues = new Set([0, 1, 5, 10, 20, 50, 100, 200, 500, 1000]);
@@ -114,6 +118,7 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     showStatusBar: booleanValue(source.showStatusBar, defaults.showStatusBar),
     reportRetention: validPositiveNumber(source.reportRetention) ? Math.min(100, Math.floor(source.reportRetention)) : defaults.reportRetention,
     showMarkdownUuid: booleanValue(source.showMarkdownUuid, defaults.showMarkdownUuid),
+    historyStyle: typeof source.historyStyle === 'string' && historyStyles.has(source.historyStyle as HistoryStyle) ? source.historyStyle as HistoryStyle : defaults.historyStyle,
     massDeleteProtectPercent: validPercentage(source.massDeleteProtectPercent) ? source.massDeleteProtectPercent : defaults.massDeleteProtectPercent,
     allowBatchRemoteDelete: booleanValue(source.allowBatchRemoteDelete, defaults.allowBatchRemoteDelete),
     enableDebugLog: booleanValue(source.enableDebugLog, defaults.enableDebugLog),

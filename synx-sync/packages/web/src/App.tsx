@@ -15,6 +15,7 @@ export function App() {
       <Route path="/settings/storage" element={<SettingsLayout />} />
       <Route path="/settings/storage/new" element={<SettingsLayout />} />
       <Route path="/settings/storage/:storageId" element={<SettingsLayout />} />
+      <Route path="/settings/tokens" element={<SettingsLayout />} />
     </Route>
     <Route path="/login.html" element={<Navigate to="/login" replace />} />
     <Route path="/register.html" element={<Navigate to="/register" replace />} />

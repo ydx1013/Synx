@@ -58,6 +58,12 @@ describe('loadPluginSettings', () => {
     expect(loadPluginSettings({}, false).concurrency).toBe(5);
   });
 
+  it('defaults history style to cards and accepts timeline', () => {
+    expect(loadPluginSettings({}, false).historyStyle).toBe('cards');
+    expect(loadPluginSettings({ historyStyle: 'timeline' }, false).historyStyle).toBe('timeline');
+    expect(loadPluginSettings({ historyStyle: 'invalid' }, false).historyStyle).toBe('cards');
+  });
+
   it('normalizes backup storage ids (dedupe, trim, drop empty)', () => {
     const settings = loadPluginSettings({
       backupStorageIds: [' s1 ', 's2', 's1', '', '  ', 's3'],

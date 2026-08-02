@@ -1,7 +1,7 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type { RetentionPolicy } from '@synx/shared';
 import type SynxSyncPlugin from './main.js';
-import type { ConflictStrategy, SynxPluginSettings } from './settings.js';
+import type { ConflictStrategy, HistoryStyle, SynxPluginSettings } from './settings.js';
 import { WorkerApiError, WorkerClient } from './workerClient.js';
 
 export class SynxSettingTab extends PluginSettingTab {
@@ -274,6 +274,10 @@ export class SynxSettingTab extends PluginSettingTab {
       if (Number.isInteger(number) && number >= 1 && number <= 100) await this.applyPatch({ reportRetention: number });
     }));
     this.addToggle(container, '显示笔记 UUID', settings.showMarkdownUuid, async (value) => this.applyPatch({ showMarkdownUuid: value }));
+    new Setting(container).setName('历史记录样式').addDropdown((dropdown) => {
+      dropdown.addOption('cards', '经典卡片').addOption('timeline', '时间轴');
+      dropdown.setValue(settings.historyStyle).onChange(async (value) => this.applyPatch({ historyStyle: value as HistoryStyle }));
+    });
     this.addToggle(container, '生成诊断日志', settings.enableDebugLog, async (value) => this.applyPatch({ enableDebugLog: value }), '写入 synx-debug-<设备名>.md，用于排查移动端同步问题；默认关闭');
     new Setting(container).addButton((button) => button.setButtonText('打开版本历史').onClick(async () => this.plugin.activateHistoryPane())).addButton((button) => button.setButtonText('打开同步详情').onClick(async () => this.plugin.activateSyncDetails())).addButton((button) => button.setButtonText('立即同步').setCta().onClick(async () => this.plugin.triggerSync()));
   }

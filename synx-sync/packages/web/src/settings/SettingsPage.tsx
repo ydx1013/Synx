@@ -1,19 +1,18 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Check, Cloud, LogOut, Pencil, Plus, Settings, Trash2 } from 'lucide-react';
+import { ArrowLeft, Check, Cloud, Copy, KeyRound, Pencil, Plus, Settings, Trash2 } from 'lucide-react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { authApi, onedriveApi, storageApi } from '../api/queries';
+import { authApi, onedriveApi, storageApi, tokenApi } from '../api/queries';
 import { useAuth } from '../auth/AuthProvider';
 import { Dialog } from '../components/Dialog';
+import { buildApiExamples } from './apiGuide';
 
 export function SettingsLayout() {
-  const navigate = useNavigate();
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   return <div className="settings-shell"><aside className="settings-sidebar">
     <Link className="settings-back" to="/notes"><ArrowLeft size={17} />返回笔记</Link>
     <div className="settings-account"><span className="avatar">{user?.username.slice(0, 1).toUpperCase()}</span><div><strong>{user?.username}</strong><small>{user?.email}</small></div></div>
-    <nav><Link className="active" to="/settings"><Settings size={17} />常规设置</Link><Link to="/settings/storage"><Cloud size={17} />存储管理</Link></nav>
-    <button className="sidebar-logout" onClick={() => { logout(); navigate('/login'); }}><LogOut size={17} />退出登录</button>
+    <nav><Link className="active" to="/settings"><Settings size={17} />常规设置</Link><Link to="/settings/storage"><Cloud size={17} />存储管理</Link><Link to="/settings/tokens"><KeyRound size={17} />API Token</Link></nav>
   </aside><SettingsContent /></div>;
 }
 
@@ -21,6 +20,7 @@ function SettingsContent() {
   const path = useLocation().pathname;
   if (path === '/settings/storage/new' || /^\/settings\/storage\/[^/]+$/.test(path)) return <StorageForm />;
   if (path === '/settings/storage') return <StorageList />;
+  if (path === '/settings/tokens') return <TokenSettings />;
   return <GeneralSettings />;
 }
 
@@ -46,6 +46,63 @@ function GeneralSettings() {
 }
 
 const TYPE_LABELS: Record<string, string> = { webdav: 'WebDAV', s3: 'S3 兼容', onedrive: 'OneDrive', dropbox: 'Dropbox' };
+
+function CodeExample({ title, code }: { title: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    await navigator.clipboard.writeText(code);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+  return <div className="api-code"><header><strong>{title}</strong><button onClick={copy} aria-label={`复制 ${title} 示例`}><Copy size={14} />{copied ? '已复制' : '复制'}</button></header><pre><code>{code}</code></pre></div>;
+}
+
+function ApiGuide() {
+  const examples = buildApiExamples(window.location.origin);
+  return <section className="api-guide" aria-labelledby="api-guide-title">
+    <header><h2 id="api-guide-title">API 使用说明</h2><p>通过外部程序将 Markdown 笔记添加到 Token 绑定的文件夹。</p></header>
+    <div className="api-guide-section"><h3>1. 准备 Token</h3><ol><li>点击页面上方“创建 Token”。</li><li>选择存储、同步根目录和目标子文件夹。</li><li>立即复制并保存密钥；完整 Token 只显示一次。</li></ol></div>
+    <div className="api-guide-section"><h3>2. 请求格式</h3><dl className="api-fields"><div><dt>地址</dt><dd><code>POST /api/inbox/notes</code></dd></div><div><dt>鉴权</dt><dd><code>Authorization: Bearer synx_pat_你的Token</code></dd></div><div><dt>title</dt><dd>必填字符串，用作 Markdown 文件名，不需要填写 <code>.md</code>。</dd></div><div><dt>content</dt><dd>必填字符串，笔记的 Markdown 正文。</dd></div></dl></div>
+    <div className="api-guide-section"><h3>3. 调用示例</h3><div className="api-examples"><CodeExample title="cURL" code={examples.curl} /><CodeExample title="PowerShell" code={examples.powershell} /><CodeExample title="JavaScript" code={examples.javascript} /></div></div>
+    <div className="api-guide-section"><h3>4. 成功响应</h3><CodeExample title="HTTP 201" code={'{\n  "note": {\n    "path": "收件箱/会议记录.md",\n    "fileUuid": "生成的 UUID",\n    "versionId": "版本 ID",\n    "createdAt": 1785714000000\n  }\n}'} /></div>
+    <div className="api-guide-section"><h3>5. 常见错误</h3><div className="api-errors"><span><code>400</code> JSON、标题或正文无效</span><span><code>401</code> Token 无效或已撤销</span><span><code>409</code> 目标文件夹已有同名笔记</span><span><code>413</code> 笔记超过存储策略限制</span><span><code>429</code> 超过每分钟 60 次请求</span><span><code>500</code> 服务端写入失败</span></div></div>
+    <aside className="api-notes"><strong>行为与安全提示</strong><ul><li>笔记只能写入该 Token 创建时绑定的文件夹。</li><li>服务会自动添加 <code>.md</code> 后缀和 <code>synx-id</code>，且不会覆盖同名笔记。</li><li>不要把 Token 放入浏览器前端代码、公开仓库、日志或聊天记录；泄露后请立即撤销。</li></ul></aside>
+  </section>;
+}
+
+function TokenSettings() {
+  const client = useQueryClient();
+  const me = useQuery({ queryKey: ['me'], queryFn: authApi.me });
+  const storages = useQuery({ queryKey: ['storages'], queryFn: storageApi.list });
+  const tokens = useQuery({ queryKey: ['api-tokens'], queryFn: tokenApi.list });
+  const [createOpen, setCreateOpen] = useState(false);
+  const [removeId, setRemoveId] = useState<string | null>(null);
+  const [secret, setSecret] = useState('');
+  const [status, setStatus] = useState('');
+
+  async function create(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.currentTarget)) as Record<string, string>;
+    try {
+      const result = await tokenApi.create({ name: data.name.trim(), storageId: data.storageId, syncFolder: data.syncFolder.trim(), targetFolder: data.targetFolder.trim() });
+      setSecret(result.token); setCreateOpen(false); await client.invalidateQueries({ queryKey: ['api-tokens'] });
+    } catch (error) { setStatus(error instanceof Error ? error.message : '创建失败'); }
+  }
+  async function remove() {
+    if (!removeId) return;
+    await tokenApi.remove(removeId); setRemoveId(null); await client.invalidateQueries({ queryKey: ['api-tokens'] });
+  }
+
+  return <main className="settings-content"><header className="settings-heading row"><div><h1>API Token</h1><p>创建只能向指定文件夹新增笔记的专用密钥。</p></div><button className="primary-button" onClick={() => setCreateOpen(true)}><Plus size={16} />创建 Token</button></header>
+    {status && <p className="notice" role="status">{status}</p>}
+    <section className="storage-grid">{tokens.data?.tokens.length ? tokens.data.tokens.map(token => <article className="storage-card" key={token.id}><div className="storage-icon"><KeyRound /></div><div className="storage-details"><div><h2>{token.name}</h2></div><p>{token.storageName ?? token.storageId} · {token.syncFolder}{token.targetFolder}</p><small>{token.tokenPrefix}… · 创建于 {new Date(token.createdAt).toLocaleDateString()}{token.lastUsedAt ? ` · 最近使用 ${new Date(token.lastUsedAt).toLocaleString()}` : ''}</small></div><div className="storage-actions"><button className="danger-text" onClick={() => setRemoveId(token.id)}><Trash2 size={15} />撤销</button></div></article>) : <div className="empty-settings"><KeyRound size={38} /><h2>还没有 API Token</h2><p>创建后可通过外部程序向绑定文件夹添加 Markdown 笔记。</p></div>}</section>
+    <ApiGuide />
+    <Dialog open={createOpen} onOpenChange={setCreateOpen} title="创建 API Token"><form className="settings-form" onSubmit={create}><label>名称<input name="name" required maxLength={100} placeholder="例如：快捷指令" /></label><label>存储<select name="storageId" required defaultValue={me.data?.preferences.defaultStorageId ?? ''}><option value="">请选择</option>{storages.data?.storages.map(storage => <option key={storage.id} value={storage.id}>{storage.name}</option>)}</select></label><label>同步根目录<input name="syncFolder" required defaultValue={me.data?.preferences.defaultSyncFolder ?? 'my-vault/'} /></label><label>目标子文件夹<input name="targetFolder" required placeholder="收件箱/API" /></label><div className="dialog-actions"><button type="button" onClick={() => setCreateOpen(false)}>取消</button><button className="primary-button">创建</button></div></form></Dialog>
+    <Dialog open={Boolean(secret)} onOpenChange={open => !open && setSecret('')} title="保存 API Token"><p>此 Token 只显示一次，请立即复制并妥善保存。</p><label className="dialog-field">API Token<input value={secret} readOnly /></label><div className="dialog-actions"><button onClick={() => void navigator.clipboard.writeText(secret)}><Copy size={15} />复制</button><button className="primary-button" onClick={() => setSecret('')}>完成</button></div></Dialog>
+    <Dialog open={Boolean(removeId)} onOpenChange={open => !open && setRemoveId(null)} title="撤销 API Token"><p>撤销后，使用该 Token 的外部程序将立即无法添加笔记。</p><div className="dialog-actions"><button onClick={() => setRemoveId(null)}>取消</button><button className="danger-button" onClick={remove}>确认撤销</button></div></Dialog>
+  </main>;
+}
+
 /** 把 config 值（string|number|boolean）安全转为 input defaultValue 可用的字符串 */
 const str = (value: string | number | boolean | undefined) => value == null ? undefined : String(value);
 

@@ -164,6 +164,12 @@ export default class SynxSyncPlugin extends Plugin {
     await this.persist();
     if (patch.serverUrl !== undefined || patch.jwt !== undefined || patch.storageId !== undefined || patch.syncFolder !== undefined) this.rebuildClient();
     if (patch.showMarkdownUuid !== undefined) this.updateUuidEditorExtension();
+    if (patch.historyStyle !== undefined) {
+      for (const leaf of this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)) {
+        const view = leaf.view;
+        if (view instanceof HistoryPaneView) view.renderCurrentStyle();
+      }
+    }
     this.scheduler?.updateSettings(this.settings);
     this.updateStatusBar();
   }
