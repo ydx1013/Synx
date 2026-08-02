@@ -123,6 +123,21 @@ describe('POST /api/auth/login', () => {
     const res = await app.request('/api/auth/login', postBody({ usernameOrEmail: 'nobody', password: 'x' }), env);
     expect(res.status).toBe(429);
   });
+
+  it('does not share the rate-limit bucket across accounts', async () => {
+    // 回归：限流按账号维度而非客户端 IP。
+    // 手机端常走运营商 NAT/代理，IP 不稳定，若按 IP 限流会误伤正常登录。
+    const db = makeD1Mock({ first: null });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+    const env = makeEnv({ DB: db, KV: kv });
+    for (let i = 0; i < 5; i++) {
+      await app.request('/api/auth/login', postBody({ usernameOrEmail: 'nobody', password: 'x' }), env);
+    }
+    // 'nobody' 已超限，但其他账号不应被连带限流
+    const res = await app.request('/api/auth/login', postBody({ usernameOrEmail: 'alice', password: 'x' }), env);
+    expect(res.status).not.toBe(429);
+  });
 });
 
 describe('GET /api/auth/me', () => {

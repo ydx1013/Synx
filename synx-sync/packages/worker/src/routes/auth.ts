@@ -3,7 +3,7 @@ import type { User } from '@synx/shared';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { signJwt } from '../auth/jwt.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { checkRateLimit, getClientId } from '../middleware/rateLimit.js';
+import { checkRateLimit } from '../middleware/rateLimit.js';
 import type { Env, AppVars } from '../types.js';
 import type {
   AuthResponse,
@@ -83,13 +83,17 @@ auth.post('/register', async (c) => {
 });
 
 auth.post('/login', async (c) => {
-  const clientId = getClientId(c);
-  const { allowed } = await checkRateLimit(c.env.KV, `login:${clientId}`, LOGIN_RATE_MAX, LOGIN_RATE_WINDOW);
-  if (!allowed) return c.json({ error: 'too many login attempts, try later' }, 429);
-
   const body = await c.req.json<LoginRequest>();
   const { usernameOrEmail, password } = body;
   if (!usernameOrEmail || !password) return c.json({ error: 'missing fields' }, 400);
+
+  // 按账号限流：手机端常走运营商 NAT/代理，取不到稳定 IP。
+  // 若按客户端 IP 限流，所有此类请求会挤进同一个桶（甚至退化为 'unknown'），
+  // 5 次/分钟的配额被共享流量耗尽，导致「电脑/网页正常、手机登录失败（429）」。
+  // 改为按账号维度，同一账号 60 秒内最多 LOGIN_RATE_MAX 次尝试，互不干扰。
+  const accountKey = usernameOrEmail.trim().toLowerCase();
+  const { allowed } = await checkRateLimit(c.env.KV, `login:acct:${accountKey}`, LOGIN_RATE_MAX, LOGIN_RATE_WINDOW);
+  if (!allowed) return c.json({ error: 'too many login attempts, try later' }, 429);
 
   const row = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? OR email = ?')
     .bind(usernameOrEmail, usernameOrEmail)

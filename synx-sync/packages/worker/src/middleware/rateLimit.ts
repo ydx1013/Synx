@@ -11,12 +11,3 @@ export async function checkRateLimit(
   await kv.put(key, String(count + 1), { expirationTtl: windowSec });
   return { allowed: true, count: count + 1 };
 }
-
-/** 从请求中提取客户端标识（用于限流 key） */
-export function getClientId(c: { req: { header: (n: string) => string | undefined } }): string {
-  return (
-    c.req.header('cf-connecting-ip') ??
-    c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ??
-    'unknown'
-  );
-}
