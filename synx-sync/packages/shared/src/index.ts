@@ -5,14 +5,21 @@ export * from './api.js';
 /** 工具：base64 <-> ArrayBuffer */
 export function arrayBufferToBase64(buf: ArrayBuffer | Uint8Array): string {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  // Obsidian/Electron 环境下 btoa 可能 "Illegal invocation"，优先用 Buffer
   const g = globalThis as Record<string, unknown>;
   if (typeof g.Buffer !== 'undefined') {
     return (g.Buffer as { from(d: Uint8Array): { toString(e: string): string } }).from(bytes).toString('base64');
   }
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
+  // 分块编码：避免逐字节拼接字符串的 O(n²)。大文件（如 PDF）用逐字节循环会让
+  // Cloudflare Workers 免费版 CPU 超限（错误码 1102）→ 503。每块 32KiB 内做一次 btoa。
+  const CHUNK = 0x8000;
+  let result = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const end = Math.min(i + CHUNK, bytes.length);
+    let binary = '';
+    for (let j = i; j < end; j++) binary += String.fromCharCode(bytes[j]);
+    result += btoa(binary);
+  }
+  return result;
 }
 
 export function base64ToArrayBuffer(b64: string): ArrayBuffer {

@@ -1,11 +1,5 @@
 import { Hono } from 'hono';
-import {
-  arrayBufferToBase64,
-  base64ToArrayBuffer,
-  type PutResponse,
-  type GetResponse,
-  type ListResponse,
-} from '@synx/shared';
+import { type PutResponse, type ListResponse } from '@synx/shared';
 import { authMiddleware } from '../middleware/auth.js';
 import { getFs, StorageError } from '../storage/factory.js';
 import { deleteFile, putVersion, getVersion, listFiles, VersionConflict } from '../services/versionService.js';
@@ -16,23 +10,30 @@ export const sync = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
 sync.use('*', authMiddleware);
 
-// POST /api/put  {path, mtime, content(base64), author?}
+// POST /api/put?path=&mtime=&fileUuid=&author=&baseVersionId=  body=原始二进制
+// 上传大文件不做 base64 编码：Cloudflare Workers 免费版 CPU 配额仅 10ms/请求，
+// base64 编码/解码 8MB+ 内容必然超限（错误 1102）。改为二进制流传输（同 remotely-save 直连 S3 的做法）。
 sync.post('/put', async (c) => {
   const storageId = c.req.header('X-Storage-Id');
   const syncFolder = c.req.header('X-Sync-Folder');
   if (!storageId || !syncFolder) return c.json({ error: 'missing X-Storage-Id or X-Sync-Folder' }, 400);
 
-  const body = await c.req.json<{ path: string; fileUuid?: string; mtime: number; content: string; author?: string; baseVersionId?: string }>();
-  const missing: string[] = [];
-  if (!body.path) missing.push('path');
-  if (body.mtime == null) missing.push('mtime');
-  if (body.content == null) missing.push('content');
-  if (missing.length > 0) return c.json({ error: `missing fields: ${missing.join(', ')}` }, 400);
+  const path = c.req.query('path');
+  const fileUuid = c.req.query('fileUuid') || undefined;
+  const mtimeStr = c.req.query('mtime');
+  const author = c.req.query('author') || undefined;
+  const baseVersionId = c.req.query('baseVersionId') || undefined;
+  if (!path || mtimeStr == null) {
+    const missing = [!path ? 'path' : null, mtimeStr == null ? 'mtime' : null].filter(Boolean);
+    return c.json({ error: `missing fields: ${missing.join(', ')}` }, 400);
+  }
+  const mtime = Number(mtimeStr);
+  if (Number.isNaN(mtime)) return c.json({ error: 'invalid mtime' }, 400);
 
   const userId = c.get('userId');
   try {
     const { fs } = await getFs(c.env, userId, storageId);
-    const content = base64ToArrayBuffer(body.content);
+    const content = await c.req.arrayBuffer();
     // put 前校验文件大小
     const policy = await getRetentionPolicy(c.env, storageId);
     enforceMaxFileSize(content.byteLength, policy);
@@ -42,12 +43,12 @@ sync.post('/put', async (c) => {
       storageId,
       syncFolder,
       fs,
-      path: body.path,
-      fileUuid: body.fileUuid,
+      path,
+      fileUuid,
       content,
-      mtime: body.mtime,
-      author: body.author,
-      baseVersionId: body.baseVersionId,
+      mtime,
+      author,
+      baseVersionId,
     });
     const res: PutResponse = { version };
     return c.json(res, 201);
@@ -56,7 +57,8 @@ sync.post('/put', async (c) => {
   }
 });
 
-// GET /api/get?path=&version=
+// GET /api/get?path=&version=&fileUuid=  → 返回原始二进制 + X-Synx-Version 头
+// 不在 worker 内 base64 编码，避免大文件 CPU 超限（1102）。
 sync.get('/get', async (c) => {
   const storageId = c.req.header('X-Storage-Id');
   if (!storageId) return c.json({ error: 'missing X-Storage-Id' }, 400);
@@ -80,8 +82,11 @@ sync.get('/get', async (c) => {
       fileUuid,
       versionId: version,
     });
-    const res: GetResponse = { content: arrayBufferToBase64(content), version: ver };
-    return c.json(res);
+    // 二进制透传；version 元数据放响应头，避免 JSON 包装引入 base64
+    return c.body(content, 200, {
+      'Content-Type': 'application/octet-stream',
+      'X-Synx-Version': JSON.stringify(ver),
+    });
   } catch (e) {
     return handleStorageError(c, e);
   }

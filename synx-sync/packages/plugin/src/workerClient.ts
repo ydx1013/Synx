@@ -1,12 +1,9 @@
 import {
   API,
-  arrayBufferToBase64,
-  base64ToArrayBuffer,
   HEADERS,
   type Entity,
   type FileMeta,
   type PutResponse,
-  type GetResponse,
   type ListResponse,
   type HistoryResponse,
   type RollbackResponse,
@@ -88,25 +85,23 @@ export class WorkerClient {
     return res.files.map(fileToEntity);
   }
 
-  /** 读取 current 版本内容（不传 versionId） */
+  /** 读取文件内容（二进制直传，不经 base64；version 元数据通过 X-Synx-Version 响应头返回） */
   async readFile(path: string, versionId?: string, fileUuid?: string): Promise<ArrayBuffer> {
     const params = new URLSearchParams({ path });
     if (versionId) params.set('version', versionId);
     if (fileUuid) params.set('fileUuid', fileUuid);
-    const res = await this.request<GetResponse>('GET', `${API.get}?${params.toString()}`);
-    return base64ToArrayBuffer(res.content);
+    const res = await this.requestResponse('GET', `${API.get}?${params.toString()}`);
+    return res.arrayBuffer();
   }
 
-  /** 写入新版本（产生新 VersionRecord） */
+  /** 写入新版本（二进制直传，产生新 VersionRecord） */
   async writeFile(path: string, content: ArrayBuffer | Uint8Array, mtime: number, author?: string, fileUuid?: string): Promise<VersionRecord> {
-    const res = await this.request<PutResponse>('POST', API.put, {
-      path,
-      fileUuid,
-      mtime,
-      content: arrayBufferToBase64(content),
-      author,
-    });
-    return res.version;
+    const params = new URLSearchParams({ path, mtime: String(mtime) });
+    if (fileUuid) params.set('fileUuid', fileUuid);
+    if (author) params.set('author', author);
+    const res = await this.requestResponse('POST', `${API.put}?${params.toString()}`, content, true);
+    const data = (await res.json()) as PutResponse;
+    return data.version;
   }
 
   async deleteFile(path: string, fileUuid?: string): Promise<void> {
@@ -182,6 +177,16 @@ export class WorkerClient {
   // ===== 内部：带重试的请求 =====
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.requestResponse(method, path, body);
+    return res.json() as Promise<T>;
+  }
+
+  /**
+   * 带重试的原始请求：返回 Response（调用方决定读 json 还是 arrayBuffer）。
+   * @param body 普通对象（JSON）或 ArrayBuffer/Uint8Array（二进制直传）
+   * @param isBinary body 为二进制时置 true（Content-Type 用 octet-stream）
+   */
+  private async requestResponse(method: string, path: string, body?: unknown, isBinary = false): Promise<Response> {
     let lastErr: unknown;
     const url = joinUrl(this.opts.serverUrl, path);
     const isUpload = method === 'POST' && body !== undefined;
@@ -192,13 +197,13 @@ export class WorkerClient {
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       const startedAt = Date.now();
       try {
-        const headers = this.headers(body !== undefined);
-        const bodyStr = body !== undefined ? JSON.stringify(body) : undefined;
-        console.log('synx request', { method, url, attempt: attempt + 1, bodyLen: bodyStr?.length ?? 0, timeoutMs });
+        const headers = this.headers(body !== undefined, isBinary);
+        const bodyData = body !== undefined && !isBinary ? JSON.stringify(body) : body;
+        console.log('synx request', { method, url, attempt: attempt + 1, bodyLen: bodyData?.length ?? 0, timeoutMs });
         const res = await this.fetchImpl(url, {
           method,
           headers,
-          body: bodyStr,
+          body: bodyData as BodyInit | undefined,
           signal: controller.signal,
         });
         const elapsed = Date.now() - startedAt;
@@ -221,7 +226,7 @@ export class WorkerClient {
         if (!res.ok) {
           throw new WorkerApiError(res.status, await safeErrorText(res), attempt + 1);
         }
-        return res.json() as Promise<T>;
+        return res;
       } catch (e) {
         const elapsed = Date.now() - startedAt;
         const isTimeout = e instanceof DOMException && e.name === 'AbortError';
@@ -257,13 +262,13 @@ export class WorkerClient {
     throw lastErr ?? new Error('request failed');
   }
 
-  private headers(hasBody: boolean): Record<string, string> {
+  private headers(hasBody: boolean, isBinary = false): Record<string, string> {
     const h: Record<string, string> = {
       [HEADERS.authorization]: `Bearer ${this.opts.jwt}`,
       [HEADERS.storageId]: this.opts.storageId,
       [HEADERS.syncFolder]: this.opts.syncFolder,
     };
-    if (hasBody) h[HEADERS.contentType] = 'application/json';
+    if (hasBody) h[HEADERS.contentType] = isBinary ? 'application/octet-stream' : 'application/json';
     return h;
   }
 }

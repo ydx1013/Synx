@@ -92,11 +92,11 @@ describe('POST /api/put', () => {
   it('returns 400 when X-Storage-Id missing', async () => {
     const app = makeApp();
     const res = await app.request(
-      '/api/put',
+      '/api/put?path=a&mtime=1',
       {
         method: 'POST',
-        body: JSON.stringify({ path: 'a', mtime: 1, content: 'YQ==' }),
-        headers: { 'Content-Type': 'application/json', 'X-Sync-Folder': SYNC_FOLDER, ...authHeaders() },
+        body: new TextEncoder().encode('a'),
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Sync-Folder': SYNC_FOLDER, ...authHeaders() },
       },
       makeEnv(),
     );
@@ -106,11 +106,11 @@ describe('POST /api/put', () => {
   it('returns 400 when X-Sync-Folder missing', async () => {
     const app = makeApp();
     const res = await app.request(
-      '/api/put',
+      '/api/put?path=a&mtime=1',
       {
         method: 'POST',
-        body: JSON.stringify({ path: 'a', mtime: 1, content: 'YQ==' }),
-        headers: { 'Content-Type': 'application/json', 'X-Storage-Id': STORAGE_ID, ...authHeaders() },
+        body: new TextEncoder().encode('a'),
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Storage-Id': STORAGE_ID, ...authHeaders() },
       },
       makeEnv(),
     );
@@ -123,9 +123,9 @@ describe('POST /api/put', () => {
       '/api/put',
       {
         method: 'POST',
-        body: JSON.stringify({ path: 'a' }),
+        body: new TextEncoder().encode('a'),
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/octet-stream',
           'X-Storage-Id': STORAGE_ID,
           'X-Sync-Folder': SYNC_FOLDER,
           ...authHeaders(),
@@ -135,20 +135,20 @@ describe('POST /api/put', () => {
     );
     expect(res.status).toBe(400);
     const data = await res.json<{ error: string }>();
+    expect(data.error).toContain('path');
     expect(data.error).toContain('mtime');
-    expect(data.error).toContain('content');
   });
 
   it('accepts empty file content (0-byte file)', async () => {
     const app = makeApp();
     const env = await makeEnvWithStorage();
     const res = await app.request(
-      '/api/put',
+      '/api/put?path=empty.md&mtime=1&fileUuid=550e8400-e29b-41d4-a716-446655440000',
       {
         method: 'POST',
-        body: JSON.stringify({ path: 'empty.md', fileUuid: '550e8400-e29b-41d4-a716-446655440000', mtime: 1, content: '' }),
+        body: new Uint8Array(0),
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/octet-stream',
           'X-Storage-Id': STORAGE_ID,
           'X-Sync-Folder': SYNC_FOLDER,
           ...authHeaders(),
@@ -162,12 +162,12 @@ describe('POST /api/put', () => {
   it('returns 401 without auth', async () => {
     const app = makeApp();
     const res = await app.request(
-      '/api/put',
+      '/api/put?path=a&mtime=1',
       {
         method: 'POST',
-        body: JSON.stringify({ path: 'a', mtime: 1, content: 'YQ==' }),
+        body: new TextEncoder().encode('a'),
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/octet-stream',
           'X-Storage-Id': STORAGE_ID,
           'X-Sync-Folder': SYNC_FOLDER,
         },
@@ -179,21 +179,16 @@ describe('POST /api/put', () => {
 
   it('returns 413 when content exceeds maxFileSize', async () => {
     const app = makeApp();
-    // 构造 > 20MB 的 base64 内容（仅校验体积，不必真填 20MB 数据）
-    // 20MB = 20 * 1024 * 1024 = 20971520；base64 编码会膨胀 ~1.33 倍
-    // 直接构造一个超大字符串：base64 → ArrayBuffer 后 > maxFileSize
-    const big = 'A'.repeat(21 * 1024 * 1024); // 21MB 字符串，base64 解码后约 15.75MB... 不够
-    // 重新算：maxFileSize = 20MB = 20971520 bytes；base64 4 个字符 → 3 字节
-    // 要让解码后 > 20971520，需要 base64 长度 > 27962027；构造 ~28MB 字符串
-    const oversized = 'A'.repeat(28 * 1024 * 1024);
+    // 构造 > 20MB 的原始二进制内容（仅校验体积）
+    const oversized = new Uint8Array(21 * 1024 * 1024);
     const env = await makeEnvWithStorage();
     const res = await app.request(
-      '/api/put',
+      '/api/put?path=big&mtime=1',
       {
         method: 'POST',
-        body: JSON.stringify({ path: 'big', mtime: 1, content: oversized }),
+        body: oversized,
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/octet-stream',
           'X-Storage-Id': STORAGE_ID,
           'X-Sync-Folder': SYNC_FOLDER,
           ...authHeaders(),

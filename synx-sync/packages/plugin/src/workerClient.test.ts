@@ -92,11 +92,13 @@ describe('list', () => {
 });
 
 describe('readFile', () => {
-  it('returns ArrayBuffer decoded from base64', async () => {
+  it('returns ArrayBuffer from binary body', async () => {
     const text = 'hello world';
-    const b64 = btoa(text);
     const fetchMock = vi.fn().mockResolvedValue(
-      jsonRes({ content: b64, version: { userId: 'u', storageId: STORAGE_ID, path: 'a.md', versionId: 'v', mtime: 1, size: 11, hash: 'h', storageKey: 'k', isCurrent: 1, author: null, createdAt: 1 } }),
+      new Response(new TextEncoder().encode(text), {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Synx-Version': JSON.stringify({ versionId: 'v' }) },
+      }),
     );
     const client = makeClient(fetchMock);
     const buf = await client.readFile('a.md');
@@ -105,7 +107,10 @@ describe('readFile', () => {
 
   it('passes version query param when given', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      jsonRes({ content: 'YQ==', version: { userId: 'u', storageId: STORAGE_ID, path: 'a.md', versionId: 'v1', mtime: 1, size: 1, hash: 'h', storageKey: 'k', isCurrent: 0, author: null, createdAt: 1 } }),
+      new Response(new TextEncoder().encode('a'), {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      }),
     );
     const client = makeClient(fetchMock);
     await client.readFile('a.md', 'v1');
@@ -114,7 +119,7 @@ describe('readFile', () => {
 });
 
 describe('writeFile', () => {
-  it('sends PUT with base64 content', async () => {
+  it('sends binary body with query params', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonRes({ version: { userId: 'u', storageId: STORAGE_ID, path: 'a.md', versionId: 'v', mtime: 1, size: 5, hash: 'h', storageKey: 'k', isCurrent: 1, author: null, createdAt: 1 } }, 201),
     );
@@ -122,12 +127,14 @@ describe('writeFile', () => {
     const content = new TextEncoder().encode('hello');
     const version = await client.writeFile('a.md', content, 1700000000, 'device-a');
     expect(version.versionId).toBe('v');
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
-    const body = JSON.parse(init.body as string);
-    expect(body.path).toBe('a.md');
-    expect(body.mtime).toBe(1700000000);
-    expect(body.content).toBe(btoa('hello'));
-    expect(body.author).toBe('device-a');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('/api/put?');
+    expect(url).toContain('path=a.md');
+    expect(url).toContain('mtime=1700000000');
+    expect(url).toContain('author=device-a');
+    expect(init.method).toBe('POST');
+    expect(init.body).toEqual(content);
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/octet-stream');
   });
 });
 

@@ -91,13 +91,16 @@ export interface UpdateRetentionPolicyRequest extends Partial<RetentionPolicy> {
 
 // ===== 同步 API =====
 
+/**
+ * POST /api/put 使用「查询参数 + 原始二进制 body」：
+ * URL query: path / fileUuid / mtime / author / baseVersionId
+ * body: 文件内容（octet-stream），不再 base64 编码。
+ */
 export interface PutRequest {
   /** vault 内相对路径 */
   path: string;
   fileUuid?: string;
   mtime: number;
-  /** base64 编码内容 */
-  content: string;
   /** 设备标识 */
   author?: string;
   /** 并发保护：打开文件时的当前版本；远端已变化则返回 409 */
@@ -114,9 +117,14 @@ export interface GetRequest {
   version?: string;
 }
 
+/**
+ * GET /api/get 的响应为「原始二进制 body + X-Synx-Version 响应头」。
+ * content 不再经 base64 编码（大文件在 worker 内 base64 会触发 Cloudflare 免费版
+ * CPU 超限 error 1102）。客户端直接读取 response.arrayBuffer()。
+ */
 export interface GetResponse {
-  /** base64 编码内容 */
-  content: string;
+  /** 文件内容（客户端从二进制 body 读取，不再走 base64） */
+  content: ArrayBuffer;
   version: VersionRecord;
 }
 

@@ -73,8 +73,10 @@ test('浏览器完成注册、新增、编辑和删除 WebDAV', async ({ page })
   await expect(page.getByRole('heading', { name: '存储管理' })).toBeVisible();
   await expect(page.locator('.empty-settings')).toContainText('还没有远程存储');
 
-  // 新增 WebDAV
-  await page.getByRole('link', { name: '添加 WebDAV' }).first().click();
+  // 新增 WebDAV（默认存储类型）
+  await page.getByRole('link', { name: '添加存储' }).first().click();
+  await expect(page.getByRole('heading', { name: '添加存储' })).toBeVisible();
+  await expect(page.locator('.storage-type-picker .type-option')).toHaveCount(3);
   await page.getByLabel('名称', { exact: true }).fill(storage.name);
   await page.getByLabel('HTTPS 地址').fill(storage.config.address);
   await page.getByLabel('用户名', { exact: true }).fill(storage.config.username);

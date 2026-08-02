@@ -19,6 +19,7 @@ app.use('/api/*', cors({
   origin: (origin) => (origin && OBSIDIAN_ORIGINS.has(origin) ? origin : ''),
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Authorization', 'Content-Type', 'X-Storage-Id', 'X-Sync-Folder'],
+  exposeHeaders: ['X-Synx-Version', 'Content-Length'],
 }));
 
 app.get('/api/health', (c) => c.json({ ok: true, ts: Date.now() }));
