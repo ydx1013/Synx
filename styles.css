@@ -1,0 +1,230 @@
+/* Synx Sync 插件样式 */
+
+/* ===== 历史侧栏 ===== */
+.synx-history-pane {
+  padding: 12px;
+  font-size: var(--font-ui-small);
+}
+
+.synx-history-pane h4 {
+  margin: 0 0 8px 0;
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+}
+
+.synx-history-pane .synx-error {
+  color: var(--text-error);
+  word-break: break-word;
+}
+
+.synx-version-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.synx-version-item {
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  background: var(--background-secondary);
+}
+
+.synx-version-item.is-current {
+  border-color: var(--interactive-accent);
+  background: var(--background-secondary-alt);
+}
+
+.synx-version-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.synx-version-meta .synx-tag-current {
+  color: var(--interactive-accent);
+  font-weight: 600;
+}
+
+.synx-version-meta .synx-author {
+  color: var(--text-accent);
+}
+
+.synx-version-meta .synx-version-id {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  opacity: 0.7;
+}
+
+.synx-version-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.synx-version-actions button {
+  font-size: var(--font-ui-smaller);
+  padding: 2px 8px;
+}
+
+/* ===== 设置面板确认弹窗 ===== */
+.synx-confirm-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+/* ===== 状态栏 ===== */
+.synx-status-syncing {
+  color: var(--text-accent);
+}
+
+.synx-status-error {
+  color: var(--text-error);
+}
+
+/* ===== Ribbon icon 状态切换 ===== */
+.synx-ribbon-running svg {
+  color: var(--interactive-accent);
+  animation: synx-ribbon-spin 1.2s linear infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@keyframes synx-ribbon-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ===== 历史版本悬浮预览 ===== */
+.synx-history-popover {
+  position: fixed;
+  z-index: var(--layer-popover);
+  display: flex;
+  flex-direction: column;
+  min-width: 360px;
+  min-height: 240px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  resize: both;
+  overflow: hidden;
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-l);
+}
+
+.synx-history-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 10px 8px 14px;
+  background: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: move;
+  user-select: none;
+}
+
+.synx-history-popover-title-group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.synx-history-popover-title-group strong {
+  font-size: var(--font-ui-small);
+}
+
+.synx-history-popover-title-group span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.synx-history-popover-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.synx-history-source {
+  margin: 0;
+  white-space: pre;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  tab-size: 2;
+}
+
+.synx-history-diff {
+  min-width: max-content;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+}
+
+.synx-history-diff-line {
+  display: grid;
+  grid-template-columns: 48px 48px 24px minmax(360px, 1fr);
+  min-height: 24px;
+  line-height: 24px;
+}
+
+.synx-history-diff-line.is-add {
+  background: rgba(var(--color-green-rgb), 0.14);
+}
+
+.synx-history-diff-line.is-remove {
+  background: rgba(var(--color-red-rgb), 0.14);
+}
+
+.synx-history-diff-number,
+.synx-history-diff-marker {
+  color: var(--text-faint);
+  text-align: right;
+  user-select: none;
+}
+
+.synx-history-diff-number {
+  padding: 0 8px;
+  background: var(--background-secondary-alt);
+  border-right: 1px solid var(--background-modifier-border);
+}
+
+.synx-history-diff-marker {
+  padding-right: 8px;
+  font-weight: 700;
+}
+
+.synx-history-diff-line.is-add .synx-history-diff-marker {
+  color: var(--color-green);
+}
+
+.synx-history-diff-line.is-remove .synx-history-diff-marker {
+  color: var(--color-red);
+}
+
+.synx-history-diff-text {
+  padding-right: 12px;
+  color: var(--text-normal);
+  white-space: pre;
+}
+
+.synx-history-diff-empty {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  color: var(--text-muted);
+}
