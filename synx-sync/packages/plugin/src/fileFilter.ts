@@ -29,8 +29,8 @@ export function evaluateFile(path: string, size: number, settings: FilterSetting
   if (normalized.startsWith('.obsidian/plugins/synx-sync/')) {
     return skipped('Synx 自身插件文件不参与同步', 'synx-sync/**', size);
   }
-  // 诊断日志写在 vault 根目录（iOS 上只显示 .md 文件，必须用 .md 后缀），
-  // 该文件必须被排除，否则会被同步到远端。
+  // 诊断日志写在 vault 根目录（iOS 上只显示 .md 文件，必须用 .md 后缀）。
+  // 日志仅用于本地/设备端排查，不参与跨设备同步（避免"写日志→触发同步"循环及跨设备污染）。
   // 文件名带设备名（synx-debug-<device>.md），旧版固定名 synx-debug.md / .log 也一并排除。
   if (normalized === 'synx-debug.md' || normalized === 'synx-debug.log' || normalized.startsWith('synx-debug-')) {
     return skipped('Synx 诊断日志不参与同步', 'synx-debug*', size);

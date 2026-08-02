@@ -883,6 +883,8 @@ export default class SynxSyncPlugin extends Plugin {
     plan: SyncPlan,
     report: SyncReport | null,
   ): Promise<void> {
+    // 开关关闭则不生成诊断日志（默认关闭，仅调试时开启）
+    if (!this.settings.enableDebugLog) return;
     try {
       const isObs = (p: string) => p.startsWith('.obsidian/');
       const localByPath = new Map(localFiles.map((f) => [f.path, f]));

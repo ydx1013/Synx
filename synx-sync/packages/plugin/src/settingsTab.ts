@@ -274,11 +274,14 @@ export class SynxSettingTab extends PluginSettingTab {
       if (Number.isInteger(number) && number >= 1 && number <= 100) await this.applyPatch({ reportRetention: number });
     }));
     this.addToggle(container, '显示笔记 UUID', settings.showMarkdownUuid, async (value) => this.applyPatch({ showMarkdownUuid: value }));
+    this.addToggle(container, '生成诊断日志', settings.enableDebugLog, async (value) => this.applyPatch({ enableDebugLog: value }), '写入 synx-debug-<设备名>.md，用于排查移动端同步问题；默认关闭');
     new Setting(container).addButton((button) => button.setButtonText('打开版本历史').onClick(async () => this.plugin.activateHistoryPane())).addButton((button) => button.setButtonText('打开同步详情').onClick(async () => this.plugin.activateSyncDetails())).addButton((button) => button.setButtonText('立即同步').setCta().onClick(async () => this.plugin.triggerSync()));
   }
 
-  private addToggle(container: HTMLElement, name: string, value: boolean, change: (value: boolean) => Promise<void>): void {
-    new Setting(container).setName(name).addToggle((toggle) => toggle.setValue(value).onChange(change));
+  private addToggle(container: HTMLElement, name: string, value: boolean, change: (value: boolean) => Promise<void>, desc?: string): void {
+    const setting = new Setting(container).setName(name);
+    if (desc) setting.setDesc(desc);
+    setting.addToggle((toggle) => toggle.setValue(value).onChange(change));
   }
 
   private addRules(container: HTMLElement, name: string, rules: string[], change: (rules: string[]) => Promise<void>): void {

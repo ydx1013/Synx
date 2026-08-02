@@ -32,6 +32,8 @@ export interface SynxPluginSettings {
   massDeleteProtectPercent: number;
   /** 仅当打开此开关时，骤降保护下才真正执行 delete-remote；否则一律转 pull */
   allowBatchRemoteDelete: boolean;
+  /** 生成同步诊断日志（synx-debug-<device>.md）。默认关闭=不生成，调试时才开启 */
+  enableDebugLog: boolean;
   /** 版本保留策略（按 storage 独立存储于远端） */
   retention: RetentionPolicy;
 }
@@ -67,6 +69,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   showMarkdownUuid: false,
   massDeleteProtectPercent: 50,
   allowBatchRemoteDelete: false,
+  enableDebugLog: false,
   retention: {
     maxFileSize: 20 * 1024 * 1024,
     hourlyWindowHours: 60,
@@ -113,6 +116,7 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     showMarkdownUuid: booleanValue(source.showMarkdownUuid, defaults.showMarkdownUuid),
     massDeleteProtectPercent: validPercentage(source.massDeleteProtectPercent) ? source.massDeleteProtectPercent : defaults.massDeleteProtectPercent,
     allowBatchRemoteDelete: booleanValue(source.allowBatchRemoteDelete, defaults.allowBatchRemoteDelete),
+    enableDebugLog: booleanValue(source.enableDebugLog, defaults.enableDebugLog),
     retention: normalizeRetention(source.retention, defaults.retention),
   };
 }
