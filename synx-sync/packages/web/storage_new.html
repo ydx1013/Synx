@@ -1,0 +1,26 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDAV · Synx Sync</title>
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <header><nav><a class="brand" href="dashboard.html">Synx Sync</a><a href="dashboard.html">返回控制台</a></nav></header>
+  <main>
+    <div class="page-heading"><h1>添加 WebDAV</h1><p>认证方式固定为 Basic Auth。连接测试失败不会阻止保存配置。</p></div>
+    <p class="status" data-status hidden role="status" aria-live="polite"></p>
+    <form id="storage-form" class="card form-grid">
+      <label>名称<input name="name" autocomplete="off" required></label>
+      <label>HTTPS 地址<input name="address" type="url" inputmode="url" placeholder="https://dav.example.com/dav/" pattern="https://.*" required><span class="help">必须使用 HTTPS，地址中不能包含用户名、密码、查询参数或片段。</span></label>
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>应用密码<input name="password" type="password" autocomplete="new-password" required><span class="help" data-password-help>请输入 WebDAV 服务生成的应用密码。</span></label>
+      <label>远程目录<input name="remoteBaseDir" autocomplete="off" placeholder="synx-notes"><span class="help">留空使用 WebDAV 根目录。</span></label>
+      <label>自定义请求头<textarea name="customHeaders" spellcheck="false" placeholder="X-Tenant: demo"></textarea><span class="help">每行一个“名称: 值”；敏感头会被服务端拒绝。</span></label>
+      <div class="actions"><button type="submit">保存配置</button><button id="test-connection" class="secondary" type="button">检查连接</button></div>
+    </form>
+  </main>
+  <script type="module" src="assets/storage.js"></script>
+</body>
+</html>

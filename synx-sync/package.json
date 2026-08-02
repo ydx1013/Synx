@@ -1,0 +1,32 @@
+{
+  "name": "synx-sync",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "description": "Obsidian notes sync via CF Workers + multi-user S3 with version history",
+  "workspaces": [
+    "packages/shared",
+    "packages/worker",
+    "packages/plugin",
+    "packages/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "esbuild@0.24.2": true,
+    "esbuild@0.21.5": true,
+    "esbuild@0.17.19": true,
+    "workerd@1.20250718.0": true,
+    "workerd@1.20260730.1": true,
+    "sharp@0.33.5": true
+  }
+}

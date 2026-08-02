@@ -1,0 +1,25 @@
+{
+  "name": "@synx/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@synx/shared": "*",
+    "aws4fetch": "^1.0.20",
+    "bcryptjs": "^3.0.3",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "@types/bcryptjs": "^2.4.6",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.118.0"
+  }
+}

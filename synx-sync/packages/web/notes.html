@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>笔记 · Synx</title>
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body class="notes-app">
+  <header class="notes-header">
+    <nav>
+      <a class="brand" href="dashboard.html">Synx</a>
+      <div class="nav-links notes-config">
+        <label>存储
+          <select id="storage-select" title="存储账号"></select>
+        </label>
+        <label>文件夹
+          <input id="sync-folder" value="my-vault/" placeholder="my-vault/" title="远端同步文件夹">
+        </label>
+        <button id="load-files" type="button" class="secondary">载入</button>
+        <a href="dashboard.html" class="button secondary">控制台</a>
+        <button id="logout" class="secondary" type="button">退出</button>
+      </div>
+    </nav>
+  </header>
+  <main class="notes-main">
+    <aside class="notes-tree-pane" aria-label="笔记本">
+      <div class="pane-toolbar">
+        <span class="pane-title">笔记本</span>
+        <button id="new-note" type="button" class="pane-action" title="新建笔记">＋ 新建</button>
+      </div>
+      <div id="folder-tree" class="tree"></div>
+    </aside>
+    <section class="notes-list-pane" aria-label="笔记列表">
+      <div class="pane-toolbar">
+        <span id="folder-title" class="pane-title">全部笔记</span>
+      </div>
+      <ul id="note-list" class="note-list"></ul>
+    </section>
+    <section class="notes-editor-pane" aria-label="笔记编辑器">
+      <div class="editor-toolbar">
+        <input id="editor-path" class="editor-path" readonly placeholder="选择左侧笔记开始">
+        <div class="actions">
+          <button id="toggle-mode" type="button" class="secondary" hidden>编辑</button>
+          <button id="save-note" type="button" class="primary" hidden>保存</button>
+          <button id="history-toggle" type="button" class="secondary" hidden>历史</button>
+          <button id="rename-note" type="button" class="secondary" hidden>重命名</button>
+          <button id="delete-note" type="button" class="danger" hidden>删除</button>
+        </div>
+      </div>
+      <p class="status" id="status" data-status hidden role="status" aria-live="polite"></p>
+      <div id="editor-container" class="editor-container"></div>
+      <div id="history-panel" class="history-panel" hidden>
+        <div class="pane-toolbar">
+          <span class="pane-title">版本历史</span>
+          <button id="history-close" type="button" class="pane-action">收起</button>
+        </div>
+        <ul id="history-list" class="version-list"></ul>
+      </div>
+    </section>
+  </main>
+  <template id="empty-editor-template">
+    <div class="editor-empty">
+      <p>从左侧选择一篇笔记，或点击「＋ 新建」创建。</p>
+    </div>
+  </template>
+  <script src="assets/dist/notes.bundle.js"></script>
+</body>
+</html>

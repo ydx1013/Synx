@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>注册 · Synx Sync</title>
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <header><nav><a class="brand" href="index.html">Synx Sync</a><a href="login.html">登录</a></nav></header>
+  <main>
+    <div class="page-heading"><h1>创建账号</h1><p>注册后即可添加自己的 WebDAV 存储。</p></div>
+    <p class="status" data-status hidden role="status" aria-live="polite"></p>
+    <form id="register-form" class="card form-grid">
+      <label>用户名<input name="username" autocomplete="username" minlength="3" required></label>
+      <label>邮箱<input name="email" type="email" autocomplete="email" required></label>
+      <label>密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label>
+      <button type="submit">注册</button>
+    </form>
+  </main>
+  <script type="module" src="assets/app.js"></script>
+</body>
+</html>

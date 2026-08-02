@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · Synx Sync</title>
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <header><nav><a class="brand" href="index.html">Synx Sync</a><a href="register.html">注册</a></nav></header>
+  <main>
+    <div class="page-heading"><h1>登录</h1><p>继续管理你的同步存储账号。</p></div>
+    <p class="status" data-status hidden role="status" aria-live="polite"></p>
+    <form id="login-form" class="card form-grid">
+      <label>用户名或邮箱<input name="usernameOrEmail" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">登录</button>
+    </form>
+  </main>
+  <script type="module" src="assets/app.js"></script>
+</body>
+</html>

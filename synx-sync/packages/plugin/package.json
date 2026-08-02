@@ -1,0 +1,22 @@
+{
+  "name": "@synx/plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Obsidian plugin: sync vault to Synx-Sync Workers with version history",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs --prod",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@synx/shared": "*"
+  },
+  "devDependencies": {
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.4.16",
+    "tslib": "^2.7.0",
+    "vitest": "^4.1.10"
+  }
+}

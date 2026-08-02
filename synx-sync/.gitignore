@@ -1,0 +1,9 @@
+node_modules/
+dist/
+!packages/web/assets/dist/
+.wrangler/
+.dev.vars
+*.log
+playwright-report/
+test-results/
+.DS_Store
