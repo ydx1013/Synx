@@ -43,9 +43,14 @@ describe('evaluateFile', () => {
     expect(evaluateFile('.obsidian/workspace-mobile.json', 1, settings)).toMatchObject({ sync: false, rule: '.obsidian/workspace*' });
     // 其他 .obsidian 配置文件应正常通过
     expect(evaluateFile('.obsidian/app.json', 1, settings)).toEqual({ sync: true });
-    // synx 插件自身目录整体排除（main.js 被同步会让运行中的插件被覆盖重载而打不开）
-    expect(evaluateFile('.obsidian/plugins/synx-sync/main.js', 1, settings)).toMatchObject({ sync: false, rule: 'synx-sync/**' });
-    expect(evaluateFile('.obsidian/plugins/synx-sync/manifest.json', 1, settings)).toMatchObject({ sync: false, rule: 'synx-sync/**' });
+    // synx 插件文件（main.js/manifest.json 等）允许同步（启用配置目录时）；
+    // 设备特有文件 data.json / synx-state.json 仍始终排除
+    expect(evaluateFile('.obsidian/plugins/synx-sync/main.js', 1, settings)).toEqual({ sync: true });
+    expect(evaluateFile('.obsidian/plugins/synx-sync/manifest.json', 1, settings)).toEqual({ sync: true });
+    expect(evaluateFile('.obsidian/plugins/synx-sync/data.json', 1, settings)).toMatchObject({ sync: false, rule: 'synx-sync/data.json' });
+    expect(evaluateFile('.obsidian/plugins/synx-sync/synx-state.json', 1, settings)).toMatchObject({ sync: false, rule: 'synx-state.json' });
+    // 关闭配置目录同步时插件文件也随之跳过
+    expect(evaluateFile('.obsidian/plugins/synx-sync/main.js', 1, base)).toMatchObject({ sync: false, rule: '.obsidian/**' });
   });
 
   it('skips oversized files and reports size before content is read', () => {

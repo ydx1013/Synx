@@ -20,14 +20,10 @@ export function evaluateFile(path: string, size: number, settings: FilterSetting
   }
   // synx 自身 data.json 含每设备不同的登录态/设备名（jwt、deviceName、storageId 等），
   // 跨设备同步会互相覆盖登录信息并造成"本地新→push→远端新→pull"的抖动，不参与同步。
+  // 插件其余文件（main.js/manifest.json/styles.css 等）允许同步：启用「同步配置目录」后
+  // 可在多设备间保持插件版本一致；唯一例外是上面的 synx-state.json（运行时状态）。
   if (normalized === '.obsidian/plugins/synx-sync/data.json') {
     return skipped('Synx 自身配置不参与同步（每设备独立）', 'synx-sync/data.json', size);
-  }
-  // synx 插件自身的 main.js/manifest.json/styles.css 也不参与同步：
-  // 各设备通过 BRAT/插件市场各自管理 synx 版本，若被同步，iPad 上运行的 synx 插件
-  // 会因 main.js 被覆盖而被 Obsidian 重新加载，读到写一半的文件 → 插件打不开。
-  if (normalized.startsWith('.obsidian/plugins/synx-sync/')) {
-    return skipped('Synx 自身插件文件不参与同步', 'synx-sync/**', size);
   }
   // 诊断日志写在 vault 根目录（iOS 上只显示 .md 文件，必须用 .md 后缀）。
   // 日志仅用于本地/设备端排查，不参与跨设备同步（避免"写日志→触发同步"循环及跨设备污染）。

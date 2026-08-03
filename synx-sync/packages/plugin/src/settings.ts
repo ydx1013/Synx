@@ -61,7 +61,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   saveSyncDelaySec: 5,
   maxFileSizeMb: 20,
   concurrency: 2,
-  syncConfigDir: false,
+  syncConfigDir: true,
   syncUnderscorePaths: false,
   ignorePatterns: [],
   allowPatterns: [],
