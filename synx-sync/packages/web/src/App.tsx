@@ -2,6 +2,7 @@ import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { AuthPage } from './auth/AuthPage';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { NotesPage } from './notes/NotesPage';
+import { RepoHistoryPage } from './history/RepoHistoryPage';
 import { SettingsLayout } from './settings/SettingsPage';
 
 export function App() {
@@ -11,6 +12,7 @@ export function App() {
     <Route path="/register" element={<AuthPage mode="register" />} />
     <Route element={<ProtectedRoute />}>
       <Route path="/notes" element={<NotesPage />} />
+      <Route path="/history" element={<RepoHistoryPage />} />
       <Route path="/settings" element={<SettingsLayout />} />
       <Route path="/settings/storage" element={<SettingsLayout />} />
       <Route path="/settings/storage/new" element={<SettingsLayout />} />

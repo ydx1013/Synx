@@ -75,28 +75,6 @@ export interface OnedriveConfig {
 
 export type StorageConfig = S3Config | WebdavConfig | OnedriveConfig;
 
-/** 用户远程存储中的版本元数据记录 */
-export interface VersionRecord {
-  userId: string;
-  storageId: string;
-  fileUuid?: string | null;
-  /** vault 内相对路径 */
-  path: string;
-  /** 时间戳+短哈希 */
-  versionId: string;
-  mtime: number;
-  size: number;
-  /** 内容 sha256（hex） */
-  hash: string;
-  /** 对象存储中的实际 key */
-  storageKey: string;
-  /** 1=当前版本 */
-  isCurrent: number;
-  /** 设备标识 */
-  author: string | null;
-  createdAt: number;
-}
-
 /** 文件实体（FakeFs 读写单位，兼容 remotely-save 的 Entity 用法） */
 export interface Entity {
   /** vault 内相对路径（含前导 /） */
@@ -150,3 +128,84 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
   maxVersionsPerFile: 1000,
 };
 
+// ===== Git 式仓库（全库历史） =====
+// 每个 storageId + syncFolder 是一个逻辑仓库：单主线、单 HEAD。
+// 全部状态（HEAD/提交/检查点/内容树）都保存在用户存储的对象上，仓库层零 D1 / 零 KV。
+
+/** 内容树条目：path → 不可变内容对象引用 */
+export interface RepoFile {
+  /** vault 内相对路径 */
+  path: string;
+  /** Markdown 用 UUID；无 UUID 文件用 `path:<path>` */
+  identity: string;
+  /** 不可变内容对象 key（当前实现复用现有 version 内容的 storageKey） */
+  blobId: string;
+  /** 内容 sha256（hex）。E2E 加密场景由客户端在加密前计算，服务端不做内容寻址校验 */
+  hash: string;
+  size: number;
+  mtime: number;
+}
+
+export type RepoChangeOperation = 'add' | 'modify' | 'rename' | 'delete';
+
+/** 提交内的单条变更 */
+export interface RepoChange {
+  identity: string;
+  operation: RepoChangeOperation;
+  path: string;
+  /** 仅 rename 需要 */
+  previousPath?: string;
+  /** delete 时为空 */
+  blobId?: string;
+  hash?: string;
+  size?: number;
+  mtime?: number;
+}
+
+export type RepoCommitKind = 'initial' | 'sync' | 'restore';
+
+/** 提交：一次成功同步形成的全库一致性节点（不可变） */
+export interface RepoCommit {
+  commitId: string;
+  parentCommitId: string | null;
+  /** 单调递增，CAS 并发校验用 */
+  generation: number;
+  createdAt: number;
+  /** 设备标识 */
+  author: string | null;
+  message: string;
+  kind: RepoCommitKind;
+  changeCount: number;
+  /** 该提交是否带完整内容树快照 */
+  checkpointId: string | null;
+  /** 规范化排序后的变更集（相对父提交） */
+  changes: RepoChange[];
+}
+
+/** 提交列表中的摘要 */
+export interface RepoCommitSummary {
+  commitId: string;
+  parentCommitId: string | null;
+  kind: RepoCommitKind;
+  createdAt: number;
+  author: string | null;
+  message: string;
+  changeCount: number;
+}
+
+/** HEAD 指针：仓库的权威状态 */
+export interface RepositoryHead {
+  version: 1;
+  commitId: string;
+  generation: number;
+  updatedAt: number;
+}
+
+/** 两个提交之间的差异条目（供 diff / 恢复预览展示） */
+export interface RepoDiffEntry {
+  operation: RepoChangeOperation;
+  path: string;
+  previousPath?: string;
+  blobId?: string;
+  size?: number;
+}

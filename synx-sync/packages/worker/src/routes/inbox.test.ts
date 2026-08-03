@@ -32,13 +32,56 @@ async function makeInboxDb(options: { collision?: boolean; lastUsedFails?: boole
   } as unknown as D1Database & { _run: ReturnType<typeof vi.fn> };
 }
 
+/** 内存 S3 mock：PUT/GET/HEAD/DELETE 写后读，支持 If-None-Match/If-Match 条件写与 ListObjectsV2 */
+function makeMemoryS3Fetch(): Map<string, Uint8Array> {
+  const store = new Map<string, Uint8Array>();
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = input instanceof Request ? input : new Request(input, init);
+    const url = new URL(req.url);
+    if (url.searchParams.has('list-type')) {
+      const prefix = url.searchParams.get('prefix') ?? '';
+      const keys = [...store.keys()].filter((k) => k.startsWith(prefix));
+      const xml = `<ListBucketResult>${keys.map((k) => `<Contents><Key>${k.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</Key></Contents>`).join('')}</ListBucketResult>`;
+      return new Response(xml, { status: 200 });
+    }
+    if (url.searchParams.has('delete')) {
+      const bodyText = await req.text();
+      const keys = [...bodyText.matchAll(/<Key>([^<]+)<\/Key>/g)].map((m) => m[1]);
+      for (const key of keys) store.delete(key);
+      return new Response('<DeleteResult></DeleteResult>', { status: 200 });
+    }
+    if (url.pathname.startsWith('/b/')) {
+      const key = decodeURIComponent(url.pathname.slice('/b/'.length));
+      if (req.method === 'PUT') {
+        const ifNoneMatch = req.headers.get('If-None-Match');
+        const ifMatch = req.headers.get('If-Match');
+        if (ifNoneMatch === '*' && store.has(key)) return new Response('', { status: 412 });
+        if (ifMatch && !store.has(key)) return new Response('', { status: 412 });
+        store.set(key, new Uint8Array(await req.arrayBuffer()));
+        return new Response('', { status: 200, headers: { ETag: `"etag-${store.size}"` } });
+      }
+      if (req.method === 'HEAD') {
+        const has = store.has(key);
+        return new Response('', { status: has ? 200 : 404, headers: has ? { ETag: '"etag"' } : {} });
+      }
+      if (req.method === 'GET') {
+        const data = store.get(key);
+        if (!data) return new Response('not found', { status: 404 });
+        return new Response(data, { status: 200 });
+      }
+      if (req.method === 'DELETE') {
+        store.delete(key);
+        return new Response('', { status: 200 });
+      }
+    }
+    return new Response('not found', { status: 404 });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return store;
+}
+
 beforeEach(() => {
-  vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-    const url = input instanceof Request ? input.url : String(input);
-    const method = input instanceof Request ? input.method : init?.method ?? 'GET';
-    const missingMetadata = (method === 'GET' || method === 'HEAD') && (url.includes('tombstone.json') || url.includes('current.json') || url.includes('manifest.json'));
-    return Promise.resolve(new Response('', { status: missingMetadata ? 404 : 200 }));
-  }));
+  makeMemoryS3Fetch();
 });
 
 describe('windowsDuplicateFileName', () => {

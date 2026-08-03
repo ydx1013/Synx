@@ -1,6 +1,7 @@
 import type {
   AuthResponse, ApiTokenListResponse, CreateApiTokenRequest, CreateApiTokenResponse,
-  FileMeta, HistoryResponse, ListResponse, MeResponse,
+  FileMeta, MeResponse, RepoChange, RepoCommitsResponse, RepoDiffResponse, RepoFileHistoryResponse, RepoFinalizeRequest,
+  RepoFinalizeResponse, RepoGcResponse, RepoHeadResponse, RepoRestoreRequest, RepoRestoreResponse, RepositoryHead,
   PreferencesResponse, StorageListResponse, StorageSummary, UpdatePreferencesRequest,
 } from '@synx/shared';
 import { ApiError, api, clearSession } from './client';
@@ -52,51 +53,160 @@ export function noteHeaders(storageId: string, syncFolder: string): HeadersInit 
   return { 'X-Storage-Id': storageId, 'X-Sync-Folder': syncFolder };
 }
 
+/** repo 树条目 identity（`path:` 前缀或 uuid）→ FileMeta.fileUuid */
+function repoIdentityToFileUuid(identity: string): string | null {
+  return identity.startsWith('path:') ? null : identity;
+}
+
+/** 内容 sha256（hex）——finalize 变更集携带，服务端校验 blob 存在但不做内容寻址校验 */
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bytes));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** 拉取 repo 二进制接口（GET /content），失败统一转 ApiError */
+async function fetchRepoBinary(apiPath: string, params: URLSearchParams, headers: HeadersInit): Promise<ArrayBuffer> {
+  const finalHeaders = new Headers(headers);
+  const token = window.localStorage.getItem('synx-token');
+  if (token) finalHeaders.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(`${apiPath}?${params}`, { headers: finalHeaders });
+  if (response.status === 401) clearSession();
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({})) as { error?: string; code?: string };
+    throw new ApiError(response.status, data.error || `请求失败 (${response.status})`, data.code);
+  }
+  return response.arrayBuffer();
+}
+
 export const notesApi = {
-  list: (storageId: string, folder: string) => api<ListResponse>('/api/list', { headers: noteHeaders(storageId, folder) }),
+  /** 仓库基线：HEAD + 当前完整文件树（替代旧 /api/list 读 current.json） */
+  head: (storageId: string, folder: string) => api<RepoHeadResponse>('/api/repository/head', { headers: noteHeaders(storageId, folder) }),
+
+  list: async (storageId: string, folder: string): Promise<{ files: FileMeta[]; head: RepositoryHead | null }> => {
+    const resp = await notesApi.head(storageId, folder);
+    const files: FileMeta[] = resp.tree.map((f) => ({
+      path: f.path,
+      fileUuid: repoIdentityToFileUuid(f.identity),
+      versionId: f.blobId,
+      mtime: f.mtime,
+      size: f.size,
+      hash: f.hash,
+      author: null,
+    }));
+    return { files, head: resp.head };
+  },
+
   /**
-   * GET /api/get 返回「原始二进制 body + X-Synx-Version 头」（worker 不做 base64，
-   * 避免大文件 CPU 超限 1102）。这里直接 fetch 读取 arrayBuffer + 解析版本头。
+   * 读指定提交下的文件内容（替代旧 /api/get 按版本记录读取）。
+   * 不传 commitId 时取当前 HEAD。二进制直传，不 base64。
    */
-  get: async (storageId: string, folder: string, path: string, fileUuid?: string | null, version?: string): Promise<{ content: ArrayBuffer; version: string | null }> => {
-    const params = new URLSearchParams({ path });
-    if (fileUuid) params.set('fileUuid', fileUuid);
-    if (version) params.set('version', version);
-    const headers = new Headers(noteHeaders(storageId, folder));
-    const token = window.localStorage.getItem('synx-token');
-    if (token) headers.set('Authorization', `Bearer ${token}`);
-    const response = await fetch(`/api/get?${params}`, { headers });
-    if (response.status === 401) clearSession();
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({})) as { error?: string; code?: string };
-      throw new ApiError(response.status, data.error || `请求失败 (${response.status})`, data.code);
+  get: async (storageId: string, folder: string, path: string, fileUuid?: string | null, commitId?: string): Promise<{ content: ArrayBuffer; version: string | null }> => {
+    let cid = commitId ?? null;
+    if (!cid) {
+      const head = await notesApi.head(storageId, folder);
+      cid = head.head?.commitId ?? null;
     }
-    const content = await response.arrayBuffer();
-    return { content, version: response.headers.get('X-Synx-Version') };
+    if (!cid) throw new ApiError(404, '仓库还没有内容');
+    const params = new URLSearchParams({ commitId: cid, path });
+    const content = await fetchRepoBinary('/api/repository/content', params, noteHeaders(storageId, folder));
+    return { content, version: cid };
   },
-  /** POST /api/put?path=&mtime=&...  body=原始二进制 */
-  put: async (storageId: string, folder: string, body: { path: string; fileUuid?: string; mtime: number; content: string; author?: string; baseVersionId?: string }) => {
-    const params = new URLSearchParams({ path: body.path, mtime: String(body.mtime) });
-    if (body.fileUuid) params.set('fileUuid', body.fileUuid);
-    if (body.author) params.set('author', body.author);
-    if (body.baseVersionId) params.set('baseVersionId', body.baseVersionId);
-    const headers = new Headers(noteHeaders(storageId, folder));
-    headers.set('Content-Type', 'application/octet-stream');
+
+  /** 保存/新建：上传不可变 blob + 原子提交。HEAD 已被他人推进时抛 409（ApiError）。 */
+  put: async (storageId: string, folder: string, body: { path: string; fileUuid?: string; mtime: number; content: string; author?: string; baseCommitId: string; baseGeneration: number; previousPath?: string }): Promise<{ head: RepositoryHead; blobId: string }> => {
+    const bytes = new TextEncoder().encode(body.content);
+    const hash = await sha256Hex(bytes);
+    const blobHeaders = new Headers(noteHeaders(storageId, folder));
+    blobHeaders.set('Content-Type', 'application/octet-stream');
     const token = window.localStorage.getItem('synx-token');
-    if (token) headers.set('Authorization', `Bearer ${token}`);
-    const response = await fetch(`/api/put?${params}`, { method: 'POST', headers, body: new TextEncoder().encode(body.content) });
-    if (response.status === 401) clearSession();
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({})) as { error?: string; code?: string };
-      throw new ApiError(response.status, data.error || `请求失败 (${response.status})`, data.code);
+    if (token) blobHeaders.set('Authorization', `Bearer ${token}`);
+    const blobParams = new URLSearchParams({ path: body.path, mtime: String(body.mtime) });
+    const blobResp = await fetch(`/api/repository/blobs?${blobParams}`, { method: 'POST', headers: blobHeaders, body: bytes });
+    if (blobResp.status === 401) clearSession();
+    if (!blobResp.ok) {
+      const data = await blobResp.json().catch(() => ({})) as { error?: string; code?: string };
+      throw new ApiError(blobResp.status, data.error || `上传失败 (${blobResp.status})`, data.code);
     }
-    return response.json() as Promise<{ version: FileMeta }>;
+    const { blobId } = (await blobResp.json()) as { blobId: string };
+    const change: RepoChange = {
+      identity: body.fileUuid ?? `path:${body.path}`,
+      operation: body.previousPath ? 'rename' : 'modify',
+      path: body.path,
+      previousPath: body.previousPath,
+      blobId,
+      hash,
+      size: bytes.byteLength,
+      mtime: body.mtime,
+    };
+    const final = await api<RepoFinalizeResponse>('/api/repository/commits/finalize', {
+      method: 'POST',
+      headers: noteHeaders(storageId, folder),
+      body: JSON.stringify({
+        baseCommitId: body.baseCommitId,
+        baseGeneration: body.baseGeneration,
+        author: body.author,
+        message: '网页编辑',
+        changes: [change],
+      } satisfies RepoFinalizeRequest),
+    });
+    return { head: final.head, blobId };
   },
-  remove: (storageId: string, folder: string, body: unknown) => api<{ ok: true }>('/api/file', { method: 'DELETE', headers: noteHeaders(storageId, folder), body: JSON.stringify(body) }),
+
+  /** 删除：以 delete 变更原子提交（git 删除语义，历史版本保留）。 */
+  remove: async (storageId: string, folder: string, body: { path: string; fileUuid?: string; baseCommitId: string; baseGeneration: number }): Promise<{ head: RepositoryHead }> => {
+    const change: RepoChange = { identity: body.fileUuid ?? `path:${body.path}`, operation: 'delete', path: body.path };
+    const final = await api<RepoFinalizeResponse>('/api/repository/commits/finalize', {
+      method: 'POST',
+      headers: noteHeaders(storageId, folder),
+      body: JSON.stringify({
+        baseCommitId: body.baseCommitId,
+        baseGeneration: body.baseGeneration,
+        message: '网页删除',
+        changes: [change],
+      } satisfies RepoFinalizeRequest),
+    });
+    return { head: final.head };
+  },
+
+  /** 单文件历史：按 identity 从提交链派生（替代旧 /api/history 的版本记录列表） */
   history: (storageId: string, folder: string, path: string, fileUuid?: string | null) => {
     const params = new URLSearchParams({ path });
     if (fileUuid) params.set('fileUuid', fileUuid);
-    return api<HistoryResponse>(`/api/history?${params}`, { headers: noteHeaders(storageId, folder) });
+    return api<RepoFileHistoryResponse>(`/api/repository/file-history?${params}`, { headers: noteHeaders(storageId, folder) });
   },
-  rollback: (storageId: string, folder: string, body: unknown) => api<{ version: FileMeta }>('/api/rollback', { method: 'POST', headers: noteHeaders(storageId, folder), body: JSON.stringify(body) }),
+
+  /** 文件级恢复：把历史提交中的内容作为最新版本重新提交，不影响其他文件。 */
+  restore: async (storageId: string, folder: string, body: { path: string; fileUuid?: string; commitId: string; author?: string; baseCommitId: string; baseGeneration: number }) => {
+    const { content } = await notesApi.get(storageId, folder, body.path, body.fileUuid, body.commitId);
+    return notesApi.put(storageId, folder, {
+      path: body.path,
+      fileUuid: body.fileUuid,
+      mtime: Date.now(),
+      content: new TextDecoder().decode(content),
+      author: body.author,
+      baseCommitId: body.baseCommitId,
+      baseGeneration: body.baseGeneration,
+    });
+  },
+};
+
+/** 仓库级操作：全库提交时间线、任意两提交 diff、全库恢复、垃圾回收。 */
+export const repoApi = {
+  /** 提交时间线：从 HEAD 向更早翻页（cursor 从响应带回） */
+  commits: (storageId: string, folder: string, cursor?: string) => {
+    const params = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    return api<RepoCommitsResponse>(`/api/repository/commits${params}`, { headers: noteHeaders(storageId, folder) });
+  },
+
+  /** 任意两提交 diff：返回 from(against) → to(target) 的变更集 */
+  diff: (storageId: string, folder: string, to: string, from: string) =>
+    api<RepoDiffResponse>(`/api/repository/commits/${encodeURIComponent(to)}/diff?against=${encodeURIComponent(from)}`, { headers: noteHeaders(storageId, folder) }),
+
+  /** 全库恢复到历史提交（dryRun=true 只预览） */
+  restore: (storageId: string, folder: string, body: RepoRestoreRequest) =>
+    api<RepoRestoreResponse>('/api/repository/restore', { method: 'POST', headers: noteHeaders(storageId, folder), body: JSON.stringify(body) }),
+
+  /** 垃圾回收：清理未引用内容对象与旧版本记录元数据 */
+  gc: (storageId: string, folder: string) =>
+    api<RepoGcResponse>('/api/repository/gc', { method: 'POST', headers: noteHeaders(storageId, folder), body: JSON.stringify({}) }),
 };

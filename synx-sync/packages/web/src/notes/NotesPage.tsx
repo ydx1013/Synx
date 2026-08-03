@@ -8,7 +8,7 @@ import { EditorView, basicSetup } from 'codemirror';
 import { markdown } from '@codemirror/lang-markdown';
 import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Edit3, FileText, Folder, History, LogOut, Menu, MoreHorizontal, Plus, Save, Search, Settings, Trash2 } from 'lucide-react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import type { FileMeta, VersionRecord } from '@synx/shared';
+import type { FileMeta, RepoFileHistoryResponse, RepositoryHead } from '@synx/shared';
 import { authApi, notesApi } from '../api/queries';
 import { ApiError } from '../api/client';
 import { useAuth } from '../auth/AuthProvider';
@@ -74,7 +74,15 @@ export function NotesPage() {
   const me = useQuery({ queryKey: ['me'], queryFn: authApi.me });
   const storageId = me.data?.preferences.defaultStorageId ?? '';
   const syncFolder = me.data?.preferences.defaultSyncFolder ?? '';
-  const filesQuery = useQuery({ queryKey: ['notes', storageId, syncFolder], queryFn: () => notesApi.list(storageId, syncFolder), enabled: Boolean(storageId && syncFolder) });
+  const filesQuery = useQuery({
+    queryKey: ['notes', storageId, syncFolder],
+    queryFn: async () => {
+      const res = await notesApi.list(storageId, syncFolder);
+      if (res.head) headRef.current = res.head;
+      return res;
+    },
+    enabled: Boolean(storageId && syncFolder),
+  });
 
   // 定位状态同步到 URL：刷新/分享后仍停留在同一文件夹与打开的笔记
   const [searchParams, setSearchParams] = useSearchParams();
@@ -94,7 +102,9 @@ export function NotesPage() {
   const [current, setCurrent] = useState<FileMeta | null>(null);
   const [text, setText] = useState('');
   const [hasUuid, setHasUuid] = useState(false);
-  const [openedVersion, setOpenedVersion] = useState('');
+  // 写操作的 CAS 基线：list 成功后持有当前 HEAD（commitId + generation），
+  // 保存/删除/恢复都以它做条件提交；成功后被新 head 替换。
+  const headRef = useRef<RepositoryHead | null>(null);
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState('');
@@ -134,25 +144,38 @@ export function NotesPage() {
 
   async function openNote(file: FileMeta) {
     if (dirty && !confirm('当前修改尚未保存，确定切换笔记吗？')) return;
-    try { const result = await notesApi.get(storageId, syncFolder, file.path, file.fileUuid); const content = decode(result.content); setCurrent(file); setText(stripUuid(content)); setHasUuid(UUID_COMMENT.test(content)); setOpenedVersion(file.versionId); setEditing(false); setDirty(false); setStatus('已保存'); setMobileEditor(true); setNavOpen(false); setOpenPath(file.path); }
+    try { const result = await notesApi.get(storageId, syncFolder, file.path, file.fileUuid, headRef.current?.commitId); const content = decode(result.content); setCurrent(file); setText(stripUuid(content)); setHasUuid(UUID_COMMENT.test(content)); setEditing(false); setDirty(false); setStatus('已保存'); setMobileEditor(true); setNavOpen(false); setOpenPath(file.path); }
     catch (error) { setStatus(error instanceof Error ? error.message : '加载失败'); }
   }
   async function save() {
     if (!current) return;
-    try { const { version } = await notesApi.put(storageId, syncFolder, { path: current.path, fileUuid: current.fileUuid ?? undefined, mtime: Date.now(), content: hasUuid ? withUuid(text, current.fileUuid) : text, author: 'web', baseVersionId: openedVersion }); setOpenedVersion(version.versionId); setCurrent({ ...current, ...version }); setDirty(false); setStatus('已保存'); await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] }); }
-    catch (error) { setStatus(error instanceof ApiError && error.status === 409 ? '远端已变化，请重新打开后合并修改' : error instanceof Error ? error.message : '保存失败'); }
+    const base = headRef.current;
+    if (!base) { setStatus('仓库尚未加载，请稍候'); return; }
+    try { const { head } = await notesApi.put(storageId, syncFolder, { path: current.path, fileUuid: current.fileUuid ?? undefined, mtime: Date.now(), content: hasUuid ? withUuid(text, current.fileUuid) : text, author: 'web', baseCommitId: base.commitId, baseGeneration: base.generation }); headRef.current = head; setCurrent({ ...current, mtime: head.updatedAt }); setDirty(false); setStatus('已保存'); await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] }); }
+    catch (error) { setStatus(error instanceof ApiError && error.status === 409 ? '远端已更新，请刷新后重试' : error instanceof Error ? error.message : '保存失败'); }
   }
   async function create(path: string) {
+    const base = headRef.current;
+    if (!base) return;
     const finalPath = isMarkdown(path) ? path : `${path}.md`; const uuid = crypto.randomUUID();
-    const { version } = await notesApi.put(storageId, syncFolder, { path: finalPath, fileUuid: uuid, mtime: Date.now(), content: `<!-- synx-id:${uuid} -->\n\n`, author: 'web' });
-    await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] }); setCreateOpen(false); await openNote({ ...version, path: finalPath, fileUuid: uuid } as FileMeta); setEditing(true);
+    const { head } = await notesApi.put(storageId, syncFolder, { path: finalPath, fileUuid: uuid, mtime: Date.now(), content: `<!-- synx-id:${uuid} -->\n\n`, author: 'web', baseCommitId: base.commitId, baseGeneration: base.generation });
+    headRef.current = head;
+    await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] }); setCreateOpen(false); await openNote({ path: finalPath, fileUuid: uuid, versionId: '', mtime: Date.now(), size: 0, hash: '', author: 'web' } as FileMeta); setEditing(true);
   }
   async function rename(path: string) {
-    if (!current) return; const finalPath = isMarkdown(path) ? path : `${path}.md`;
-    const { version } = await notesApi.put(storageId, syncFolder, { path: finalPath, fileUuid: current.fileUuid ?? undefined, mtime: Date.now(), content: hasUuid ? withUuid(text, current.fileUuid) : text, author: 'web', baseVersionId: openedVersion });
-    setCurrent({ ...current, ...version, path: finalPath }); setOpenedVersion(version.versionId); setRenameOpen(false); setDirty(false); setOpenPath(finalPath); await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] });
+    if (!current) return; const base = headRef.current;
+    if (!base) return;
+    const finalPath = isMarkdown(path) ? path : `${path}.md`;
+    const { head } = await notesApi.put(storageId, syncFolder, { path: finalPath, fileUuid: current.fileUuid ?? undefined, previousPath: current.path, mtime: Date.now(), content: hasUuid ? withUuid(text, current.fileUuid) : text, author: 'web', baseCommitId: base.commitId, baseGeneration: base.generation });
+    headRef.current = head;
+    setCurrent({ ...current, path: finalPath }); setRenameOpen(false); setDirty(false); setOpenPath(finalPath); await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] });
   }
-  async function remove() { if (!current) return; await notesApi.remove(storageId, syncFolder, { path: current.path, fileUuid: current.fileUuid ?? undefined }); setCurrent(null); setText(''); setDeleteOpen(false); setMobileEditor(false); setOpenPath(null); setStatus('笔记已删除，历史版本仍然保留'); await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] }); }
+  async function remove() {
+    if (!current) return; const base = headRef.current;
+    if (!base) return;
+    const { head } = await notesApi.remove(storageId, syncFolder, { path: current.path, fileUuid: current.fileUuid ?? undefined, baseCommitId: base.commitId, baseGeneration: base.generation });
+    headRef.current = head; setCurrent(null); setText(''); setDeleteOpen(false); setMobileEditor(false); setOpenPath(null); setStatus('笔记已删除，历史版本仍然保留'); await client.invalidateQueries({ queryKey: ['notes', storageId, syncFolder] });
+  }
 
   // 点击笔记正文中的 [[双向链接]]：按文件名匹配并打开对应笔记
   function onWikiLinkClick(event: ReactMouseEvent<HTMLElement>) {
@@ -170,7 +193,7 @@ export function NotesPage() {
 
   return <div className={`notes-shell ${navOpen ? 'nav-open' : ''} ${mobileEditor ? 'show-editor' : ''}`}>
     <button className="nav-scrim" aria-label="关闭导航" onClick={() => setNavOpen(false)} />
-    <aside className="primary-sidebar"><div className="sidebar-logo">Synx</div><button className="new-note-button" onClick={() => setCreateOpen(true)}><Plus size={16} />新建</button><nav className="primary-nav"><button className={!folder ? 'active' : ''} onClick={() => { setFolder(''); setNavOpen(false); }}><Clock3 size={16} />最新</button><div className="nav-label"><Folder size={15} />我的文件夹</div><FolderTree folders={folders} rootFiles={rootFiles} currentPath={current?.path ?? ''} onOpenFile={openNote} selected={folder} expanded={expanded} onToggle={path => setExpanded(prev => { const next = new Set(prev); next.has(path) ? next.delete(path) : next.add(path); return next; })} onSelect={path => { setFolder(path); setNavOpen(false); }} /></nav>
+    <aside className="primary-sidebar"><div className="sidebar-logo">Synx</div><button className="new-note-button" onClick={() => setCreateOpen(true)}><Plus size={16} />新建</button><nav className="primary-nav"><button className={!folder ? 'active' : ''} onClick={() => { setFolder(''); setNavOpen(false); }}><Clock3 size={16} />最新</button><button onClick={() => { navigate('/history'); setNavOpen(false); }}><History size={16} />提交历史</button><div className="nav-label"><Folder size={15} />我的文件夹</div><FolderTree folders={folders} rootFiles={rootFiles} currentPath={current?.path ?? ''} onOpenFile={openNote} selected={folder} expanded={expanded} onToggle={path => setExpanded(prev => { const next = new Set(prev); next.has(path) ? next.delete(path) : next.add(path); return next; })} onSelect={path => { setFolder(path); setNavOpen(false); }} /></nav>
       <div className="sidebar-account"><span className="avatar">{user?.username[0].toUpperCase()}</span><span className="sidebar-username">{user?.username}</span><div className="sidebar-account-actions"><button className="sidebar-account-action" aria-label="设置" title="设置" onClick={() => navigate('/settings')}><Settings size={19} /></button><button className="sidebar-account-action logout" aria-label="退出" title="退出" onClick={() => { logout(); navigate('/login'); }}><LogOut size={19} /></button></div></div>
     </aside>
     <section className="note-list-pane"><header className="list-toolbar"><button className="menu-button" aria-label="打开导航" onClick={() => setNavOpen(true)}><Menu size={18} /></button><label className="search-box"><Search size={15} /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索笔记" /></label></header><div className="list-heading"><strong>{folder || '全部笔记'}</strong><span>{visible.length} 篇</span></div><ul className="note-list">{filesQuery.isLoading ? <li className="list-state">正在载入远程笔记…</li> : visible.length ? visible.map(file => <li key={`${file.path}:${file.versionId}`}><button className={current?.path === file.path ? 'note-item active' : 'note-item'} onClick={() => openNote(file)}><FileText size={15} /><span className="note-copy"><strong>{displayName(file.path)}</strong><small>{file.path}</small><span><time>{new Date(file.mtime).toLocaleDateString()}</time><small>{formatSize(file.size)}</small></span></span></button></li>) : <li className="list-state">这里还没有笔记</li>}</ul></section>
@@ -178,7 +201,17 @@ export function NotesPage() {
     <PathDialog open={createOpen} title="新建笔记" initial={folder ? `${folder}/未命名.md` : '未命名.md'} onClose={() => setCreateOpen(false)} onSubmit={create} />
     <PathDialog open={renameOpen} title="重命名笔记" initial={current?.path ?? ''} onClose={() => setRenameOpen(false)} onSubmit={rename} />
     <Dialog open={deleteOpen} onOpenChange={setDeleteOpen} title="删除笔记"><p>删除“{current?.path}”？历史版本会保留，可以从版本记录恢复。</p><div className="dialog-actions"><button onClick={() => setDeleteOpen(false)}>取消</button><button className="danger-button" onClick={remove}><Trash2 size={15} />删除</button></div></Dialog>
-    <HistoryDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} storageId={storageId} syncFolder={syncFolder} current={current} onRestore={async version => { if (!current) return; await notesApi.rollback(storageId, syncFolder, { path: current.path, fileUuid: current.fileUuid ?? undefined, version: version.versionId }); await openNote(current); setHistoryOpen(false); }} />
+    <HistoryDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} storageId={storageId} syncFolder={syncFolder} current={current} headCommitId={headRef.current?.commitId ?? null} onRestore={async (commitId) => {
+      if (!current) return;
+      const base = headRef.current;
+      if (!base) { setStatus('仓库尚未加载，请稍候'); return; }
+      try {
+        const { head } = await notesApi.restore(storageId, syncFolder, { path: current.path, fileUuid: current.fileUuid ?? undefined, commitId, author: 'web', baseCommitId: base.commitId, baseGeneration: base.generation });
+        headRef.current = head;
+        await openNote(current);
+        setHistoryOpen(false);
+      } catch (error) { setStatus(error instanceof ApiError && error.status === 409 ? '远端已更新，请刷新后重试' : error instanceof Error ? error.message : '恢复失败'); }
+    }} />
   </div>;
 }
 
@@ -223,39 +256,65 @@ function FolderNode({ node, depth, selected, expanded, onToggle, onSelect }: {
   </div>;
 }
 
-function HistoryDrawer({ open, onClose, storageId, syncFolder, current, onRestore }: { open: boolean; onClose: () => void; storageId: string; syncFolder: string; current: FileMeta | null; onRestore: (version: VersionRecord) => void }) {
-  const history = useQuery({ queryKey: ['history', current?.path], queryFn: () => notesApi.history(storageId, syncFolder, current!.path, current!.fileUuid), enabled: open && Boolean(current) });
-  const versions = history.data?.versions ?? [];
+interface HistoryEntry {
+  commitId: string;
+  createdAt: number;
+  author: string | null;
+  message: string;
+  size: number;
+  isCurrent: boolean;
+  deleted: boolean;
+}
 
-  const [baseVersion, setBaseVersion] = useState<VersionRecord | null>(null);
-  const [targetVersion, setTargetVersion] = useState<VersionRecord | null>(null);
+function HistoryDrawer({ open, onClose, storageId, syncFolder, current, headCommitId, onRestore }: { open: boolean; onClose: () => void; storageId: string; syncFolder: string; current: FileMeta | null; headCommitId: string | null; onRestore: (commitId: string) => void }) {
+  const history = useQuery({ queryKey: ['history', current?.path], queryFn: () => notesApi.history(storageId, syncFolder, current!.path, current!.fileUuid), enabled: open && Boolean(current) });
+  // repo 模型下单文件历史：commits 与 changes 同序一一对应（每提交一条该文件变更）
+  const entries: HistoryEntry[] = useMemo(() => {
+    const data = history.data as RepoFileHistoryResponse | undefined;
+    if (!data) return [];
+    return data.commits.map((c, i) => {
+      const change = data.changes[i];
+      return {
+        commitId: c.commitId,
+        createdAt: c.createdAt,
+        author: c.author,
+        message: c.message,
+        size: change?.size ?? 0,
+        isCurrent: c.commitId === headCommitId,
+        deleted: change?.operation === 'delete',
+      };
+    });
+  }, [history.data, headCommitId]);
+
+  const [baseEntry, setBaseEntry] = useState<HistoryEntry | null>(null);
+  const [targetEntry, setTargetEntry] = useState<HistoryEntry | null>(null);
   const [diffLines, setDiffLines] = useState<DiffLine[] | null>(null);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [loadingDiff, setLoadingDiff] = useState(false);
 
   // 抽屉打开/关闭时重置对比状态，避免切换笔记后残留旧对比
   useEffect(() => {
-    if (!open) { setBaseVersion(null); setTargetVersion(null); setDiffLines(null); setDiffError(null); setLoadingDiff(false); }
+    if (!open) { setBaseEntry(null); setTargetEntry(null); setDiffLines(null); setDiffError(null); setLoadingDiff(false); }
   }, [open]);
 
   // 版本列表变化后，清掉列表中已不存在的选中项
   useEffect(() => {
-    if (!versions.length) return;
-    if (baseVersion && !versions.some(v => v.versionId === baseVersion.versionId)) setBaseVersion(null);
-    if (targetVersion && !versions.some(v => v.versionId === targetVersion.versionId)) setTargetVersion(null);
-  }, [versions, baseVersion, targetVersion]);
+    if (!entries.length) return;
+    if (baseEntry && !entries.some(e => e.commitId === baseEntry.commitId)) setBaseEntry(null);
+    if (targetEntry && !entries.some(e => e.commitId === targetEntry.commitId)) setTargetEntry(null);
+  }, [entries, baseEntry, targetEntry]);
 
   // 对比双方确定后拉取内容并计算行级 diff
   useEffect(() => {
-    if (!open || !current || !baseVersion || !targetVersion) return;
-    if (baseVersion.versionId === targetVersion.versionId) { setDiffLines([]); setDiffError(null); setLoadingDiff(false); return; }
+    if (!open || !current || !baseEntry || !targetEntry) return;
+    if (baseEntry.commitId === targetEntry.commitId) { setDiffLines([]); setDiffError(null); setLoadingDiff(false); return; }
     let cancelled = false;
     setLoadingDiff(true); setDiffLines(null); setDiffError(null);
     void (async () => {
       try {
         const [oldRes, newRes] = await Promise.all([
-          notesApi.get(storageId, syncFolder, current.path, current.fileUuid, baseVersion.versionId),
-          notesApi.get(storageId, syncFolder, current.path, current.fileUuid, targetVersion.versionId),
+          notesApi.get(storageId, syncFolder, current.path, current.fileUuid, baseEntry.commitId),
+          notesApi.get(storageId, syncFolder, current.path, current.fileUuid, targetEntry.commitId),
         ]);
         if (cancelled) return;
         setDiffLines(buildLineDiff(decode(oldRes.content), decode(newRes.content)));
@@ -267,31 +326,31 @@ function HistoryDrawer({ open, onClose, storageId, syncFolder, current, onRestor
       }
     })();
     return () => { cancelled = true; };
-  }, [open, current, baseVersion, targetVersion, storageId, syncFolder]);
+  }, [open, current, baseEntry, targetEntry, storageId, syncFolder]);
 
-  const currentVersion = versions.find(v => v.isCurrent) ?? null;
+  const currentEntry = entries.find(e => e.isCurrent) ?? null;
 
-  const startCompare = (version: VersionRecord) => {
-    setBaseVersion(version);
-    if (version.isCurrent) {
-      setTargetVersion(versions.find(v => !v.isCurrent) ?? null);
+  const startCompare = (entry: HistoryEntry) => {
+    setBaseEntry(entry);
+    if (entry.isCurrent) {
+      setTargetEntry(entries.find(e => !e.isCurrent) ?? null);
     } else {
-      setTargetVersion(currentVersion ?? versions.find(v => v.versionId !== version.versionId) ?? null);
+      setTargetEntry(currentEntry ?? entries.find(e => e.commitId !== entry.commitId) ?? null);
     }
   };
 
-  const comparing = Boolean(baseVersion && targetVersion);
+  const comparing = Boolean(baseEntry && targetEntry);
   const changed = diffLines !== null && diffLines.some(line => line.type !== 'context');
-  const versionLabel = (v: VersionRecord) => `${new Date(v.createdAt).toLocaleString()}${v.isCurrent ? '（当前）' : ''}`;
+  const versionLabel = (e: HistoryEntry) => `${new Date(e.createdAt).toLocaleString()}${e.isCurrent ? '（当前）' : ''}`;
 
   return <div className={open ? 'history-drawer open' : 'history-drawer'}><header><h2>版本历史</h2><button aria-label="关闭历史" onClick={onClose}><ArrowLeft /></button></header>
-    {comparing && baseVersion && targetVersion ? (
+    {comparing && baseEntry && targetEntry ? (
       <div className="history-diff">
         <div className="history-diff-controls">
-          <label className="history-diff-select"><span>旧版本</span><select value={baseVersion.versionId} onChange={e => setBaseVersion(versions.find(v => v.versionId === e.target.value) ?? null)}>{versions.map(v => <option key={v.versionId} value={v.versionId}>{versionLabel(v)}</option>)}</select></label>
+          <label className="history-diff-select"><span>旧版本</span><select value={baseEntry.commitId} onChange={e => setBaseEntry(entries.find(en => en.commitId === e.target.value) ?? null)}>{entries.map(en => <option key={en.commitId} value={en.commitId}>{versionLabel(en)}</option>)}</select></label>
           <span className="history-diff-arrow">→</span>
-          <label className="history-diff-select"><span>新版本</span><select value={targetVersion.versionId} onChange={e => setTargetVersion(versions.find(v => v.versionId === e.target.value) ?? null)}>{versions.map(v => <option key={v.versionId} value={v.versionId}>{versionLabel(v)}</option>)}</select></label>
-          <button onClick={() => { setBaseVersion(null); setTargetVersion(null); }}>返回列表</button>
+          <label className="history-diff-select"><span>新版本</span><select value={targetEntry.commitId} onChange={e => setTargetEntry(entries.find(en => en.commitId === e.target.value) ?? null)}>{entries.map(en => <option key={en.commitId} value={en.commitId}>{versionLabel(en)}</option>)}</select></label>
+          <button onClick={() => { setBaseEntry(null); setTargetEntry(null); }}>返回列表</button>
         </div>
         <div className="history-diff-body">
           {loadingDiff ? <div className="history-diff-empty">正在对比…</div>
@@ -308,7 +367,7 @@ function HistoryDrawer({ open, onClose, storageId, syncFolder, current, onRestor
         </div>
       </div>
     ) : (
-      <ul>{versions.map(version => <li key={version.versionId}><div><strong>{new Date(version.createdAt).toLocaleString()}</strong><small>{version.author || '未知设备'} · {formatSize(version.size)}</small></div><div className="history-actions">{version.isCurrent ? <span className="default-tag">当前</span> : <><button onClick={() => startCompare(version)}>对比</button><button onClick={() => onRestore(version)}>恢复</button></>}</div></li>)}</ul>
+      <ul>{entries.map(entry => <li key={entry.commitId}><div><strong>{new Date(entry.createdAt).toLocaleString()}</strong><small>{entry.author || '未知设备'} · {formatSize(entry.size)}{entry.message ? ` · ${entry.message}` : ''}</small></div><div className="history-actions">{entry.isCurrent ? <span className="default-tag">当前</span> : entry.deleted ? <span className="default-tag">已删除</span> : <><button onClick={() => startCompare(entry)}>对比</button><button onClick={() => onRestore(entry.commitId)}>恢复</button></>}</div></li>)}</ul>
     )}
   </div>;
 }

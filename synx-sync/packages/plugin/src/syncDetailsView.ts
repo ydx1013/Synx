@@ -79,7 +79,9 @@ export class SyncDetailsView extends ItemView {
     row.createEl('div', { text: meta.join(' · ') });
     if (item.rule) row.createEl('div', { text: `规则：${item.rule}${item.size !== undefined ? ` · ${item.size} 字节` : ''}` });
     if (item.conflictPath) row.createEl('div', { text: `冲突副本：${item.conflictPath}` });
-    if (item.error) row.createEl('div', { text: `${item.error.message}${item.error.status ? ` · HTTP ${item.error.status}` : ''}` });
+    if (item.error) {
+      row.createEl('div', { text: `${item.error.message}${item.error.detail ? `（${item.error.detail}）` : ''}${item.error.status ? ` · HTTP ${item.error.status}` : ''}` });
+    }
     const actions = row.createDiv({ cls: 'synx-report-actions' });
     if (item.status === 'failed') {
       actions.createEl('button', { text: '重试' }).onclick = async () => this.plugin.retryReportItems([item]);

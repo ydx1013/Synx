@@ -1,25 +1,26 @@
 import {
   API,
   HEADERS,
-  type Entity,
-  type FileMeta,
-  type PutResponse,
-  type ListResponse,
-  type HistoryResponse,
-  type RollbackResponse,
-  type VersionRecord,
   type AuthResponse,
   type StorageSummary,
   type StorageListResponse,
   type RetentionPolicy,
   type RetentionPolicyResponse,
+  type RepoHeadResponse,
+  type RepoInitResponse,
+  type RepoTreeResponse,
+  type RepoFinalizeRequest,
+  type RepoFinalizeResponse,
+  type RepoFile,
+  type RepoFileHistoryResponse,
+  type RepoGcResponse,
 } from '@synx/shared';
 
 /**
  * WorkerClient：插件端通过 HTTP 调 Workers API 的传输层。
  *
- * 实现 SyncFs 子集（list/readFile/writeFile），并提供 history/rollback/storage 等高级 API。
- * 失败重试（指数退避 3 次）；401 时触发 onUnauthorized 回调（让 UI 提示重登）。
+ * 通过 Git 式仓库 API（repoHead/repoBlobs/repoFinalize/repoContent/repoFileHistory）
+ * 与远端同步；失败重试（指数退避 3 次）；401 时触发 onUnauthorized 回调（让 UI 提示重登）。
  */
 export interface WorkerClientOptions {
   serverUrl: string;
@@ -77,53 +78,54 @@ export class WorkerClient {
     this.opts.syncFolder = syncFolder;
   }
 
-  // ===== SyncFs 接口实现 =====
+  // ===== Git 式仓库 API（同步走全库原子提交） =====
 
-  /** 列举远端 current 版本（返回 Entity 列表） */
-  async list(_path = ''): Promise<Entity[]> {
-    const res = await this.request<ListResponse>('GET', API.list);
-    return res.files.map(fileToEntity);
+  /** 读取仓库 HEAD + 当前完整树（替代旧 list() 作为远端状态来源） */
+  async repoHead(): Promise<RepoHeadResponse> {
+    return this.request<RepoHeadResponse>('GET', API.repoHead);
   }
 
-  /** 读取文件内容（二进制直传，不经 base64；version 元数据通过 X-Synx-Version 响应头返回） */
-  async readFile(path: string, versionId?: string, fileUuid?: string): Promise<ArrayBuffer> {
-    const params = new URLSearchParams({ path });
-    if (versionId) params.set('version', versionId);
-    if (fileUuid) params.set('fileUuid', fileUuid);
-    const res = await this.requestResponse('GET', `${API.get}?${params.toString()}`);
+  /** 初始化仓库：把当前远端状态完整收进 initial 提交。已存在时报 409 REPO_EXISTS。 */
+  async repoInit(author?: string): Promise<RepoInitResponse> {
+    return this.request<RepoInitResponse>('POST', API.repoInit, { author });
+  }
+
+  /** 读取某提交下的文件树 */
+  async repoTree(commitId: string): Promise<RepoFile[]> {
+    const res = await this.request<RepoTreeResponse>('GET', `${API.repoTree}?commitId=${encodeURIComponent(commitId)}`);
+    return res.files;
+  }
+
+  /** 上传不可变内容对象（二进制直传），返回 blobId 供 finalize 变更集引用 */
+  async uploadBlob(path: string, content: ArrayBuffer | Uint8Array, mtime: number): Promise<string> {
+    const params = new URLSearchParams({ path, mtime: String(mtime) });
+    const res = await this.requestResponse('POST', `${API.repoBlobs}?${params.toString()}`, content, true);
+    const data = (await res.json()) as { blobId: string };
+    return data.blobId;
+  }
+
+  /** 原子提交变更集（CAS）。HEAD 已被推进时抛 WorkerApiError(409) */
+  async finalizeCommit(input: RepoFinalizeRequest): Promise<RepoFinalizeResponse> {
+    return this.request<RepoFinalizeResponse>('POST', API.repoFinalize, input);
+  }
+
+  /** 读取某提交下的文件内容（二进制，路径与 blob 解引用） */
+  async repoContent(commitId: string, path: string): Promise<ArrayBuffer> {
+    const params = new URLSearchParams({ commitId, path });
+    const res = await this.requestResponse('GET', `${API.repoContent}?${params.toString()}`);
     return res.arrayBuffer();
   }
 
-  /** 写入新版本（二进制直传，产生新 VersionRecord） */
-  async writeFile(path: string, content: ArrayBuffer | Uint8Array, mtime: number, author?: string, fileUuid?: string): Promise<VersionRecord> {
-    const params = new URLSearchParams({ path, mtime: String(mtime) });
-    if (fileUuid) params.set('fileUuid', fileUuid);
-    if (author) params.set('author', author);
-    const res = await this.requestResponse('POST', `${API.put}?${params.toString()}`, content, true);
-    const data = (await res.json()) as PutResponse;
-    return data.version;
-  }
-
-  async deleteFile(path: string, fileUuid?: string): Promise<void> {
-    await this.request<{ deleted: boolean }>('DELETE', API.file, { path, fileUuid });
-  }
-
-  // ===== 版本历史 API（Task 16 历史侧栏使用） =====
-
-  async history(path: string, fileUuid?: string): Promise<VersionRecord[]> {
+  /** 单文件历史：按 identity 从提交链派生（git 模型替代旧 /api/history） */
+  async repoFileHistory(path: string, fileUuid?: string): Promise<RepoFileHistoryResponse> {
     const params = new URLSearchParams({ path });
     if (fileUuid) params.set('fileUuid', fileUuid);
-    const res = await this.request<HistoryResponse>('GET', `${API.history}?${params.toString()}`);
-    return res.versions;
+    return this.request<RepoFileHistoryResponse>('GET', `${API.repoFileHistory}?${params.toString()}`);
   }
 
-  async rollback(path: string, versionId: string, fileUuid?: string): Promise<VersionRecord> {
-    const res = await this.request<RollbackResponse>('POST', '/api/rollback', {
-      path,
-      fileUuid,
-      version: versionId,
-    });
-    return res.version;
+  /** 垃圾回收：清理孤儿内容对象 + 按保留策略裁剪历史提交（静默调用，失败不影响同步） */
+  async repoGc(): Promise<RepoGcResponse> {
+    return this.request<RepoGcResponse>('POST', API.repoGc, {});
   }
 
   // ===== 静态方法：登录、列出存储（不依赖 storageId/syncFolder） =====
@@ -283,19 +285,6 @@ export class WorkerApiError extends Error {
 }
 
 // ===== 辅助函数 =====
-
-function fileToEntity(f: FileMeta): Entity {
-  return {
-    key: '/' + f.path.replace(/^\/+/, ''),
-    mtime: f.mtime,
-    size: f.size,
-    type: 'file',
-    hash: f.hash,
-    etag: f.hash,
-    versionId: f.versionId,
-    fileUuid: f.fileUuid,
-  };
-}
 
 function joinUrl(base: string, path: string): string {
   return `${normalizeServerUrl(base)}${path}`;

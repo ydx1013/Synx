@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { WorkerClient, WorkerApiError } from './workerClient.js';
+import { describe, it, expect, vi } from 'vitest';
+import { WorkerClient } from './workerClient.js';
 
 const SERVER = 'https://synx.example.com';
 const JWT = 'jwt-token';
@@ -25,11 +25,15 @@ function jsonRes(body: unknown, status = 200): Response {
   });
 }
 
+function emptyRepoHead(): unknown {
+  return { head: null, tree: [], storageId: STORAGE_ID, syncFolder: SYNC_FOLDER };
+}
+
 describe('WorkerClient headers', () => {
   it('sends Authorization, X-Storage-Id, X-Sync-Folder', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock);
-    await client.list();
+    await client.repoHead();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const headers = init.headers as Record<string, string>;
@@ -39,140 +43,79 @@ describe('WorkerClient headers', () => {
   });
 
   it('builds URL by joining base + path', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock);
-    await client.list();
-    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/list`);
+    await client.repoHead();
+    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/repository/head`);
   });
 
   it('normalizes the fixed login URL before joining API paths', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock, { serverUrl: `${SERVER}/login` });
-    await client.list();
-    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/list`);
+    await client.repoHead();
+    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/repository/head`);
   });
 
-  it.each(['/dashboard', '/dashboard/'])('normalizes a pasted %s URL before joining API paths', async (dashboardPath) => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
-    const client = makeClient(fetchMock, {
-      serverUrl: `${SERVER}${dashboardPath}`,
-    });
-    await client.list();
-    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/list`);
-  });
-
-  it('normalizes a pasted dashboard URL before joining API paths', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
-    const client = makeClient(fetchMock, {
-      serverUrl: `${SERVER}/dashboard.html?from=plugin#storage`,
-    });
-    await client.list();
-    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/list`);
+  it.each(['/dashboard', '/dashboard/', '/dashboard.html?from=plugin#storage'])('normalizes a pasted %s URL before joining API paths', async (dashboardPath) => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(emptyRepoHead()));
+    const client = makeClient(fetchMock, { serverUrl: `${SERVER}${dashboardPath}` });
+    await client.repoHead();
+    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/repository/head`);
   });
 });
 
-describe('list', () => {
-  it('returns Entity[] mapped from FileMeta', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonRes({
-        files: [
-          { path: 'a.md', versionId: 'v1', mtime: 1, size: 10, hash: 'h1', author: null },
-          { path: 'b.md', versionId: 'v2', mtime: 2, size: 20, hash: 'h2', author: 'dev' },
-        ],
-      }),
-    );
+describe('repoHead', () => {
+  it('returns head + tree', async () => {
+    const head = { commitId: 'c1', generation: 1, createdAt: 1, author: 'dev', message: 'init' };
+    const tree = [{ path: 'a.md', identity: 'uuid-a', blobId: 'k', mtime: 1, size: 1, hash: 'h' }];
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ head, tree, storageId: STORAGE_ID, syncFolder: SYNC_FOLDER }));
     const client = makeClient(fetchMock);
-    const entities = await client.list();
-    expect(entities.length).toBe(2);
-    expect(entities[0].key).toBe('/a.md');
-    expect(entities[0].size).toBe(10);
-    expect(entities[0].etag).toBe('h1');
-    expect(entities[0].type).toBe('file');
+    const res = await client.repoHead();
+    expect(res.head?.commitId).toBe('c1');
+    expect(res.tree.length).toBe(1);
+    expect(fetchMock.mock.calls[0][0]).toContain('/api/repository/head');
   });
 });
 
-describe('readFile', () => {
-  it('returns ArrayBuffer from binary body', async () => {
-    const text = 'hello world';
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(new TextEncoder().encode(text), {
-        status: 200,
-        headers: { 'Content-Type': 'application/octet-stream', 'X-Synx-Version': JSON.stringify({ versionId: 'v' }) },
-      }),
-    );
+describe('repoFileHistory', () => {
+  it('passes path and fileUuid query params', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ identity: 'uuid-a', commits: [], changes: [] }));
     const client = makeClient(fetchMock);
-    const buf = await client.readFile('a.md');
-    expect(new TextDecoder().decode(buf)).toBe(text);
-  });
-
-  it('passes version query param when given', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(new TextEncoder().encode('a'), {
-        status: 200,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      }),
-    );
-    const client = makeClient(fetchMock);
-    await client.readFile('a.md', 'v1');
-    expect(fetchMock.mock.calls[0][0]).toContain('version=v1');
+    await client.repoFileHistory('a.md', '550e8400-e29b-41d4-a716-446655440000');
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/api/repository/file-history');
+    expect(url).toContain('path=a.md');
+    expect(url).toContain('fileUuid=550e8400-e29b-41d4-a716-446655440000');
   });
 });
 
-describe('writeFile', () => {
-  it('sends binary body with query params', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonRes({ version: { userId: 'u', storageId: STORAGE_ID, path: 'a.md', versionId: 'v', mtime: 1, size: 5, hash: 'h', storageKey: 'k', isCurrent: 1, author: null, createdAt: 1 } }, 201),
-    );
+describe('repoGc', () => {
+  it('POSTs to /api/repository/gc and returns scan result', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ scanned: 5, deleted: 1, more: false }));
+    const client = makeClient(fetchMock);
+    const res = await client.repoGc();
+    expect(res).toEqual({ scanned: 5, deleted: 1, more: false });
+    const url = String(fetchMock.mock.calls[0][0]);
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(url).toContain('/api/repository/gc');
+    expect(init.method).toBe('POST');
+  });
+});
+
+describe('uploadBlob', () => {
+  it('sends binary body and returns blobId', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ blobId: 'my-vault/a.md@v1' }, 201));
     const client = makeClient(fetchMock);
     const content = new TextEncoder().encode('hello');
-    const version = await client.writeFile('a.md', content, 1700000000, 'device-a');
-    expect(version.versionId).toBe('v');
+    const blobId = await client.uploadBlob('a.md', content, 1700000000);
+    expect(blobId).toBe('my-vault/a.md@v1');
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toContain('/api/put?');
+    expect(url).toContain('/api/repository/blobs?');
     expect(url).toContain('path=a.md');
     expect(url).toContain('mtime=1700000000');
-    expect(url).toContain('author=device-a');
     expect(init.method).toBe('POST');
     expect(init.body).toEqual(content);
     expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/octet-stream');
-  });
-});
-
-describe('deleteFile', () => {
-  it('sends UUID and path to the delete endpoint', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ deleted: true }));
-    const client = makeClient(fetchMock);
-    await client.deleteFile('notes/a.md', '550e8400-e29b-41d4-a716-446655440000');
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
-    expect(fetchMock.mock.calls[0][0]).toContain('/api/file');
-    expect(init.method).toBe('DELETE');
-    expect(JSON.parse(init.body as string)).toEqual({ path: 'notes/a.md', fileUuid: '550e8400-e29b-41d4-a716-446655440000' });
-  });
-});
-
-describe('history', () => {
-  it('returns versions', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonRes({ versions: [{ userId: 'u', storageId: STORAGE_ID, path: 'a.md', versionId: 'v1', mtime: 1, size: 1, hash: 'h', storageKey: 'k', isCurrent: 1, author: null, createdAt: 1 }] }),
-    );
-    const client = makeClient(fetchMock);
-    const versions = await client.history('a.md');
-    expect(versions.length).toBe(1);
-    expect(fetchMock.mock.calls[0][0]).toContain('?path=a.md');
-  });
-});
-
-describe('rollback', () => {
-  it('posts path + version, returns new version', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonRes({ version: { userId: 'u', storageId: STORAGE_ID, path: 'a.md', versionId: 'v-new', mtime: 1, size: 1, hash: 'h', storageKey: 'k', isCurrent: 1, author: 'rollback@v-old', createdAt: 1 } }, 201),
-    );
-    const client = makeClient(fetchMock);
-    const version = await client.rollback('a.md', 'v-old');
-    expect(version.versionId).toBe('v-new');
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
-    const body = JSON.parse(init.body as string);
-    expect(body).toEqual({ path: 'a.md', version: 'v-old' });
   });
 });
 
@@ -180,14 +123,14 @@ describe('error handling', () => {
   it('throws WorkerApiError on 4xx (non-401)', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"forbidden"}', { status: 403 }));
     const client = makeClient(fetchMock);
-    await expect(client.list()).rejects.toMatchObject({ status: 403 });
+    await expect(client.repoHead()).rejects.toMatchObject({ status: 403 });
   });
 
   it('triggers onUnauthorized on 401', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"unauthorized"}', { status: 401 }));
     const onUnauthorized = vi.fn();
     const client = makeClient(fetchMock, { onUnauthorized });
-    await expect(client.list()).rejects.toMatchObject({ status: 401 });
+    await expect(client.repoHead()).rejects.toMatchObject({ status: 401 });
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
   });
 
@@ -196,13 +139,13 @@ describe('error handling', () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('', { status: 500 }))
       .mockResolvedValueOnce(new Response('', { status: 500 }))
-      .mockResolvedValueOnce(jsonRes({ files: [] }));
+      .mockResolvedValueOnce(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock, { maxRetries: 2 });
-    const promise = client.list();
+    const promise = client.repoHead();
     // 推进 fake timers（500 + 1000 ms 退避）
     await vi.advanceTimersByTimeAsync(2000);
     const result = await promise;
-    expect(result).toEqual([]);
+    expect(result.head).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(3);
     vi.useRealTimers();
   });
@@ -210,14 +153,14 @@ describe('error handling', () => {
   it('does NOT retry on 413', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"too large"}', { status: 413 }));
     const client = makeClient(fetchMock);
-    await expect(client.writeFile('a', new Uint8Array(1), 1)).rejects.toMatchObject({ status: 413 });
+    await expect(client.uploadBlob('a', new Uint8Array(1), 1)).rejects.toMatchObject({ status: 413 });
     expect(fetchMock).toHaveBeenCalledTimes(1); // 未重试
   });
 
   it('does NOT retry on 400 (client error)', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"missing fields: content"}', { status: 400 }));
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"missing fields: path"}', { status: 400 }));
     const client = makeClient(fetchMock);
-    await expect(client.writeFile('a', new Uint8Array(1), 1)).rejects.toMatchObject({ status: 400 });
+    await expect(client.uploadBlob('a', new Uint8Array(1), 1)).rejects.toMatchObject({ status: 400 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -225,12 +168,12 @@ describe('error handling', () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(new Error('network down'))
-      .mockResolvedValueOnce(jsonRes({ files: [] }));
+      .mockResolvedValueOnce(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock, { maxRetries: 1 });
-    const promise = client.list();
+    const promise = client.repoHead();
     await vi.advanceTimersByTimeAsync(1000);
     const result = await promise;
-    expect(result).toEqual([]);
+    expect(result.head).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
@@ -263,19 +206,19 @@ describe('static methods', () => {
 
 describe('setJwt / setStorage', () => {
   it('updates jwt after construction', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock);
     client.setJwt('new-jwt');
-    await client.list();
+    await client.repoHead();
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer new-jwt');
   });
 
   it('updates storageId + syncFolder after construction', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ files: [] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(emptyRepoHead()));
     const client = makeClient(fetchMock);
     client.setStorage('s-new', 'folder-new');
-    await client.list();
+    await client.repoHead();
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const headers = init.headers as Record<string, string>;
     expect(headers['X-Storage-Id']).toBe('s-new');

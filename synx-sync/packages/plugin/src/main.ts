@@ -1,6 +1,7 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
+import type { RepoChange, RepoFile } from '@synx/shared';
 import { evaluateFile } from './fileFilter.js';
 import { conflictCopyPath, resolveConflict } from './conflict.js';
 import { HistoryPaneView, HISTORY_VIEW_TYPE } from './historyPane.js';
@@ -17,7 +18,8 @@ import { formatStatusBar } from './syncPresentation.js';
 import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncStats, type SyncReport, type SyncReportItem, type SyncTrigger } from './syncReport.js';
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
-import { WorkerClient } from './workerClient.js';
+import { WorkerClient, WorkerApiError } from './workerClient.js';
+import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 
 interface PersistedPluginData {
   settings: SynxPluginSettings;
@@ -77,6 +79,14 @@ export default class SynxSyncPlugin extends Plugin {
   private knownRemoteFiles: { storageId: string; syncFolder: string; path: string; fileUuid?: string }[] = [];
   private prevSync: PrevSyncState | null = null;
   private internalDeletes = new Set<string>();
+
+  // Git 式仓库同步状态（本次同步内累积，runSync 结束/失败时清理）
+  private repoUploads = new Map<string, RepoUploadedFile>();
+  private repoDeletes = new Map<string, string>(); // path → identity
+  private repoTree: RepoFile[] = [];
+  /** 提交时的基线 HEAD（用于 pull 内容与 finalize CAS） */
+  private repoHeadCommitId: string | null = null;
+  private repoHeadGeneration: number | null = null;
 
   private uuidEditorExtensions: Extension[] = [];
 
@@ -240,7 +250,14 @@ export default class SynxSyncPlugin extends Plugin {
       new Notice('Synx: 请先登录并选择存储');
       return;
     }
-    this.remoteEntities = await this.client.list();
+    // 拉仓库树作为远端状态（未初始化时先 init）
+    const repo = await this.ensureRepoBase();
+    this.repoTree = repo.tree;
+    this.repoHeadCommitId = repo.head.commitId;
+    this.repoHeadGeneration = repo.head.generation;
+    this.repoUploads.clear();
+    this.repoDeletes.clear();
+    this.remoteEntities = repoTreeToRemote(repo.tree);
     const remotePaths = new Set(this.remoteEntities.map((entity) => entity.key.replace(/^\/+/, '')));
     const actions = await buildRetryActions(items, {
       inspectLocal: async (path) => {
@@ -250,7 +267,25 @@ export default class SynxSyncPlugin extends Plugin {
       inspectRemote: async (path) => remotePaths.has(path),
       evaluate: (path, size) => evaluateFile(path, size, this.settings),
     });
-    await this.executeActions(actions, 'retry');
+    this.reportStore.start('retry');
+    await this.executeActions(actions);
+    // 重试产生的变更也走原子提交
+    const changes = buildRepoChanges(
+      [...this.repoUploads.values()],
+      [...this.repoDeletes.entries()].map(([path, identity]) => ({ path, identity }) as RepoDelete),
+      treeToMap(this.repoTree),
+    );
+    if (changes.length > 0) {
+      await this.client.finalizeCommit({
+        baseCommitId: repo.head.commitId,
+        baseGeneration: repo.head.generation,
+        author: this.settings.deviceName,
+        message: `重试同步 ${changes.length} 个文件`,
+        changes,
+      });
+    }
+    this.finishSyncReport();
+    await this.persist();
   }
 
   async clearSyncReports(): Promise<void> {
@@ -318,10 +353,11 @@ export default class SynxSyncPlugin extends Plugin {
     if (!this.client || !this.settings.storageId) return;
     const target = { storageId: this.settings.storageId, syncFolder: this.settings.syncFolder };
     for (const entry of pendingForTarget(this.pendingDeletions, target)) {
-      await this.client.deleteFile(entry.path, entry.fileUuid);
+      // git 模型下删除 = 提交中的 delete 变更（原子），不再单独 deleteFile
+      this.repoDeletes.set(entry.path, entry.fileUuid ?? `path:${entry.path}`);
       this.pendingDeletions = this.pendingDeletions.filter((item) => item !== entry);
-      await this.persist();
     }
+    await this.persist();
   }
 
   private handleUnauthorized(): void {
@@ -334,99 +370,155 @@ export default class SynxSyncPlugin extends Plugin {
     this.reportStore.start(trigger);
     this.updateProgress();
     try {
-      await this.flushPendingDeletions();
       const prevSyncMap = this.getPrevSyncMap();
       const { files, skipped } = await this.enumerateLocalFiles(prevSyncMap);
-      const rawRemote = await this.client.list();
-      const targetFiles = rawRemote.map((entity) => ({
-        storageId: this.settings.storageId!,
-        syncFolder: this.settings.syncFolder,
-        path: entity.key.replace(/^\/+/, ''),
-        fileUuid: entity.fileUuid ?? undefined,
-      }));
-      this.knownRemoteFiles = [
-        ...this.knownRemoteFiles.filter((item) => item.storageId !== this.settings.storageId || item.syncFolder !== this.settings.syncFolder),
-        ...targetFiles,
-      ];
-      await this.persist();
-      // 对远端列表同样应用过滤规则：被过滤掉的远端文件不参与同步计划，
-      // 避免"关闭 syncConfigDir 后远端的 .obsidian/ 被拉回本地"的问题。
-      // 与 remotely-save 行为一致：过滤后从 finalMappings 中删除。
-      const { remote, skippedRemote } = this.filterRemoteEntities(rawRemote);
-      this.remoteEntities = remote;
-      this.reportStore.setPhase('planning');
-      this.updateProgress();
-      // #region debug-point B:plan-inputs
-      dbg('B', 'main.ts:runSync', 'plan inputs', {
-        trigger,
-        localCount: files.length,
-        remoteCount: this.remoteEntities.length,
-        hasPrevSync: !!prevSyncMap,
-        prevSyncCount: prevSyncMap ? prevSyncMap.size : 0,
-        storageId: this.settings.storageId,
-        prevStorageId: this.prevSync?.storageId ?? null,
-        syncFolder: this.settings.syncFolder,
-        prevSyncFolder: this.prevSync?.syncFolder ?? null,
-        syncConfigDir: this.settings.syncConfigDir,
-      });
-      // #endregion
-      const plan = planSync(files, this.remoteEntities, 1000, prevSyncMap);
-      // #region debug-point C:plan-per-file
-      {
-        const localByPath = new Map(files.map((f) => [f.path, f]));
-        const remoteByPath = new Map(this.remoteEntities.map((e) => [e.key.replace(/^\/+/, ''), e]));
-        for (const a of plan.actions) {
-          if (a.type === 'skip') continue;
-          const l = localByPath.get(a.path);
-          const r = remoteByPath.get(a.path);
-          const p = prevSyncMap?.get(a.path);
-          dbg('C', 'main.ts:runSync', `plan ${a.type} ${a.reason}`, {
-            path: a.path,
-            lHash: l?.hash ?? null, lMtime: l?.mtime ?? null, lSize: l?.size ?? null, lUuid: l?.fileUuid ?? null,
-            rHash: r?.hash ?? r?.etag ?? null, rMtime: r?.mtime ?? null, rSize: r?.size ?? null,
-            pLocalHash: p?.localHash ?? null, pRemoteHash: p?.remoteHash ?? null,
-            pLocalMtime: p?.localMtime ?? null, pRemoteMtime: p?.remoteMtime ?? null,
+
+      // 拉取仓库基线：HEAD + 当前树。仓库未初始化时先 init（把现有远端收进 initial 提交）。
+      let repo = await this.ensureRepoBase();
+
+      let plan: SyncPlan | null = null;
+      let skippedRemote: ExecutableSyncAction[] = [];
+      let attempt = 0;
+      for (; attempt < 2; attempt++) {
+        this.repoUploads.clear();
+        this.repoDeletes.clear();
+        this.repoTree = repo.tree;
+        this.repoHeadCommitId = repo.head.commitId;
+        this.repoHeadGeneration = repo.head.generation;
+        // 消化本地删除队列 → 收集进本次提交的 delete 变更
+        await this.flushPendingDeletions();
+
+        // 远端树 → 过滤（被过滤的远端文件不参与同步计划，保留现有行为）
+        const remoteEntities = repoTreeToRemote(repo.tree);
+        const { remote, skippedRemote: sr } = this.filterRemoteEntities(remoteEntities);
+        skippedRemote = sr;
+        this.remoteEntities = remote;
+        // knownRemoteFiles 缓存：本地删除时判断"远端是否有该文件"
+        const targetFiles = remote.map((entity) => ({
+          storageId: this.settings.storageId!,
+          syncFolder: this.settings.syncFolder,
+          path: entity.key.replace(/^\/+/, ''),
+          fileUuid: entity.fileUuid ?? undefined,
+        }));
+        this.knownRemoteFiles = [
+          ...this.knownRemoteFiles.filter((item) => item.storageId !== this.settings.storageId || item.syncFolder !== this.settings.syncFolder),
+          ...targetFiles,
+        ];
+        await this.persist();
+
+        this.reportStore.setPhase('planning');
+        this.updateProgress();
+        // #region debug-point B:plan-inputs
+        dbg('B', 'main.ts:runSync', 'plan inputs', {
+          trigger,
+          localCount: files.length,
+          remoteCount: this.remoteEntities.length,
+          hasPrevSync: !!prevSyncMap,
+          prevSyncCount: prevSyncMap ? prevSyncMap.size : 0,
+          storageId: this.settings.storageId,
+          prevStorageId: this.prevSync?.storageId ?? null,
+          syncFolder: this.settings.syncFolder,
+          prevSyncFolder: this.prevSync?.syncFolder ?? null,
+          syncConfigDir: this.settings.syncConfigDir,
+        });
+        // #endregion
+        plan = planSync(files, this.remoteEntities, 1000, prevSyncMap);
+        // #region debug-point C:plan-per-file
+        {
+          const localByPath = new Map(files.map((f) => [f.path, f]));
+          const remoteByPath = new Map(this.remoteEntities.map((e) => [e.key.replace(/^\/+/, ''), e]));
+          for (const a of plan.actions) {
+            if (a.type === 'skip') continue;
+            const l = localByPath.get(a.path);
+            const r = remoteByPath.get(a.path);
+            const p = prevSyncMap?.get(a.path);
+            dbg('C', 'main.ts:runSync', `plan ${a.type} ${a.reason}`, {
+              path: a.path,
+              lHash: l?.hash ?? null, lMtime: l?.mtime ?? null, lSize: l?.size ?? null, lUuid: l?.fileUuid ?? null,
+              rHash: r?.hash ?? r?.etag ?? null, rMtime: r?.mtime ?? null, rSize: r?.size ?? null,
+              pLocalHash: p?.localHash ?? null, pRemoteHash: p?.remoteHash ?? null,
+              pLocalMtime: p?.localMtime ?? null, pRemoteMtime: p?.remoteMtime ?? null,
+            });
+          }
+        }
+        // #endregion
+        // 防清空 vault 误删远端：本地文件数比上次同步骤降（低于设置阈值）时，
+        // 默认把所有 delete-remote 转为 pull（拉回，不删）。只有用户在设置中打开
+        // 「允许批量删除远端」开关，才真正执行 delete-remote。
+        let guardedDeletes = 0;
+        let guardedActions = plan.actions;
+        const protectPercent = this.settings.massDeleteProtectPercent;
+        if (
+          prevSyncMap &&
+          !this.settings.allowBatchRemoteDelete &&
+          shouldProtectAgainstMassDeletion(files.length, prevSyncMap.size, protectPercent)
+        ) {
+          guardedActions = plan.actions.map((a) => {
+            if (a.type !== 'delete-remote') return a;
+            guardedDeletes++;
+            return { type: 'pull', path: a.path, reason: 'remote-only', fileUuid: a.fileUuid };
           });
         }
+        if (guardedDeletes > 0) {
+          console.warn('synx: mass local deletion detected, protected remote files from delete', { local: files.length, prevSync: prevSyncMap?.size ?? 0, guarded: guardedDeletes, protectPercent });
+          // #region debug-point B:mass-deletion-guard
+          dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount: prevSyncMap?.size ?? 0, guardedDeletes, protectPercent });
+          // #endregion
+        }
+        const actions: ExecutableSyncAction[] = [
+          ...skipped,
+          ...skippedRemote,
+          ...guardedActions.map((action) => ({ ...action })) as ExecutableSyncAction[],
+        ];
+        this.reportStore.setPlannedCounts(plan.stats.push, plan.stats.pull);
+        await this.executeActions(actions);
+
+        // 组装变更集：push 已上传为 blob、delete 已收集；pull/skip 不产生提交
+        const changes = buildRepoChanges(
+          [...this.repoUploads.values()],
+          [...this.repoDeletes.entries()].map(([path, identity]) => ({ path, identity }) as RepoDelete),
+          treeToMap(this.repoTree),
+        );
+        if (changes.length === 0) break;
+
+        // CAS 原子提交；HEAD 已被其他设备推进（409）→ 重拉基线重新计划
+        try {
+          const result = await this.client.finalizeCommit({
+            baseCommitId: repo.head.commitId,
+            baseGeneration: repo.head.generation,
+            author: this.settings.deviceName,
+            message: `同步 ${changes.length} 个文件`,
+            changes,
+          });
+          this.repoHeadCommitId = result.head.commitId;
+          this.repoHeadGeneration = result.head.generation;
+          break;
+        } catch (error) {
+          if (error instanceof WorkerApiError && error.status === 409) {
+            repo = await this.ensureRepoBase();
+            continue;
+          }
+          throw error;
+        }
       }
-      // #endregion
-      // 防清空 vault 误删远端：本地文件数比上次同步骤降（低于设置阈值）时，
-      // 默认把所有 delete-remote 转为 pull（拉回，不删）。只有用户在设置中打开
-      // 「允许批量删除远端」开关，才真正执行 delete-remote。
-      let guardedDeletes = 0;
-      let guardedActions = plan.actions;
-      const protectPercent = this.settings.massDeleteProtectPercent;
-      if (
-        prevSyncMap &&
-        !this.settings.allowBatchRemoteDelete &&
-        shouldProtectAgainstMassDeletion(files.length, prevSyncMap.size, protectPercent)
-      ) {
-        guardedActions = plan.actions.map((a) => {
-          if (a.type !== 'delete-remote') return a;
-          guardedDeletes++;
-          return { type: 'pull', path: a.path, reason: 'remote-only', fileUuid: a.fileUuid };
-        });
+      if (attempt >= 2) throw new Error('同步冲突过多（远端提交被其他设备持续推进），请稍后重试');
+      // 提交成功后顺带触发一次垃圾回收：清理"任何提交都未引用"的孤儿内容对象
+      // （中断上传残留等）。静默执行，失败只记日志，绝不影响同步结果。
+      try {
+        const gc = await this.client.repoGc();
+        if (gc.deleted > 0 || gc.deletedCommits > 0 || gc.more) {
+          console.info('synx: gc done after sync', gc);
+        }
+      } catch (error) {
+        console.warn('synx: gc after sync failed', error);
       }
-      if (guardedDeletes > 0) {
-        console.warn('synx: mass local deletion detected, protected remote files from delete', { local: files.length, prevSync: prevSyncMap?.size ?? 0, guarded: guardedDeletes, protectPercent });
-        // #region debug-point B:mass-deletion-guard
-        dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount: prevSyncMap?.size ?? 0, guardedDeletes, protectPercent });
-        // #endregion
-      }
-      const actions: ExecutableSyncAction[] = [
-        ...skipped,
-        ...skippedRemote,
-        ...guardedActions.map((action) => ({ ...action })) as ExecutableSyncAction[],
-      ];
-      this.reportStore.setPlannedCounts(plan.stats.push, plan.stats.pull);
-      await this.executeActions(actions, trigger, false);
       // 同步完成后静默刷新历史面板（不显示 loading、不清空，避免闪烁），
       // 让当前笔记的历史记录立即反映最新版本（含本次 pull 下来的内容）
       this.refreshHistoryPanes(true);
-      const report = this.reportStore.current;
+      const report = this.finishSyncReport();
       if (report && report.stats.push === 0 && report.stats.pull === 0 && report.stats.failed === 0) new Notice('Synx: 已是最新，无需同步');
       // 写 .obsidian 同步诊断日志（移动端排查用）
-      await this.writeObsSyncDebug(files, skipped, skippedRemote, plan, report);
+      if (plan) await this.writeObsSyncDebug(files, skipped, skippedRemote, plan, report);
       // 主存储同步完成后，把本地内容镜像到备份存储（仅 push，不 pull）
       await this.mirrorToBackupStorages(files);
       // 同步全部成功后重建 prevSync 快照（失败时不重建，下次同步重试）
@@ -453,7 +545,17 @@ export default class SynxSyncPlugin extends Plugin {
       this.reportStore.addItem({ path: '', operation: 'skip', status: 'failed', startedAt: now, endedAt: now, attempts: 1, error: normalized });
       this.reportStore.finish();
       if (this.reportStore.current) this.reportStore.current.phase = 'failed';
-      new Notice(`Synx 同步失败：${normalized.message}`, 8000);
+      // 失败原因写入 vault 根部的诊断文件（synx-debug-* 被 fileFilter 排除，不会同步回传），
+      // 便于排查"同步失败但 Notice 一闪而过"的情况。
+      try {
+        await this.app.vault.adapter.write(
+          this.obsDebugFile,
+          `> [!note] Synx 同步失败诊断（生成时间 ${new Date().toISOString()}）\n> 将本文件内容发给作者排查同步失败问题。\n\n\`\`\`json\n${JSON.stringify({ trigger, category: normalized.category, message: normalized.message, detail: normalized.detail ?? null, status: (normalized as { status?: number }).status ?? null, attempts: (normalized as { attempts?: number }).attempts ?? null, raw: error instanceof Error ? error.stack ?? error.message : String(error) }, null, 2)}\n\`\`\`\n`,
+        );
+      } catch (writeError) {
+        console.warn('synx: failed to write sync failure log', writeError);
+      }
+      new Notice(`Synx 同步失败：${normalized.message}${normalized.detail ? `（${normalized.detail}）` : ''}`, 10000);
       await this.persist();
       this.updateProgress();
     }
@@ -523,12 +625,16 @@ export default class SynxSyncPlugin extends Plugin {
     return { remote, skippedRemote };
   }
 
-  private async executeActions(actions: ExecutableSyncAction[], trigger: SyncTrigger, startReport = true): Promise<void> {
-    if (startReport) this.reportStore.start(trigger);
+  /**
+   * 执行动作列表（仅执行，不负责报告的 start/finish/Notice，由 runSync 统一收尾）。
+   * push/delete-remote 只收集变更（blob 上传/删除记录），在 runSync 中一次性 finalize 提交；
+   * pull/delete-local 立即执行（从仓库当前提交读内容写本地）。
+   */
+  private async executeActions(actions: ExecutableSyncAction[]): Promise<void> {
     this.reportStore.setPhase('syncing');
     const push = actions.reduce((count, action) => count + (action.type === 'push' ? 1 : 0), 0);
     const pull = actions.reduce((count, action) => count + (action.type === 'pull' ? 1 : 0), 0);
-    if (startReport) this.reportStore.setPlannedCounts(push, pull);
+    this.reportStore.setPlannedCounts(push, pull);
     const executor = new SyncExecutor(this.settings.concurrency, (action) => this.executeAction(action), (event) => {
       if ('result' in event) {
         this.reportStore.addItem(this.toReportItem(event.result, event.action));
@@ -536,10 +642,29 @@ export default class SynxSyncPlugin extends Plugin {
       }
     });
     await executor.execute(actions);
+  }
+
+  /** 报告收尾：finish + 状态栏 + 通知（runSync / retry 共用） */
+  private finishSyncReport(): SyncReport {
     const report = this.reportStore.finish();
-    await this.persist();
     this.updateProgress();
     new Notice(`Synx 完成：成功 ${report.stats.success}，失败 ${report.stats.failed}，跳过 ${report.stats.skipped}`, 4000);
+    return report;
+  }
+
+  /**
+   * 拉取仓库基线：HEAD + 当前树。
+   * 仓库未初始化时先 init（服务端把现有远端状态完整收进 initial 提交）。
+   */
+  private async ensureRepoBase(): Promise<{ head: { commitId: string; generation: number }; tree: RepoFile[] }> {
+    if (!this.client) throw new Error('Synx 客户端未就绪');
+    let resp = await this.client.repoHead();
+    if (!resp.head) {
+      await this.client.repoInit(this.settings.deviceName);
+      resp = await this.client.repoHead();
+    }
+    if (!resp.head) throw new Error('仓库初始化失败，请重试');
+    return { head: { commitId: resp.head.commitId, generation: resp.head.generation }, tree: resp.tree };
   }
 
   /**
@@ -566,7 +691,7 @@ export default class SynxSyncPlugin extends Plugin {
     }
   }
 
-  /** 镜像单个备份存储：list → filter → planSync → 只取 push → execute */
+  /** 镜像单个备份存储：仓库树 → filter → planSync → 只取 push → 上传 blob + 原子提交 */
   private async mirrorToBackupStorage(storageId: string, storageName: string | null, localFiles: LocalFile[]): Promise<void> {
     const backupClient = new WorkerClient({
       serverUrl: this.settings.serverUrl,
@@ -578,8 +703,16 @@ export default class SynxSyncPlugin extends Plugin {
 
     let stats: BackupSyncStats;
     try {
-      const rawRemote = await backupClient.list();
-      const { remote } = this.filterRemoteEntities(rawRemote);
+      // 拉备份存储仓库基线（未初始化则 init 收现有远端）
+      let resp = await backupClient.repoHead();
+      if (!resp.head) {
+        await backupClient.repoInit(this.settings.deviceName);
+        resp = await backupClient.repoHead();
+      }
+      if (!resp.head) throw new Error('备份仓库初始化失败');
+
+      const tree = resp.tree;
+      const { remote } = this.filterRemoteEntities(repoTreeToRemote(tree));
       const plan = planSync(localFiles, remote);
       // ★ 只取 push 动作，丢弃所有 pull——备份存储永不反向覆盖本地
       const pushActions: ExecutableSyncAction[] = plan.actions
@@ -589,15 +722,28 @@ export default class SynxSyncPlugin extends Plugin {
 
       let success = 0;
       let failed = 0;
-      const executor = new SyncExecutor(this.settings.concurrency, (action) => this.pushToClient(backupClient, action.path));
+      // 上传为不可变 blob 并收集（不逐文件提交）
+      const uploads = new Map<string, RepoUploadedFile>();
+      const executor = new SyncExecutor(this.settings.concurrency, (action) => this.uploadToClient(backupClient, action.path, uploads));
       const results = await executor.execute(pushActions);
       for (const r of results) {
         if (r.status === 'success') success++;
         else if (r.status === 'failed') failed++;
       }
+      // 有上传才产生一次原子提交
+      if (uploads.size > 0) {
+        const changes = buildRepoChanges([...uploads.values()], [], treeToMap(tree));
+        await backupClient.finalizeCommit({
+          baseCommitId: resp.head.commitId,
+          baseGeneration: resp.head.generation,
+          author: this.settings.deviceName,
+          message: `镜像 ${changes.length} 个文件`,
+          changes,
+        });
+      }
       stats = { storageId, storageName, push: pushActions.length, success, failed, skipped: skippedCount };
     } catch (error) {
-      // 整个备份存储阶段失败（如 list 失败）：记录错误，不抛出，不阻塞其他备份
+      // 整个备份存储阶段失败（如 list/init 失败）：记录错误，不抛出，不阻塞其他备份
       stats = { storageId, storageName, push: 0, success: 0, failed: 0, skipped: 0, error: normalizeSyncError(error) };
     }
     this.reportStore.recordBackup(stats);
@@ -612,8 +758,8 @@ export default class SynxSyncPlugin extends Plugin {
     } else if (action.type === 'pull') {
       await this.executePull(action.path, action.fileUuid);
     } else if (action.type === 'delete-remote') {
-      if (!this.client) return;
-      await this.client.deleteFile(action.path, action.fileUuid);
+      // git 模型下删除 = 提交中的 delete 变更（原子，不再单独 deleteFile）
+      this.repoDeletes.set(action.path, action.fileUuid ?? `path:${action.path}`);
     } else {
       await this.deleteLocalFile(action.path);
     }
@@ -650,10 +796,11 @@ export default class SynxSyncPlugin extends Plugin {
       if (resolution.paused) throw new Error('冲突策略要求暂停并报告');
       if (resolution.outcome === 'keep-local') {
         try {
-          const remoteContent = await this.client.readFile(path);
+          if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
+          const remoteContent = await this.client.repoContent(this.repoHeadCommitId, path);
           await this.writeLocalViaAdapter(resolution.conflictPath, remoteContent);
         } catch {
-          // 远端 current 已丢失（版本被清理/manifest 不一致），退化为直接推送本地
+          // 远端内容拉不到（提交被清理等），退化为直接推送本地
         }
         await this.executePush(path);
       } else {
@@ -676,10 +823,11 @@ export default class SynxSyncPlugin extends Plugin {
     if (resolution.paused) throw new Error('冲突策略要求暂停并报告');
     if (resolution.outcome === 'keep-local') {
       try {
-        const remoteContent = await this.client.readFile(path);
+        if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
+        const remoteContent = await this.client.repoContent(this.repoHeadCommitId, path);
         await this.writeLocal(resolution.conflictPath, remoteContent);
       } catch {
-        // 远端 current 已丢失，退化为直接推送本地
+        // 远端内容拉不到（提交被清理等），退化为直接推送本地
       }
       await this.executePush(path);
     } else {
@@ -714,63 +862,63 @@ export default class SynxSyncPlugin extends Plugin {
 
   private async executePush(path: string): Promise<void> {
     if (!this.client) return;
-    await this.pushToClient(this.client, path);
+    await this.uploadToClient(this.client, path, this.repoUploads);
   }
 
   /**
-   * 把本地 path 推送到指定 client（主存储或备份存储共用）。
+   * 把本地 path 上传为不可变 blob 并收集到 target（主同步/镜像共用）。
    * .obsidian/ 内的文件用底层 adapter 读取；其余用 vault API。
+   * 不立即提交：变更集由调用方汇总后一次性 finalize。
    */
-  private async pushToClient(client: WorkerClient, path: string): Promise<void> {
+  private async uploadToClient(client: WorkerClient, path: string, target: Map<string, RepoUploadedFile>): Promise<void> {
     console.log('synx push start', { path });
+    let content: ArrayBuffer;
+    let mtime: number;
+    let fileUuid: string | undefined;
     // .obsidian/ 内的文件不在 vault 文件追踪范围，需用底层 adapter 读取
     if (path.startsWith('.obsidian/')) {
       const stat = await this.app.vault.adapter.stat(path);
       if (!stat || stat.type !== 'file') throw Object.assign(new Error('本地文件已不存在'), { code: 'ENOENT' });
-      const content = await this.app.vault.adapter.readBinary(path);
+      content = await this.app.vault.adapter.readBinary(path);
+      mtime = stat.mtime > 0 ? stat.mtime : stat.ctime;
       console.log('synx push .obsidian file', { path, size: content.byteLength });
-      await client.writeFile(path, content, stat.mtime > 0 ? stat.mtime : stat.ctime, this.settings.deviceName);
-      return;
-    }
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) throw Object.assign(new Error('本地文件已不存在'), { code: 'ENOENT' });
-    let content: ArrayBuffer;
-    let fileUuid: string | undefined;
-    if (isMarkdownPath(path)) {
-      const text = await this.app.vault.read(file);
-      const result = ensureMarkdownUuid(text);
-      let finalText = result.text;
-      // 仅当 UUID 来自已有注释（可能因复制笔记而重复）时才检测；
-      // 新生成的 crypto.randomUUID 碰撞概率为零，跳过 O(N) 全文遍历
-      const duplicate = result.changed ? false : await this.findDuplicateUuid(path, result.uuid);
-      if (duplicate) {
-        fileUuid = crypto.randomUUID();
-        finalText = replaceMarkdownUuid(finalText, fileUuid);
-      } else {
-        fileUuid = result.uuid;
-      }
-      if (finalText !== text) await this.app.vault.modify(file, finalText);
-      content = new TextEncoder().encode(finalText).buffer;
-      // #region debug-point C:push-markdown
-      dbg('C', 'main.ts:pushToClient', 'push markdown bytes', {
-        path, uuid: fileUuid,
-        textLen: text.length,
-        finalTextLen: finalText.length,
-        modified: finalText !== text,
-        pushedHash: await hashContent(content),
-        pushedSize: content.byteLength,
-        mtime: file.stat.mtime,
-        now: Date.now(),
-      });
-      // #endregion
-      console.log('synx push markdown', { path, uuid: fileUuid, size: content.byteLength });
     } else {
-      content = await this.app.vault.readBinary(file);
-      console.log('synx push binary', { path, size: content.byteLength });
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) throw Object.assign(new Error('本地文件已不存在'), { code: 'ENOENT' });
+      mtime = file.stat.mtime;
+      if (isMarkdownPath(path)) {
+        const text = await this.app.vault.read(file);
+        const result = ensureMarkdownUuid(text);
+        let finalText = result.text;
+        // 仅当 UUID 来自已有注释（可能因复制笔记而重复）时才检测；
+        // 新生成的 crypto.randomUUID 碰撞概率为零，跳过 O(N) 全文遍历
+        const duplicate = result.changed ? false : await this.findDuplicateUuid(path, result.uuid);
+        if (duplicate) {
+          fileUuid = crypto.randomUUID();
+          finalText = replaceMarkdownUuid(finalText, fileUuid);
+        } else {
+          fileUuid = result.uuid;
+        }
+        if (finalText !== text) await this.app.vault.modify(file, finalText);
+        content = new TextEncoder().encode(finalText).buffer;
+        console.log('synx push markdown', { path, uuid: fileUuid, size: content.byteLength });
+      } else {
+        content = await this.app.vault.readBinary(file);
+        console.log('synx push binary', { path, size: content.byteLength });
+      }
     }
+    const hash = await hashContent(content);
     try {
-      await client.writeFile(path, content, file.stat.mtime, this.settings.deviceName, fileUuid);
-      console.log('synx push done', { path });
+      const blobId = await client.uploadBlob(path, content, mtime);
+      target.set(path, {
+        path,
+        blobId,
+        hash,
+        size: content.byteLength,
+        mtime,
+        identity: fileUuid ?? `path:${path}`,
+      });
+      console.log('synx push done', { path, blobId });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       // "Failed to fetch" 通常是服务端 503/CORS 被浏览器拦截，给用户更明确的提示
@@ -800,10 +948,12 @@ export default class SynxSyncPlugin extends Plugin {
   /** .obsidian 写入后回读的实际 mtime（诊断 iOS 写 mtime 是否生效） */
   private obsWriteBackMtimes: Record<string, { expected: number; actual: number | null }> = {};
 
-  private async executePull(path: string, fileUuid?: string): Promise<void> {
+  private async executePull(path: string, _fileUuid?: string): Promise<void> {
     if (!this.client) return;
+    if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
     const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
-    const content = await this.client.readFile(path, undefined, fileUuid);
+    // 从仓库当前提交读取内容（git 模型下内容对象不可变，路径解引用）
+    const content = await this.client.repoContent(this.repoHeadCommitId, path);
     // .obsidian/ 内的文件用 adapter 写入
     if (path.startsWith('.obsidian/')) {
       // 显式设置 mtime（模仿 remotely-save 的 adapter.writeBinary(key, content, { mtime, ctime })）。
@@ -988,7 +1138,7 @@ export default class SynxSyncPlugin extends Plugin {
     return new Map(Object.entries(this.prevSync.entries));
   }
 
-  /** 同步成功后重建 prevSync 快照：重新枚举本地 + 重新 list 远端 */
+  /** 同步成功后重建 prevSync 快照：重新枚举本地 + 用最近拉取的仓库树作为远端状态 */
   private async rebuildPrevSync(): Promise<void> {
     if (!this.client || !this.settings.storageId) return;
     // #region debug-point B:rebuild-prevsync
@@ -996,7 +1146,7 @@ export default class SynxSyncPlugin extends Plugin {
     // #endregion
     try {
       const { files } = await this.enumerateLocalFiles(this.getPrevSyncMap());
-      const remote = await this.client.list();
+      const remote = repoTreeToRemote(this.repoTree);
       const remoteMap = new Map<string, Entity>();
       const remoteUuidMap = new Map<string, Entity>();
       for (const r of remote) {

@@ -1,12 +1,16 @@
 import type {
-  FileMeta,
+  RepoChange,
+  RepoCommit,
+  RepoCommitSummary,
+  RepoDiffEntry,
+  RepoFile,
+  RepositoryHead,
   RetentionPolicy,
   StorageConfig,
   Storage,
   StorageType,
   User,
   UserPreferences,
-  VersionRecord,
 } from './types.js';
 
 /** API 路径常量 */
@@ -28,14 +32,19 @@ export const API = {
   tokenCreate: '/api/tokens',
   tokenDelete: '/api/tokens/:id',
   inboxNoteCreate: '/api/inbox/notes',
-  // 同步
-  put: '/api/put',
-  get: '/api/get',
-  list: '/api/list',
-  file: '/api/file',
-  // 版本历史
-  history: '/api/history',
-  rollback: '/api/rollback',
+  // Git 式仓库（全库历史）
+  repoHead: '/api/repository/head',
+  repoInit: '/api/repository/init',
+  repoCommits: '/api/repository/commits',
+  repoCommit: '/api/repository/commits/:id',
+  repoCommitDiff: '/api/repository/commits/:id/diff',
+  repoFinalize: '/api/repository/commits/finalize',
+  repoRestore: '/api/repository/restore',
+  repoTree: '/api/repository/tree',
+  repoBlobs: '/api/repository/blobs',
+  repoContent: '/api/repository/content',
+  repoFileHistory: '/api/repository/file-history',
+  repoGc: '/api/repository/gc',
 } as const;
 
 // ===== 认证请求/响应 =====
@@ -131,63 +140,101 @@ export interface CreateInboxNoteResponse {
 
 export interface UpdateRetentionPolicyRequest extends Partial<RetentionPolicy> {}
 
-// ===== 同步 API =====
+// ===== Git 式仓库 API =====
 
-/**
- * POST /api/put 使用「查询参数 + 原始二进制 body」：
- * URL query: path / fileUuid / mtime / author / baseVersionId
- * body: 文件内容（octet-stream），不再 base64 编码。
- */
-export interface PutRequest {
-  /** vault 内相对路径 */
-  path: string;
-  fileUuid?: string;
-  mtime: number;
-  /** 设备标识 */
+/** 仓库读取基线：HEAD + 完整内容树（当前远端文件列表） */
+export interface RepoHeadResponse {
+  head: RepositoryHead | null;
+  tree: RepoFile[];
+  storageId: string;
+  syncFolder: string;
+}
+
+/** 初始化仓库：把当前远端状态完整收进 initial 提交。仓库已存在时返回 409 REPO_EXISTS。 */
+export interface RepoInitRequest {
   author?: string;
-  /** 并发保护：打开文件时的当前版本；远端已变化则返回 409 */
-  baseVersionId?: string;
 }
 
-export interface PutResponse {
-  version: VersionRecord;
+export interface RepoInitResponse {
+  head: RepositoryHead;
+  commit: RepoCommit;
 }
 
-export interface GetRequest {
-  path: string;
-  /** 不传则返回 current 版本 */
-  version?: string;
+export interface RepoCommitsResponse {
+  commits: RepoCommitSummary[];
+  /** 分页游标：下一次请求传该值继续向前翻页；无更多提交时为 null */
+  cursor: string | null;
 }
 
-/**
- * GET /api/get 的响应为「原始二进制 body + X-Synx-Version 响应头」。
- * content 不再经 base64 编码（大文件在 worker 内 base64 会触发 Cloudflare 免费版
- * CPU 超限 error 1102）。客户端直接读取 response.arrayBuffer()。
- */
-export interface GetResponse {
-  /** 文件内容（客户端从二进制 body 读取，不再走 base64） */
-  content: ArrayBuffer;
-  version: VersionRecord;
+export interface RepoCommitResponse {
+  commit: RepoCommit;
 }
 
-export interface ListResponse {
-  files: FileMeta[];
+export interface RepoDiffResponse {
+  against: string;
+  target: string;
+  changes: RepoDiffEntry[];
+  added: number;
+  modified: number;
+  renamed: number;
+  deleted: number;
 }
 
-// ===== 版本历史 =====
-
-export interface HistoryResponse {
-  versions: VersionRecord[];
+/** 原子提交变更集。冲突（HEAD 已被推进）返回 409 HEAD_CONFLICT。 */
+export interface RepoFinalizeRequest {
+  baseCommitId: string;
+  baseGeneration: number;
+  author?: string;
+  message?: string;
+  changes: RepoChange[];
 }
 
-export interface RollbackRequest {
-  path: string;
-  fileUuid?: string;
-  version: string;
+export interface RepoFinalizeResponse {
+  commit: RepoCommit;
+  head: RepositoryHead;
 }
 
-export interface RollbackResponse {
-  version: VersionRecord;
+/** 全库恢复：dryRun=true 只返回预览；否则创建 kind=restore 新提交并推进 HEAD。 */
+export interface RepoRestoreRequest {
+  toCommitId: string;
+  dryRun?: boolean;
+  author?: string;
+}
+
+export interface RepoRestorePreview {
+  /** 当前 HEAD → 目标提交的反向变更集 */
+  changes: RepoDiffEntry[];
+  added: number;
+  modified: number;
+  renamed: number;
+  deleted: number;
+}
+
+export interface RepoRestoreResponse {
+  preview?: RepoRestorePreview;
+  commit?: RepoCommit;
+  head?: RepositoryHead;
+}
+
+/** 某提交下的文件树（网页浏览用） */
+export interface RepoTreeResponse {
+  commitId: string;
+  files: RepoFile[];
+}
+
+/** 某提交下单文件的版本历史（从提交链按 identity 派生） */
+export interface RepoFileHistoryResponse {
+  identity: string;
+  commits: RepoCommitSummary[];
+  changes: RepoChange[];
+}
+
+/** 垃圾回收结果：清理未引用内容对象；deletedCommits 为按保留策略淘汰的历史提交数 */
+export interface RepoGcResponse {
+  scanned: number;
+  deleted: number;
+  deletedCommits: number;
+  more: boolean;
 }
 
 // ===== 错误响应 =====

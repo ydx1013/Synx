@@ -36,6 +36,36 @@ export class S3Fs implements WorkerFs {
     if (!res.ok) throw new Error(`s3 put failed (${res.status})`);
   }
 
+  /** 条件写：S3/R2/MinIO 的 If-Match 比较对象 ETag，失配返回 412。 */
+  async putIfMatch(key: string, content: ArrayBuffer | Uint8Array, etag: string): Promise<boolean> {
+    const res = await this.client.fetch(this.url(key), {
+      method: 'PUT',
+      headers: { 'If-Match': etag },
+      body: content as BufferSource,
+    });
+    if (res.status === 412) return false;
+    if (!res.ok) throw new Error(`s3 conditional put failed (${res.status})`);
+    return true;
+  }
+
+  /** 条件写：If-None-Match: * 仅在 key 不存在时创建。 */
+  async putIfNoneMatch(key: string, content: ArrayBuffer | Uint8Array): Promise<boolean> {
+    const res = await this.client.fetch(this.url(key), {
+      method: 'PUT',
+      headers: { 'If-None-Match': '*' },
+      body: content as BufferSource,
+    });
+    if (res.status === 412) return false;
+    if (!res.ok) throw new Error(`s3 conditional put failed (${res.status})`);
+    return true;
+  }
+
+  async getEtag(key: string): Promise<string | null> {
+    const res = await this.client.fetch(this.url(key), { method: 'HEAD' });
+    if (!res.ok) return null;
+    return res.headers.get('etag');
+  }
+
   async get(key: string): Promise<ArrayBuffer> {
     const res = await this.client.fetch(this.url(key), { method: 'GET' });
     if (!res.ok) throw new Error(`s3 get failed (${res.status})`);

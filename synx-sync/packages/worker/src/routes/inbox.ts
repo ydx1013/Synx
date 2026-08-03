@@ -1,9 +1,10 @@
 import { Hono } from 'hono';
+import { makeStorageKey } from '@synx/shared';
 import { hashApiToken } from '../auth/apiToken.js';
 import { checkRateLimit } from '../middleware/rateLimit.js';
 import { getFs, StorageError } from '../storage/factory.js';
 import { enforceMaxFileSize, FileTooLarge, getRetentionPolicy } from '../services/retention.js';
-import { listFiles, putVersion } from '../services/versionService.js';
+import { finalizeCommit, initRepository, readHead, readTree, RepoExistsError } from '../services/repositoryService.js';
 import type { AppVars, Env } from '../types.js';
 
 interface ApiTokenRow {
@@ -12,6 +13,12 @@ interface ApiTokenRow {
   storage_id: string;
   sync_folder: string;
   target_folder: string;
+}
+
+/** 内容 sha256（hex）——finalize 变更集携带，服务端校验 blob 存在但不做内容寻址校验 */
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bytes));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export const inbox = new Hono<{ Bindings: Env; Variables: AppVars }>();
@@ -62,9 +69,26 @@ inbox.post('/notes', async c => {
     const { fs } = await getFs(c.env, token.user_id, token.storage_id);
     const policy = await getRetentionPolicy(c.env, token.storage_id, fs);
     enforceMaxFileSize(content.byteLength, policy);
-    const existing = await listFiles({ env: c.env, userId: token.user_id, storageId: token.storage_id, syncFolder: token.sync_folder, fs });
+    // 确保 git 仓库存在（init 零复制收旧数据；并发下 REPO_EXISTS 则重读 HEAD）
+    let head = await readHead(fs, token.sync_folder);
+    if (!head) {
+      try {
+        const init = await initRepository({
+          env: c.env, userId: token.user_id, storageId: token.storage_id,
+          syncFolder: token.sync_folder, fs, author: `api:${token.id}`,
+        });
+        head = init.head;
+      } catch (error) {
+        if (error instanceof RepoExistsError) head = await readHead(fs, token.sync_folder);
+        else throw error;
+      }
+    }
+    if (!head) throw new Error('repository init failed');
+
+    // 占用检查用仓库当前树（git 模型下远端状态 = HEAD 树，不再读 current.json）
+    const { files: treeFiles } = await readTree(fs, token.sync_folder, head.commitId);
     const folderPrefix = `${token.target_folder}/`;
-    const occupied = new Set(existing
+    const occupied = new Set(treeFiles
       .filter(file => file.path.startsWith(folderPrefix))
       .map(file => file.path.slice(folderPrefix.length)));
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -80,9 +104,16 @@ inbox.post('/notes', async c => {
     }
     if (!reserved) return c.json({ error: 'could not reserve note path', code: 'NOTE_PATH_UNAVAILABLE' }, 409);
 
-    const version = await putVersion({
-      env: c.env, userId: token.user_id, storageId: token.storage_id, syncFolder: token.sync_folder,
-      fs, path, fileUuid, content, mtime: Date.now(), author: `api:${token.id}`,
+    // 上传不可变内容对象 + 原子提交 add 变更
+    const mtime = Date.now();
+    const blobId = makeStorageKey(token.sync_folder, path, crypto.randomUUID());
+    const hash = await sha256Hex(content);
+    await fs.put(blobId, content);
+    const { commit } = await finalizeCommit({
+      env: c.env, userId: token.user_id, storageId: token.storage_id, syncFolder: token.sync_folder, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      author: `api:${token.id}`, message: 'Inbox 收件箱',
+      changes: [{ identity: fileUuid, operation: 'add', path, blobId, hash, size: content.byteLength, mtime }],
     });
     try {
       await c.env.DB.prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?').bind(Date.now(), token.id).run();
@@ -91,7 +122,7 @@ inbox.post('/notes', async c => {
     }
     await c.env.DB.prepare('DELETE FROM api_note_paths WHERE storage_id = ? AND sync_folder = ? AND path = ?').bind(token.storage_id, token.sync_folder, path).run();
     reserved = false;
-    return c.json({ note: { path, fileUuid, versionId: version.versionId, createdAt: version.createdAt } }, 201);
+    return c.json({ note: { path, fileUuid, versionId: commit.commitId, createdAt: commit.createdAt } }, 201);
   } catch (error) {
     if (reserved) await c.env.DB.prepare('DELETE FROM api_note_paths WHERE storage_id = ? AND sync_folder = ? AND path = ?').bind(token.storage_id, token.sync_folder, path).run();
     if (error instanceof FileTooLarge) return c.json({ error: error.message, code: 'FILE_TOO_LARGE' }, 413);

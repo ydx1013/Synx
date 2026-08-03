@@ -2,11 +2,10 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import type { Env, AppVars } from './types.js';
 import { auth } from './routes/auth.js';
-import { history } from './routes/history.js';
 import { inbox } from './routes/inbox.js';
 import { onedrive } from './routes/onedrive.js';
+import { repository } from './routes/repository.js';
 import { storage } from './routes/storage.js';
-import { sync } from './routes/sync.js';
 import { tokens } from './routes/tokens.js';
 
 const app = new Hono<{ Bindings: Env; Variables: AppVars }>();
@@ -31,8 +30,7 @@ app.route('/api/storage', storage);
 app.route('/api/tokens', tokens);
 app.route('/api/onedrive', onedrive);
 app.route('/api/inbox', inbox);
-app.route('/api', sync);
-app.route('/api', history);
+app.route('/api/repository', repository);
 
 app.all('*', (c) => c.env.ASSETS.fetch(c.req.raw));
 
