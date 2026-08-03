@@ -71,6 +71,16 @@
   padding: 2px 8px;
 }
 
+.synx-version-more {
+  margin-top: 12px;
+  text-align: center;
+}
+
+.synx-version-more button {
+  font-size: var(--font-ui-smaller);
+  padding: 4px 16px;
+}
+
 .synx-version-timeline {
   position: relative;
   margin-top: 4px;

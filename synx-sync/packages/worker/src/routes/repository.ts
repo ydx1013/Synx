@@ -247,19 +247,20 @@ repository.get('/content', async (c) => {
   }
 });
 
-// GET /api/repository/file-history?path=&fileUuid=
+// GET /api/repository/file-history?path=&fileUuid=&from=
 repository.get('/file-history', async (c) => {
   const { storageId, syncFolder } = repoScope(c);
   const path = c.req.query('path');
   const fileUuid = c.req.query('fileUuid') || undefined;
+  const from = c.req.query('from') || undefined;
   if (!path) throw new StorageError(400, 'missing path');
   try {
     const { fs } = await getFs(c.env, c.get('userId'), storageId);
     const head = await readHead(fs, syncFolder);
     if (!head) throw new RepoNotInitializedError();
     const identity = fileUuid ?? `path:${path}`;
-    const { commits, changes } = await fileHistory(fs, syncFolder, head, identity);
-    const res: RepoFileHistoryResponse = { identity, commits, changes };
+    const { commits, changes, nextCursor } = await fileHistory(fs, syncFolder, head, identity, undefined, from);
+    const res: RepoFileHistoryResponse = { identity, commits, changes, nextCursor };
     return c.json(res);
   } catch (e) {
     return handleError(c, e);

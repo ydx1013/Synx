@@ -33,6 +33,9 @@ export class HistoryPaneView extends ItemView {
   private previewCache = new Map<string, string>();
   private currentTextCache = new Map<string, string>();
   private requestId = 0;
+  /** 分页游标：非空表示还有更早的历史可加载 */
+  private nextCursor: string | null = null;
+  private loadingMore = false;
   private popover: HistoryPreviewPopover;
 
   constructor(leaf: WorkspaceLeaf, private plugin: SynxSyncPlugin) {
@@ -83,10 +86,13 @@ export class HistoryPaneView extends ItemView {
     // 首次打开文件才显示"加载中"反馈
     if (!silent) this.renderLoading(path);
     try {
+      // 首次加载：从头拉取；分页加载时保留已有版本，只追加更早的历史
+      const append = this.versions.length > 0 && this.nextCursor !== null && !silent;
+      const from = append ? this.nextCursor : undefined;
       const fileUuid = await this.plugin.getFileUuid(path);
       // 单文件历史从提交链派生；HEAD 用于标记"当前"版本
       const [history, head] = await Promise.all([
-        client.repoFileHistory(path, fileUuid),
+        client.repoFileHistory(path, fileUuid, from ?? undefined),
         client.repoHead(),
       ]);
       if (requestId !== this.requestId || path !== this.currentFile) return;
@@ -105,16 +111,22 @@ export class HistoryPaneView extends ItemView {
           };
         })
         .sort((a, b) => b.createdAt - a.createdAt);
+      // 分页加载：把新拉到的更早历史接到现有列表之后（都按时间倒序，追加即可）
+      const merged = append ? [...this.versions, ...next] : next;
+      this.versions = merged;
+      this.nextCursor = history.nextCursor;
       // silent 刷新且版本列表完全没变：不触碰 DOM，视觉零变化
-      if (silent && this.versions.length > 0 && sameVersionSet(this.versions, next)) {
+      if (silent && merged.length > 0 && sameVersionSet(this.versions, next)) {
         this.versions = next;
         return;
       }
-      this.versions = next;
+      this.versions = merged;
       this.renderVersions();
-      void this.precache(path, requestId);
+      if (!append) void this.precache(path, requestId);
     } catch (error) {
       if (requestId === this.requestId && !silent) this.renderError('加载历史失败', error);
+    } finally {
+      this.loadingMore = false;
     }
   }
 
@@ -122,6 +134,8 @@ export class HistoryPaneView extends ItemView {
     if (path === this.currentFile) return;
     this.currentFile = path;
     this.versions = [];
+    this.nextCursor = null;
+    this.loadingMore = false;
     this.previewCache.clear();
     this.currentTextCache.clear();
     this.popover.close();
@@ -180,6 +194,21 @@ export class HistoryPaneView extends ItemView {
         const rollback = actions.createEl('button', { text: '回滚', cls: 'mod-warning' });
         rollback.onclick = () => void this.rollbackTo(version);
       }
+    }
+    // 还有更早的历史：提供"加载更多"按钮（点击拉取下一页，不截断）
+    if (this.nextCursor) {
+      const more = this.contentEl.createEl('div', { cls: 'synx-version-more' });
+      const button = more.createEl('button', { text: this.loadingMore ? '加载中…' : '加载更多' });
+      button.disabled = this.loadingMore;
+      button.onclick = () => {
+        if (this.loadingMore) return;
+        this.loadingMore = true;
+        button.disabled = true;
+        button.textContent = '加载中…';
+        void this.refresh().then(() => {
+          // refresh 内 finally 已复位 loadingMore 并重绘
+        });
+      };
     }
   }
 

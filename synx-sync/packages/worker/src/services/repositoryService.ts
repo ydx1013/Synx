@@ -609,10 +609,12 @@ export async function fileHistory(
   head: RepositoryHead,
   identity: string,
   limit: number = FILE_HISTORY_LIMIT,
-): Promise<{ commits: RepoCommitSummary[]; changes: RepoChange[] }> {
+  from?: string,
+): Promise<{ commits: RepoCommitSummary[]; changes: RepoChange[]; nextCursor: string | null }> {
   const commits: RepoCommitSummary[] = [];
   const changes: RepoChange[] = [];
-  let commitId: string | null = head.commitId;
+  // 游标：首次从头开始；分页时 from 即为下一个待扫描提交（该提交尚未处理）
+  let commitId: string | null = from ?? head.commitId;
   while (commitId && commits.length < limit) {
     const commit = await readCommit(fs, syncFolder, commitId);
     if (!commit) break;
@@ -625,7 +627,9 @@ export async function fileHistory(
   }
   commits.reverse();
   changes.reverse();
-  return { commits, changes };
+  // 扫到链尾（commitId === null）说明没有更多；否则把当前游标返回给调用方续扫
+  const nextCursor = commitId;
+  return { commits, changes, nextCursor };
 }
 
 // ── 全库恢复（revert 语义） ──

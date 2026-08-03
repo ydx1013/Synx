@@ -116,10 +116,11 @@ export class WorkerClient {
     return res.arrayBuffer();
   }
 
-  /** 单文件历史：按 identity 从提交链派生（git 模型替代旧 /api/history） */
-  async repoFileHistory(path: string, fileUuid?: string): Promise<RepoFileHistoryResponse> {
+  /** 单文件历史：按 identity 从提交链派生；from 提供后返回其后的更早历史（分页游标） */
+  async repoFileHistory(path: string, fileUuid?: string, from?: string): Promise<RepoFileHistoryResponse> {
     const params = new URLSearchParams({ path });
     if (fileUuid) params.set('fileUuid', fileUuid);
+    if (from) params.set('from', from);
     return this.request<RepoFileHistoryResponse>('GET', `${API.repoFileHistory}?${params.toString()}`);
   }
 

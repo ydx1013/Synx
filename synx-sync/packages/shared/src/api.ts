@@ -227,6 +227,8 @@ export interface RepoFileHistoryResponse {
   identity: string;
   commits: RepoCommitSummary[];
   changes: RepoChange[];
+  /** 有下一页时返回游标（下次请求的 from 提交 id）；没有则为空 */
+  nextCursor: string | null;
 }
 
 /** 垃圾回收结果：清理未引用内容对象；deletedCommits 为按保留策略淘汰的历史提交数 */

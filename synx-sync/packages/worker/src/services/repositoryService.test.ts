@@ -395,9 +395,30 @@ describe('提交历史 / diff / 单文件历史', () => {
   it('fileHistory 从提交链按 identity 派生', async () => {
     const { fs, initialCommitId, syncCommitId } = await setup();
     const head = (await readHead(fs, SYNC_FOLDER))!;
-    const { commits, changes } = await fileHistory(fs, SYNC_FOLDER, head, 'uuid-note');
+    const { commits, changes, nextCursor } = await fileHistory(fs, SYNC_FOLDER, head, 'uuid-note');
     expect(commits.map((c) => c.commitId)).toEqual([initialCommitId, syncCommitId]);
     expect(changes.map((c) => c.operation)).toEqual(['add', 'modify']);
+    // 链已扫尽 → 无下一页
+    expect(nextCursor).toBeNull();
+  });
+
+  it('fileHistory 支持 from 游标分页，不截断', async () => {
+    const { fs, initialCommitId, syncCommitId } = await setup();
+    const head = (await readHead(fs, SYNC_FOLDER))!;
+    // 上限 1：只返回最新一条，并返回游标（下一个待扫的 initial）
+    const page1 = await fileHistory(fs, SYNC_FOLDER, head, 'uuid-note', 1);
+    expect(page1.commits.map((c) => c.commitId)).toEqual([syncCommitId]);
+    expect(page1.changes.map((c) => c.operation)).toEqual(['modify']);
+    expect(page1.nextCursor).toBe(initialCommitId);
+    // 从游标续扫：返回更早的一条（initial 的 add）
+    const page2 = await fileHistory(fs, SYNC_FOLDER, head, 'uuid-note', 1, page1.nextCursor!);
+    expect(page2.commits.map((c) => c.commitId)).toEqual([initialCommitId]);
+    expect(page2.changes.map((c) => c.operation)).toEqual(['add']);
+    // 游标指向空 initial 提交（不含匹配变更）→ 再扫一页为空并扫尽
+    expect(page2.nextCursor).not.toBeNull();
+    const page3 = await fileHistory(fs, SYNC_FOLDER, head, 'uuid-note', 1, page2.nextCursor!);
+    expect(page3.commits).toHaveLength(0);
+    expect(page3.nextCursor).toBeNull();
   });
 
   it('diffTrees 识别身份级 rename', () => {
