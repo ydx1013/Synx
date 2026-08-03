@@ -247,6 +247,26 @@ export function shouldProtectAgainstMassDeletion(
 }
 
 /**
+ * delete-local 方向的大面积删除保护（防远端整库丢失误删本地）：
+ * 当有 prevSync 快照且本次计划删除的本地文件（delete-local）占上次同步记录的比例
+ * 超过 (100 - protectPercent)% 时，说明远端可能整体丢失（清空/存储配置错配/仓库损坏），
+ * 此时执行 delete-local 会把本地唯一副本一并删掉。返回 true 表示"应保护"：
+ * 调用方需把 delete-local 动作转为 push（把未修改的本地内容重新上传，不删本地）。
+ *
+ * @param deleteLocalCount 本次计划 delete-local 的动作数
+ * @param prevSyncCount prevSync 记录的条目数（上次同步时两端的并集）
+ * @param protectPercent 判定阈值百分比（deleteLocal/prevSync × 100 超过 100 - 此值视为大面积删除），默认 50
+ */
+export function shouldProtectAgainstMassLocalDeletion(
+  deleteLocalCount: number,
+  prevSyncCount: number,
+  protectPercent = 50,
+): boolean {
+  if (prevSyncCount <= 0) return false;
+  return (deleteLocalCount / prevSyncCount) * 100 > 100 - protectPercent;
+}
+
+/**
  * 本地文件相对上次同步是否「未变」，用于跳过读取与 hash 重算（快路径）。
  * 要求 prevSync 存在、上次有本地 hash、且 mtime 与 size 均完全一致——
  * 一致即内容未变（mtime 由文件系统写入更新，未写入的文件 mtime 保持不变），

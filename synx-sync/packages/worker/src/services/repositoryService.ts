@@ -231,6 +231,7 @@ async function withRepoLock<T>(fs: WorkerFs, syncFolder: string, task: () => Pro
   const lockKey = `${repoRoot(syncFolder)}lock.json`;
   const token = crypto.randomUUID();
   const expiresAt = Date.now() + LOCK_TTL_MS;
+  const payload = new TextEncoder().encode(JSON.stringify({ token, expiresAt }));
   for (let attempt = 0; attempt < LOCK_ACQUIRE_RETRIES; attempt++) {
     try {
       const held = await readLock(fs, lockKey);
@@ -238,9 +239,17 @@ async function withRepoLock<T>(fs: WorkerFs, syncFolder: string, task: () => Pro
         await sleep(LOCK_RETRY_DELAY_MS);
         continue;
       }
-      await fs.put(lockKey, new TextEncoder().encode(JSON.stringify({ token, expiresAt })));
-      const verify = await readLock(fs, lockKey);
-      if (verify === token) {
+      let acquired = false;
+      if (fs.putIfNoneMatch) {
+        // 原子建锁：竞争窗口内他人已建锁 → 返回 false，绝不用无条件写覆盖他人锁
+        //（否则两个 Worker 可同时持锁进入，同一 generation 的不同 HEAD 互相覆盖）。
+        acquired = await fs.putIfNoneMatch(lockKey, payload);
+      } else {
+        // 无条件写后端（best-effort）：写后验证，被覆盖则重试。
+        await fs.put(lockKey, payload);
+        acquired = (await readLock(fs, lockKey)) === token;
+      }
+      if (acquired) {
         try {
           return await task();
         } finally {
@@ -248,11 +257,28 @@ async function withRepoLock<T>(fs: WorkerFs, syncFolder: string, task: () => Pro
           if (now === token) await fs.delete(lockKey).catch(() => undefined);
         }
       }
+      // 建锁失败：锁对象已存在。仅当确认是过期/无法解析的陈旧锁才清理（下轮重试），
+      // 避免误删他人刚写入的有效锁。
+      if (await isLockExpired(fs, lockKey)) {
+        await fs.delete(lockKey).catch(() => undefined);
+      }
+      await sleep(LOCK_RETRY_DELAY_MS);
     } catch {
       await sleep(LOCK_RETRY_DELAY_MS);
     }
   }
   throw new HeadConflictError();
+}
+
+/** 锁对象是否存在且已过期（或无法解析视为陈旧）。对象不存在返回 false。 */
+async function isLockExpired(fs: WorkerFs, lockKey: string): Promise<boolean> {
+  if (!(await fs.head(lockKey))) return false;
+  try {
+    const lock = JSON.parse(textDecoder.decode(await fs.get(lockKey))) as { token: string; expiresAt: number };
+    return lock.expiresAt < Date.now();
+  } catch {
+    return true;
+  }
 }
 
 async function readLock(fs: WorkerFs, lockKey: string): Promise<string | null> {
@@ -862,6 +888,7 @@ export async function gcRepository(input: GcRepositoryInput): Promise<GcReposito
   //    从最旧端淘汰超出保留策略的提交及其独有的内容对象。
   let deletedCommits = 0;
   let keep = commits.length;
+  let boundaryTree: Map<string, RepoFile> | null = null;
   if (!moreCommits && commits.length > 0 && policy) {
     const layers = buildRetentionLayers(policy);
     keep = computeKeepBoundary(commits, layers);
@@ -870,6 +897,18 @@ export async function gcRepository(input: GcRepositoryInput): Promise<GcReposito
     // 否则裁剪后从保留提交 resolveTree 会沿父链访问已删除提交。
     while (keep < commits.length && commits[keep - 1].checkpointId !== commits[keep - 1].commitId) keep++;
     deletedCommits = commits.length - keep;
+    // 边界提交的检查点树：裁剪后所有保留提交的完整状态都可由
+    // 「边界检查点树 + 保留提交的增量变更」重建，其引用的 blob 必须全部保留，
+    // 否则长期未修改的文件（blob 只出现在已淘汰提交的变更里）会被误判为孤儿删除。
+    // 边界检查点缺失/损坏时无法证明可达性 → 保守取消裁剪（保留全部）。
+    if (deletedCommits > 0 && keep > 0) {
+      try {
+        boundaryTree = await loadCheckpoint(fs, syncFolder, commits[keep - 1].commitId);
+      } catch {
+        deletedCommits = 0;
+        keep = commits.length;
+      }
+    }
   }
 
   // 只统计「保留提交」引用的 blob：同一 blob 可能被保留与淘汰提交同时引用
@@ -877,6 +916,10 @@ export async function gcRepository(input: GcRepositoryInput): Promise<GcReposito
   const keepReferenced = new Set<string>();
   for (let i = 0; i < keep; i++) {
     for (const change of commits[i].changes) if (change.blobId) keepReferenced.add(change.blobId);
+  }
+  // 边界检查点树引用的内容对象也必须保留（长期未修改文件只被树引用）
+  if (boundaryTree) {
+    for (const file of boundaryTree.values()) if (file.blobId) keepReferenced.add(file.blobId);
   }
 
   // 3) 列出全部内容对象；.synx/（仓库本体 + 保留策略）整体保留，其余按引用清理

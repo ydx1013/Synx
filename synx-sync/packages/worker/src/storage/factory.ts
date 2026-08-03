@@ -64,16 +64,6 @@ export async function getStorageRow(
 }
 
 /**
- * 解密 S3 配置（向后兼容）。
- * @deprecated 使用 decryptStorageConfig 替代
- */
-export async function decryptS3Config(row: StorageRow, encryptionKey: string): Promise<S3Config> {
-  if (row.type !== 's3') throw new StorageError(400, `unsupported storage type: ${row.type}`);
-  const json = await decryptString(row.config, encryptionKey);
-  return JSON.parse(json) as S3Config;
-}
-
-/**
  * 解密 storage config（通用，按 type 返回对应的配置类型）。
  */
 export async function decryptStorageConfig(row: StorageRow, encryptionKey: string): Promise<StorageConfig> {

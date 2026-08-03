@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { encryptString } from '../auth/crypto.js';
-import { getFs, getStorageRow, invalidateStorageRowCache, resetStorageRowCache, decryptS3Config, decryptStorageConfig, StorageError } from './factory.js';
+import { getFs, getStorageRow, invalidateStorageRowCache, resetStorageRowCache, decryptStorageConfig, StorageError } from './factory.js';
 import { makeD1Mock, makeKvMock, makeEnv } from '../test/helpers.js';
 
 const ENCRYPTION_KEY = 'test-encryption-key';
@@ -80,23 +80,6 @@ describe('getStorageRow', () => {
     const env = makeEnv({ DB: db, ENCRYPTION_KEY });
     await expect(getStorageRow(env, USER, STORAGE_ID)).rejects.toMatchObject({
       status: 403,
-      name: 'StorageError',
-    });
-  });
-});
-
-describe('decryptS3Config', () => {
-  it('decrypts encrypted s3 config', async () => {
-    const encrypted = await encryptString(JSON.stringify(s3Config), ENCRYPTION_KEY);
-    const row = makeStorageRow({ config: encrypted });
-    const cfg = await decryptS3Config(row, ENCRYPTION_KEY);
-    expect(cfg).toEqual(s3Config);
-  });
-
-  it('throws StorageError(400) when type is not s3', async () => {
-    const row = makeStorageRow({ type: 'onedrive', config: 'x' });
-    await expect(decryptS3Config(row, ENCRYPTION_KEY)).rejects.toMatchObject({
-      status: 400,
       name: 'StorageError',
     });
   });

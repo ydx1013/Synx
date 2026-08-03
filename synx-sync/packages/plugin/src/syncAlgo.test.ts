@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type RemoteEntity } from './syncAlgo.js';
+import { isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type RemoteEntity } from './syncAlgo.js';
 
 function localFile(path: string, mtime: number, hash?: string): LocalFile {
   return { path, mtime, size: 10, hash };
@@ -274,6 +274,29 @@ describe('shouldProtectAgainstMassDeletion', () => {
     expect(shouldProtectAgainstMassDeletion(460, 500, 90)).toBe(false);  // 92% ≥ 90%
     expect(shouldProtectAgainstMassDeletion(200, 400, 50)).toBe(false);  // 恰为 50%，不触发（严格小于）
     expect(shouldProtectAgainstMassDeletion(199, 400, 50)).toBe(true);   // 49.75% < 50%
+  });
+});
+
+describe('shouldProtectAgainstMassLocalDeletion', () => {
+  it('does not protect when prevSync is empty', () => {
+    expect(shouldProtectAgainstMassLocalDeletion(50, 0)).toBe(false);
+  });
+
+  it('does not protect when delete-local count is not mass', () => {
+    expect(shouldProtectAgainstMassLocalDeletion(0, 451)).toBe(false);
+    expect(shouldProtectAgainstMassLocalDeletion(200, 451)).toBe(false); // 44% < 50%
+    expect(shouldProtectAgainstMassLocalDeletion(225, 450)).toBe(false); // 恰为 50%，不触发（严格大于）
+  });
+
+  it('protects when remote mass-loss would delete most local files', () => {
+    expect(shouldProtectAgainstMassLocalDeletion(226, 450)).toBe(true); // 50.2% > 50%
+    expect(shouldProtectAgainstMassLocalDeletion(451, 451)).toBe(true); // 整库将被删除
+  });
+
+  it('protects with custom threshold', () => {
+    expect(shouldProtectAgainstMassLocalDeletion(40, 500, 90)).toBe(false);  // 8% ≤ 10%，不触发
+    expect(shouldProtectAgainstMassLocalDeletion(60, 500, 90)).toBe(true);   // 12% > 10%
+    expect(shouldProtectAgainstMassLocalDeletion(226, 450, 50)).toBe(true);  // 50.2% > 50%
   });
 });
 

@@ -592,4 +592,84 @@ describe('gcRepository', () => {
     const tree = await resolveTree(fs, SYNC_FOLDER, newestFirst[idxOf(10)]);
     expect(tree.get('a.md')?.blobId).toBe(blobOf.get(9)!);
   });
+
+  it('裁剪后保留仍被边界检查点树引用的 blob（长期未修改文件不被误删）', async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const base = Date.now();
+    const fs = new MemFs();
+    const { head: initHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+
+    // 第一个同步提交：a.md 与 b.md 都加入（b.md 此后不再变动）
+    const a1 = makeStorageKey(SYNC_FOLDER, 'a.md', 'a1');
+    const b1 = makeStorageKey(SYNC_FOLDER, 'b.md', 'b1');
+    fs.putText(a1, 'a1');
+    fs.putText(b1, 'b1');
+    let head = initHead;
+    await finalizeCommit({
+      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      now: base - 18 * DAY,
+      changes: [
+        { identity: 'uuid-a', operation: 'add', path: 'a.md', blobId: a1, hash: 'ha1', size: 2, mtime: 1000 },
+        { identity: 'uuid-b', operation: 'add', path: 'b.md', blobId: b1, hash: 'hb1', size: 2, mtime: 1000 },
+      ],
+    });
+    head = (await readHead(fs, SYNC_FOLDER))!;
+
+    // gen3..gen12：只改 a.md（每隔一天）。b.md 自 gen2 后不再变动。
+    for (let gen = 3; gen <= 12; gen++) {
+      const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `a${gen}`);
+      fs.putText(blob, `a${gen}`);
+      ({ head } = await finalizeCommit({
+        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        baseCommitId: head.commitId, baseGeneration: head.generation,
+        now: base - (12 - gen) * DAY,
+        changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `ha${gen}`, size: 2, mtime: 1000 * gen }],
+      }));
+    }
+
+    // 3 天窗口：淘汰 gen1..gen9，边界对齐到 gen10 checkpoint
+    const result = await gcRepository({
+      fs, syncFolder: SYNC_FOLDER,
+      policy: { maxFileSize: 0, hourlyWindowHours: 0, dailyWindowDays: 3, monthlyWindowMonths: 0, yearlyWindowYears: 0, maxVersionsPerFile: 0 },
+    });
+
+    // 前置条件：确实发生了裁剪（否则测试场景不成立）
+    expect(result.deletedCommits).toBeGreaterThan(0);
+    // b.md 的 blob 只被 gen2 提交（已淘汰）与 gen10 检查点树引用，
+    // 而 gen10 是保留边界 → b1 必须保留，否则「保留提交的完整状态」无法重建
+    expect(fs.map.has(b1)).toBe(true);
+    // 仅被淘汰提交引用的 a.md 旧版本可删（a1 由 gen2 引用）
+    expect(fs.map.has(a1)).toBe(false);
+  });
+});
+
+describe('withRepoLock（原子建锁）', () => {
+  it('读锁后建锁窗口内被他人抢占时不再并发进入，提交抛 HeadConflictError', async () => {
+    // 模拟：另一 Worker 在我们读锁之后、写锁之前抢先写入了锁对象。
+    // 旧实现用无条件 put 覆盖他人锁 → 两个任务同时持锁进入（同一 generation、不同
+    // commitId 的 HEAD 互相覆盖，后写者胜出，先写者变更丢失）；
+    // 新实现用 putIfNoneMatch 原子建锁 → 发现锁已被占用 → 重试失败 → HeadConflictError。
+    const fs = new MemFs(true, true); // 条件写可用但 If-Match 恒失配 → casWriteHead 走锁路径
+    const originalPutIfNoneMatch = fs.putIfNoneMatch!;
+    let injected = false;
+    // MemFs 构造器把 putIfNoneMatch 作为自身属性赋值，需在构造后包装才能拦截
+    fs.putIfNoneMatch = async (key, content) => {
+      if (key.endsWith('lock.json') && !injected) {
+        injected = true;
+        fs.map.set(key, new TextEncoder().encode(JSON.stringify({ token: 'foreign', expiresAt: Date.now() + 15_000 })));
+      }
+      return originalPutIfNoneMatch(key, content);
+    };
+
+    const { head } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const blob = makeStorageKey(SYNC_FOLDER, 'a.md', 'v1');
+    fs.putText(blob, 'content');
+    // 锁被他人持有时绝不应推进 HEAD（否则并发提交会互相覆盖）
+    await expect(finalizeCommit({
+      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'uuid-a', operation: 'add', path: 'a.md', blobId: blob, hash: 'h1', size: 7, mtime: 1000 }],
+    })).rejects.toThrow(HeadConflictError);
+  });
 });

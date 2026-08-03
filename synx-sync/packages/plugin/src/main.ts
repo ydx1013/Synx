@@ -10,7 +10,7 @@ import { hideMarkdownUuidExtension } from './markdownUuidEditor.js';
 import { listObsConfigFiles } from './obsConfigLister.js';
 import { loadPluginSettings, type SynxPluginSettings } from './settings.js';
 import { SynxSettingTab } from './settingsTab.js';
-import { hashContent, isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
+import { hashContent, isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
 import { enqueueDeletion, pendingForTarget, type PendingDeletion } from './deletionQueue.js';
 import { SyncDetailsView, SYNC_DETAILS_VIEW_TYPE } from './syncDetailsView.js';
 import { SyncExecutor, type ExecutableSyncAction, type SyncExecutionResult } from './syncExecutor.js';
@@ -308,13 +308,15 @@ export default class SynxSyncPlugin extends Plugin {
     });
     this.reportStore.start('retry');
     await this.executeActions(actions);
+    // 部分动作再次失败时不产生原子提交（避免「报告失败但远端已部分变更」）
+    const syncFailed = this.reportStore.current?.stats.failed ?? 0;
     // 重试产生的变更也走原子提交
     const changes = buildRepoChanges(
       [...this.repoUploads.values()],
       [...this.repoDeletes.entries()].map(([path, identity]) => ({ path, identity }) as RepoDelete),
       treeToMap(this.repoTree),
     );
-    if (changes.length > 0) {
+    if (syncFailed === 0 && changes.length > 0) {
       await this.client.finalizeCommit({
         baseCommitId: repo.head.commitId,
         baseGeneration: repo.head.generation,
@@ -487,21 +489,32 @@ export default class SynxSyncPlugin extends Plugin {
         let guardedDeletes = 0;
         let guardedActions = plan.actions;
         const protectPercent = this.settings.massDeleteProtectPercent;
-        if (
-          prevSyncMap &&
-          !this.settings.allowBatchRemoteDelete &&
-          shouldProtectAgainstMassDeletion(files.length, prevSyncMap.size, protectPercent)
-        ) {
+        const prevSyncCount = prevSyncMap?.size ?? 0;
+        const protectMass = !!prevSyncMap && !this.settings.allowBatchRemoteDelete;
+        if (protectMass && shouldProtectAgainstMassDeletion(files.length, prevSyncCount, protectPercent)) {
           guardedActions = plan.actions.map((a) => {
             if (a.type !== 'delete-remote') return a;
             guardedDeletes++;
             return { type: 'pull', path: a.path, reason: 'remote-only', fileUuid: a.fileUuid };
           });
         }
-        if (guardedDeletes > 0) {
-          console.warn('synx: mass local deletion detected, protected remote files from delete', { local: files.length, prevSync: prevSyncMap?.size ?? 0, guarded: guardedDeletes, protectPercent });
+        // delete-local 方向：远端可能整体丢失（清空/配置错配/仓库损坏）时，
+        // 把所有 delete-local 转为 push（重新上传本地未变内容，不删本地）。
+        let guardedLocalDeletes = 0;
+        if (protectMass) {
+          const deleteLocalCount = guardedActions.filter((a) => a.type === 'delete-local').length;
+          if (shouldProtectAgainstMassLocalDeletion(deleteLocalCount, prevSyncCount, protectPercent)) {
+            guardedActions = guardedActions.map((a) => {
+              if (a.type !== 'delete-local') return a;
+              guardedLocalDeletes++;
+              return { type: 'push', path: a.path, reason: 'local-only' };
+            });
+          }
+        }
+        if (guardedDeletes > 0 || guardedLocalDeletes > 0) {
+          console.warn('synx: mass deletion detected, protected data from deletion', { local: files.length, prevSync: prevSyncCount, guardedRemoteDeletes: guardedDeletes, guardedLocalDeletes, protectPercent });
           // #region debug-point B:mass-deletion-guard
-          dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount: prevSyncMap?.size ?? 0, guardedDeletes, protectPercent });
+          dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount, guardedRemoteDeletes: guardedDeletes, guardedLocalDeletes, protectPercent });
           // #endregion
         }
         const actions: ExecutableSyncAction[] = [
@@ -511,6 +524,11 @@ export default class SynxSyncPlugin extends Plugin {
         ];
         this.reportStore.setPlannedCounts(plan.stats.push, plan.stats.pull);
         await this.executeActions(actions);
+
+        // 部分动作失败时不产生原子提交：成功的 push 会残留孤儿 blob（由 GC 清理），
+        // 远端保持原状，避免「报告同步失败但远端已部分变更」的误判；下次同步会重试。
+        const syncFailed = this.reportStore.current?.stats.failed ?? 0;
+        if (syncFailed > 0) break;
 
         // 组装变更集：push 已上传为 blob、delete 已收集；pull/skip 不产生提交
         const changes = buildRepoChanges(
@@ -769,8 +787,8 @@ export default class SynxSyncPlugin extends Plugin {
         if (r.status === 'success') success++;
         else if (r.status === 'failed') failed++;
       }
-      // 有上传才产生一次原子提交
-      if (uploads.size > 0) {
+      // 有失败时不产生原子提交（避免「报告失败但备份已部分变更」），下次镜像重试
+      if (uploads.size > 0 && failed === 0) {
         const changes = buildRepoChanges([...uploads.values()], [], treeToMap(tree));
         await backupClient.finalizeCommit({
           baseCommitId: resp.head.commitId,
