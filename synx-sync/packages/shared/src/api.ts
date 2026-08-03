@@ -42,6 +42,10 @@ export const API = {
   repoRestore: '/api/repository/restore',
   repoTree: '/api/repository/tree',
   repoBlobs: '/api/repository/blobs',
+  repoMultipartStart: '/api/repository/multipart/start',
+  repoMultipartParts: '/api/repository/multipart/parts',
+  repoMultipartComplete: '/api/repository/multipart/complete',
+  repoMultipartAbort: '/api/repository/multipart/abort',
   repoContent: '/api/repository/content',
   repoFileHistory: '/api/repository/file-history',
   repoGc: '/api/repository/gc',
@@ -178,6 +182,60 @@ export interface RepoDiffResponse {
   modified: number;
   renamed: number;
   deleted: number;
+}
+
+export interface MultipartUploadedPart {
+  partNumber: number;
+  etag: string;
+  size: number;
+}
+
+export interface MultipartStartRequest {
+  path: string;
+  size: number;
+  hash: string;
+  mtime: number;
+  resume?: { blobId: string; uploadId: string };
+}
+
+export interface MultipartSessionResponse {
+  blobId: string;
+  uploadId: string;
+  partSize: number;
+  partCount: number;
+  uploadedParts: MultipartUploadedPart[];
+}
+
+export interface MultipartPartsRequest {
+  path: string;
+  blobId: string;
+  uploadId: string;
+  partNumbers: number[];
+}
+
+export interface MultipartPartsResponse {
+  parts: Array<{ partNumber: number; url: string }>;
+}
+
+export interface MultipartCompleteRequest {
+  path: string;
+  blobId: string;
+  uploadId: string;
+  size: number;
+  hash: string;
+  parts: Array<{ partNumber: number; etag: string }>;
+}
+
+export interface MultipartCompleteResponse {
+  blobId: string;
+  size: number;
+  hash: string;
+}
+
+export interface MultipartAbortRequest {
+  path: string;
+  blobId: string;
+  uploadId: string;
 }
 
 /** 原子提交变更集。冲突（HEAD 已被推进）返回 409 HEAD_CONFLICT。 */
