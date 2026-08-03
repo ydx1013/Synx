@@ -228,6 +228,38 @@ describe('finalizeCommit（原子提交）', () => {
     expect(readHeadResult!.commitId).toBe(commit.commitId);
   });
 
+  it('大变更集（超过逐个 HEAD 上限）走单次 list 校验，提交成功且树完整', async () => {
+    const { fs, initialHead, initialCommitId } = await setup();
+
+    const changes: RepoChange[] = [];
+    for (let i = 0; i < 60; i++) {
+      const path = `bulk/${i}.md`;
+      const blobId = makeStorageKey(SYNC_FOLDER, path, `v${i}`);
+      await fs.putText(blobId, `content-${i}`);
+      changes.push({ identity: `path:${path}`, operation: 'add', path, blobId, hash: `h${i}`, size: 9, mtime: 1000 + i });
+    }
+
+    const { commit, head } = await finalizeCommit({
+      env,
+      userId: 'u1',
+      storageId: 's1',
+      syncFolder: SYNC_FOLDER,
+      fs,
+      baseCommitId: initialHead.commitId,
+      baseGeneration: initialHead.generation,
+      changes,
+    });
+
+    expect(commit.parentCommitId).toBe(initialCommitId);
+    expect(commit.generation).toBe(3);
+    expect(commit.changeCount).toBe(60);
+    expect(head.commitId).toBe(commit.commitId);
+
+    const tree = await resolveTree(fs, SYNC_FOLDER, commit);
+    expect(tree.size).toBe(61); // note.md + 60 bulk 文件
+    expect(tree.get('bulk/59.md')!.blobId).toBe(makeStorageKey(SYNC_FOLDER, 'bulk/59.md', 'v59'));
+  });
+
   it('基于过期基线提交 → HEAD_CONFLICT，HEAD 不变', async () => {
     const { fs, initialHead } = await setup();
     const blob = makeStorageKey(SYNC_FOLDER, 'note.md', 'v2');

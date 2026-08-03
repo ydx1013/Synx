@@ -25,6 +25,8 @@ const FILE_HISTORY_LIMIT = 200;
 const LOCK_TTL_MS = 15_000;
 const LOCK_ACQUIRE_RETRIES = 20;
 const LOCK_RETRY_DELAY_MS = 100;
+/** 逐个 fs.head 校验 blob 的变更集上限：超出改用单次 list，避免 Workers 免费版 50 子请求限额。 */
+const MAX_BLOB_HEAD_CHECKS = 40;
 
 function repoRoot(syncFolder: string): string {
   return `${syncFolder.replace(/\/+$/, '')}/${REPO_DIR}/`;
@@ -486,10 +488,22 @@ export async function finalizeCommit(input: FinalizeCommitInput): Promise<{ comm
   const parent = await readCommit(fs, syncFolder, head.commitId);
   if (!parent) throw new RepoIntegrityError(`parent commit missing: ${head.commitId}`);
 
-  // 校验引用的内容对象存在（缺失则拒绝提交，HEAD 不变）
-  for (const change of changes) {
-    if (change.operation !== 'delete' && change.blobId) {
-      if (!(await fs.head(change.blobId))) throw new BlobMissingError(change.path);
+  // 校验引用的内容对象存在（缺失则拒绝提交，HEAD 不变）。
+  // 注意：不能对大变更集逐个 fs.head —— Workers 免费版单请求子请求上限 50，
+  // 首次全量同步（数百个文件）会因逐个 HEAD 超额被平台中断 → 500。
+  // 变更集较小时逐个 HEAD（少几次往返、可精确定位缺失文件）；
+  // 变更集大时改为单次 list + 内存 Set 判断（1 次子请求校验全部 blob）。
+  const blobChanges = changes.filter((c) => c.operation !== 'delete' && c.blobId);
+  if (blobChanges.length > 0) {
+    if (blobChanges.length <= MAX_BLOB_HEAD_CHECKS) {
+      for (const change of blobChanges) {
+        if (!(await fs.head(change.blobId!))) throw new BlobMissingError(change.path);
+      }
+    } else {
+      const keys = new Set(await fs.list(`${syncFolder.replace(/\/+$/, '')}/`));
+      for (const change of blobChanges) {
+        if (!keys.has(change.blobId!)) throw new BlobMissingError(change.path);
+      }
     }
   }
 
