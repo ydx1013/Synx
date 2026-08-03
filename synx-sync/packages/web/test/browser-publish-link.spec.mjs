@@ -35,7 +35,8 @@ test('Obsidian 发布链接（/笔记名.md）能重定向并打开对应笔记'
     }
     if (pathname === '/api/get' && request.method() === 'GET') {
       const filePath = url.searchParams.get('path') || '';
-      await route.fulfill({ json: { content: Buffer.from(CONTENTS[filePath] ?? '# 空', 'utf8').toString('base64') } });
+      const content = CONTENTS[filePath] ?? '# 空';
+      await route.fulfill({ body: Buffer.from(content, 'utf8'), headers: { 'Content-Type': 'text/markdown; charset=utf-8', 'X-Synx-Version': JSON.stringify({ versionId: 'v1', size: content.length, mtime: 1700000000000, hash: 'h1', author: 'web' }) } });
       return;
     }
     await route.fulfill({ status: 404, json: { error: 'not found' } });

@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
-import { DEFAULT_RETENTION, type CreateStorageRequest, type OnedriveConfig, type RetentionPolicy, type StorageSummary, type S3Config, type StorageConfig, type StorageType, type WebdavConfig, type WorkerFs } from '@synx/shared';
+import { type CreateStorageRequest, type OnedriveConfig, type RetentionPolicy, type StorageSummary, type S3Config, type StorageConfig, type StorageType, type WebdavConfig, type WorkerFs } from '@synx/shared';
 import { authMiddleware } from '../middleware/auth.js';
 import { decryptString, encryptString } from '../auth/crypto.js';
 import { ConnectivityError, checkConnectivity } from '../storage/connectivity.js';
-import { getFs, StorageError } from '../storage/factory.js';
-import { normalizePolicy } from '../services/retention.js';
+import { getFs, invalidateStorageRowCache, StorageError } from '../storage/factory.js';
+import { getRetentionPolicy, normalizePolicy, saveRetentionPolicy } from '../services/retention.js';
 import { OneDriveFs } from '../storage/onedriveFs.js';
 import { S3Fs } from '../storage/s3Fs.js';
 import { WebDAVFs } from '../storage/webdavFs.js';
@@ -244,6 +244,7 @@ storage.post('/', async (c) => {
   )
     .bind(id, userId, name, type, encrypted, now)
     .run();
+  invalidateStorageRowCache(id);
 
   const summary: StorageSummary = { id, userId, name, type, config: null, createdAt: now };
   return c.json({ storage: summary }, 201);
@@ -316,38 +317,38 @@ storage.patch('/:id', async (c) => {
   await c.env.DB.prepare('UPDATE storages SET name = ?, config = ? WHERE id = ? AND user_id = ?')
     .bind(name, encrypted, row.id, row.user_id)
     .run();
+  invalidateStorageRowCache(row.id);
   return c.json({ storage: { ...rowToSummary({ ...row, name }), config: redactConfig(row.type as StorageType, next) } });
 });
 
-// GET /api/storage/:id/retention —— 读取保留策略
+// GET /api/storage/:id/retention —— 读取保留策略（优先用户存储，含归属校验）
 storage.get('/:id/retention', async (c) => {
-  const row = await c.env.DB.prepare('SELECT retention_policy FROM storages WHERE id = ?')
-    .bind(c.req.param('id'))
-    .first<{ retention_policy: string | null }>();
-  if (!row) return c.json({ error: 'storage not found' }, 404);
-  if (row.retention_policy === undefined) return c.json({ error: 'retention column unavailable; run migrations' }, 500);
-  let policy: RetentionPolicy;
+  const storageId = c.req.param('id');
   try {
-    policy = row.retention_policy ? (JSON.parse(row.retention_policy) as RetentionPolicy) : DEFAULT_RETENTION;
-  } catch {
-    policy = DEFAULT_RETENTION;
+    const { fs } = await getFs(c.env, c.get('userId'), storageId); // 含归属校验
+    const policy = await getRetentionPolicy(c.env, storageId, fs);
+    return c.json({ policy });
+  } catch (e) {
+    if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
+    console.error('get retention error:', e);
+    return c.json({ error: 'internal error' }, 500);
   }
-  return c.json({ policy });
 });
 
-// PUT /api/storage/:id/retention —— 保存保留策略
+// PUT /api/storage/:id/retention —— 保存保留策略（写入用户自己的存储，D1 仅回退源）
 storage.put('/:id/retention', async (c) => {
   const body = await c.req.json<Partial<RetentionPolicy>>();
-  const row = await c.env.DB.prepare('SELECT id, user_id, retention_policy FROM storages WHERE id = ?')
-    .bind(c.req.param('id'))
-    .first<{ id: string; user_id: string; retention_policy: string | null }>();
-  if (!row) return c.json({ error: 'storage not found' }, 404);
-  if (row.user_id !== c.get('userId')) return c.json({ error: 'forbidden' }, 403);
   const policy = normalizePolicy(body);
-  await c.env.DB.prepare('UPDATE storages SET retention_policy = ? WHERE id = ? AND user_id = ?')
-    .bind(JSON.stringify(policy), row.id, row.user_id)
-    .run();
-  return c.json({ policy });
+  const storageId = c.req.param('id');
+  try {
+    const { fs } = await getFs(c.env, c.get('userId'), storageId); // 含归属校验
+    await saveRetentionPolicy(c.env, storageId, fs, policy);
+    return c.json({ policy });
+  } catch (e) {
+    if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
+    console.error('save retention error:', e);
+    return c.json({ error: 'failed to save retention policy to storage' }, 500);
+  }
 });
 
 storage.delete('/:id', async (c) => {
@@ -362,6 +363,7 @@ storage.delete('/:id', async (c) => {
   await c.env.DB.prepare('DELETE FROM storages WHERE id = ? AND user_id = ?')
     .bind(id, userId)
     .run();
+  invalidateStorageRowCache(id);
   return c.json({ ok: true, remoteFilesPreserved: true });
 });
 

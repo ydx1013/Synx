@@ -246,6 +246,24 @@ export function shouldProtectAgainstMassDeletion(
   return (localCount / prevSyncCount) * 100 < protectPercent;
 }
 
+/**
+ * 本地文件相对上次同步是否「未变」，用于跳过读取与 hash 重算（快路径）。
+ * 要求 prevSync 存在、上次有本地 hash、且 mtime 与 size 均完全一致——
+ * 一致即内容未变（mtime 由文件系统写入更新，未写入的文件 mtime 保持不变），
+ * 此时可安全复用 prevSync 的 localHash 与 fileUuid，无需再读文件。
+ *
+ * 注意：这是 mtime+size 启发式。若内容变化但 mtime 与 size 恰好都没变
+ * （极端场景，如粗粒度文件系统 + 手动还原 mtime），该变化会被漏检，
+ * 与 planSync 无 hash 时的兜底判断处于同一信任级别。
+ */
+export function isLocalFileUnchangedFromPrev(
+  prev: PrevSyncEntry | undefined,
+  mtime: number,
+  size: number,
+): boolean {
+  return !!prev && !!prev.localHash && prev.localMtime === mtime && prev.size === size;
+}
+
 /** 简单的 sha256 hex 计算（Obsidian 环境下用 SubtleCrypto） */
 export async function hashContent(content: ArrayBuffer | Uint8Array): Promise<string> {
   const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);

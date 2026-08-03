@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { encryptString } from '../auth/crypto.js';
-import { getFs, getStorageRow, decryptS3Config, decryptStorageConfig, StorageError } from './factory.js';
+import { getFs, getStorageRow, invalidateStorageRowCache, resetStorageRowCache, decryptS3Config, decryptStorageConfig, StorageError } from './factory.js';
 import { makeD1Mock, makeKvMock, makeEnv } from '../test/helpers.js';
 
 const ENCRYPTION_KEY = 'test-encryption-key';
@@ -52,6 +52,11 @@ function makeStorageRow(overrides: Partial<{
     ...overrides,
   };
 }
+
+// 行缓存是模块级全局状态，每个用例前清空，避免跨用例污染
+beforeEach(() => {
+  resetStorageRowCache();
+});
 
 describe('getStorageRow', () => {
   it('returns row when storage exists and belongs to user', async () => {

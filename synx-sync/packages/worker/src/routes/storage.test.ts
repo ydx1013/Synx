@@ -1,9 +1,11 @@
 import { Hono } from 'hono';
-import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, vi, beforeEach } from 'vitest';
 import { DEFAULT_RETENTION } from '@synx/shared';
 import { storage } from './storage.js';
 import { signJwt } from '../auth/jwt.js';
 import { decryptString, encryptString } from '../auth/crypto.js';
+import { resetRetentionPolicyCache } from '../services/retention.js';
+import { resetStorageRowCache } from '../storage/factory.js';
 import { makeD1Mock, makeKvMock, makeEnv } from '../test/helpers.js';
 import type { Env, AppVars } from '../types.js';
 
@@ -529,31 +531,64 @@ describe('PATCH /api/storage/:id', () => {
 });
 
 describe('GET/PUT /api/storage/:id/retention', () => {
-  it('returns the default policy when no custom policy is stored', async () => {
-    const db = makeD1Mock({ first: { retention_policy: null } });
+  const ENCRYPTION_KEY = 'test-encryption-key';
+
+  /** 构造 storages 行：type s3 + 加密 config + retention_policy */
+  async function makeRow(retentionPolicy: string | null) {
+    const encrypted = await encryptString(JSON.stringify(validS3), ENCRYPTION_KEY);
+    return { id: 's1', user_id: USER, name: 'mine', type: 's3', config: encrypted, created_at: 1, retention_policy: retentionPolicy };
+  }
+
+  beforeEach(() => {
+    resetRetentionPolicyCache();
+    resetStorageRowCache();
+  });
+
+  it('returns the default policy when neither storage nor D1 has a policy', async () => {
+    const db = makeD1Mock({ first: await makeRow(null) });
     const kv = makeKvMock();
+    // 保留策略文件不存在 → S3 GET 404 → 回退 D1（null）→ 默认
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 404 })));
     const app = makeApp(db, kv);
-    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv, ENCRYPTION_KEY }));
     expect(res.status).toBe(200);
     const data = await res.json<any>();
     expect(data.policy.hourlyWindowHours).toBe(60);
   });
 
-  it('returns the stored policy', async () => {
+  it('falls back to D1 when storage file is missing', async () => {
     const stored = JSON.stringify({ hourlyWindowHours: 12, dailyWindowDays: 7, monthlyWindowMonths: 2, yearlyWindowYears: 1, maxVersionsPerFile: 200 });
-    const db = makeD1Mock({ first: { retention_policy: stored } });
+    const db = makeD1Mock({ first: await makeRow(stored) });
     const kv = makeKvMock();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 404 })));
     const app = makeApp(db, kv);
-    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv, ENCRYPTION_KEY }));
     expect(res.status).toBe(200);
     const data = await res.json<any>();
     expect(data.policy.hourlyWindowHours).toBe(12);
     expect(data.policy.maxVersionsPerFile).toBe(200);
   });
 
-  it('saves a normalized policy', async () => {
-    const db = makeD1Mock({ first: { id: 's1', user_id: USER, retention_policy: null } });
+  it('reads the policy from user storage when file exists', async () => {
+    const policyJson = JSON.stringify({ hourlyWindowHours: 12, dailyWindowDays: 7, monthlyWindowMonths: 2, yearlyWindowYears: 1, maxVersionsPerFile: 200 });
+    const db = makeD1Mock({ first: await makeRow(null) });
     const kv = makeKvMock();
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes('/.synx/retention.json')) return Promise.resolve(new Response(policyJson, { status: 200 }));
+      return Promise.resolve(new Response('', { status: 404 }));
+    }));
+    const app = makeApp(db, kv);
+    const res = await app.request('/api/storage/s1/retention', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv, ENCRYPTION_KEY }));
+    expect(res.status).toBe(200);
+    const data = await res.json<any>();
+    expect(data.policy.hourlyWindowHours).toBe(12);
+  });
+
+  it('saves a normalized policy (writes to user storage)', async () => {
+    const db = makeD1Mock({ first: await makeRow(null) });
+    const kv = makeKvMock();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 200 })));
     const app = makeApp(db, kv);
     const res = await app.request(
       '/api/storage/s1/retention',
@@ -562,9 +597,10 @@ describe('GET/PUT /api/storage/:id/retention', () => {
         headers: { 'Content-Type': 'application/json', ...(await authHeader()) },
         body: JSON.stringify({ hourlyWindowHours: 24, dailyWindowDays: 5 }),
       },
-      makeEnv({ DB: db, KV: kv }),
+      makeEnv({ DB: db, KV: kv, ENCRYPTION_KEY }),
     );
     expect(res.status).toBe(200);
+    // saveRetentionPolicy 最后一条 D1 语句是 UPDATE storages SET retention_policy
     const bindArgs = (db as any)._stmt.bind.mock.calls.at(-1);
     const saved = JSON.parse(bindArgs[0]);
     expect(saved.hourlyWindowHours).toBe(24);

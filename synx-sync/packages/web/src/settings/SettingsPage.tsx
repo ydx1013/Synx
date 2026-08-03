@@ -9,10 +9,11 @@ import { buildApiExamples } from './apiGuide';
 
 export function SettingsLayout() {
   const { user } = useAuth();
+  const path = useLocation().pathname;
   return <div className="settings-shell"><aside className="settings-sidebar">
     <Link className="settings-back" to="/notes"><ArrowLeft size={17} />返回笔记</Link>
     <div className="settings-account"><span className="avatar">{user?.username.slice(0, 1).toUpperCase()}</span><div><strong>{user?.username}</strong><small>{user?.email}</small></div></div>
-    <nav><Link className="active" to="/settings"><Settings size={17} />常规设置</Link><Link to="/settings/storage"><Cloud size={17} />存储管理</Link><Link to="/settings/tokens"><KeyRound size={17} />API Token</Link></nav>
+    <nav><Link className={path === '/settings' ? 'active' : ''} to="/settings"><Settings size={17} />常规设置</Link><Link className={path.startsWith('/settings/storage') ? 'active' : ''} to="/settings/storage"><Cloud size={17} />存储管理</Link><Link className={path === '/settings/tokens' ? 'active' : ''} to="/settings/tokens"><KeyRound size={17} />API Token</Link></nav>
   </aside><SettingsContent /></div>;
 }
 
@@ -65,8 +66,8 @@ function ApiGuide() {
     <div className="api-guide-section"><h3>2. 请求格式</h3><dl className="api-fields"><div><dt>地址</dt><dd><code>POST /api/inbox/notes</code></dd></div><div><dt>鉴权</dt><dd><code>Authorization: Bearer synx_pat_你的Token</code></dd></div><div><dt>title</dt><dd>必填字符串，用作 Markdown 文件名，不需要填写 <code>.md</code>。</dd></div><div><dt>content</dt><dd>必填字符串，笔记的 Markdown 正文。</dd></div></dl></div>
     <div className="api-guide-section"><h3>3. 调用示例</h3><div className="api-examples"><CodeExample title="cURL" code={examples.curl} /><CodeExample title="PowerShell" code={examples.powershell} /><CodeExample title="JavaScript" code={examples.javascript} /></div></div>
     <div className="api-guide-section"><h3>4. 成功响应</h3><CodeExample title="HTTP 201" code={'{\n  "note": {\n    "path": "收件箱/会议记录.md",\n    "fileUuid": "生成的 UUID",\n    "versionId": "版本 ID",\n    "createdAt": 1785714000000\n  }\n}'} /></div>
-    <div className="api-guide-section"><h3>5. 常见错误</h3><div className="api-errors"><span><code>400</code> JSON、标题或正文无效</span><span><code>401</code> Token 无效或已撤销</span><span><code>409</code> 目标文件夹已有同名笔记</span><span><code>413</code> 笔记超过存储策略限制</span><span><code>429</code> 超过每分钟 60 次请求</span><span><code>500</code> 服务端写入失败</span></div></div>
-    <aside className="api-notes"><strong>行为与安全提示</strong><ul><li>笔记只能写入该 Token 创建时绑定的文件夹。</li><li>服务会自动添加 <code>.md</code> 后缀和 <code>synx-id</code>，且不会覆盖同名笔记。</li><li>不要把 Token 放入浏览器前端代码、公开仓库、日志或聊天记录；泄露后请立即撤销。</li></ul></aside>
+    <div className="api-guide-section"><h3>5. 常见错误</h3><div className="api-errors"><span><code>400</code> JSON、标题或正文无效</span><span><code>401</code> Token 无效或已撤销</span><span><code>409</code> 暂时无法分配可用文件名</span><span><code>413</code> 笔记超过存储策略限制</span><span><code>429</code> 超过每分钟 60 次请求</span><span><code>500</code> 服务端写入失败</span></div></div>
+    <aside className="api-notes"><strong>行为与安全提示</strong><ul><li>笔记只能写入该 Token 创建时绑定的文件夹。</li><li>服务会自动添加 <code>.md</code> 后缀和 <code>synx-id</code>，不会覆盖同名笔记；同名时按 Windows 风格创建 <code>标题 (2).md</code>、<code>标题 (3).md</code>。</li><li>不要把 Token 放入浏览器前端代码、公开仓库、日志或聊天记录；泄露后请立即撤销。</li></ul></aside>
   </section>;
 }
 

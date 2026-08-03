@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { S3Fs } from '../storage/s3Fs.js';
 import { getVersion, listFiles, putVersion } from './versionService.js';
+import { resetRetentionPolicyCache } from './retention.js';
 import type { Env } from '../types.js';
 
 // 回归测试：非 md 文件（identity = `path:中文路径`）+ S3 存储时，
@@ -72,6 +73,10 @@ interface WorkerFsLike {
 }
 
 describe('S3 中文路径非 md 文件同步（回归）', () => {
+  beforeEach(() => {
+    resetRetentionPolicyCache();
+  });
+
   it('putVersion → listFiles → getVersion 全链路不抛 404', async () => {
     const { fs, _store } = makeS3Fs();
     const env = makeNoPruneEnv();

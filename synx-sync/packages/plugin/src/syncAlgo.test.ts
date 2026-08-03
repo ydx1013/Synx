@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type RemoteEntity } from './syncAlgo.js';
+import { isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type RemoteEntity } from './syncAlgo.js';
 
 function localFile(path: string, mtime: number, hash?: string): LocalFile {
   return { path, mtime, size: 10, hash };
@@ -274,5 +274,31 @@ describe('shouldProtectAgainstMassDeletion', () => {
     expect(shouldProtectAgainstMassDeletion(460, 500, 90)).toBe(false);  // 92% ≥ 90%
     expect(shouldProtectAgainstMassDeletion(200, 400, 50)).toBe(false);  // 恰为 50%，不触发（严格小于）
     expect(shouldProtectAgainstMassDeletion(199, 400, 50)).toBe(true);   // 49.75% < 50%
+  });
+});
+
+describe('isLocalFileUnchangedFromPrev（hash 快路径）', () => {
+  it('mtime 与 size 均一致且上次有 hash → 可复用', () => {
+    const prev: PrevSyncEntry = { localMtime: 1000, remoteMtime: 1000, size: 10, localHash: 'h1', remoteHash: 'h1' };
+    expect(isLocalFileUnchangedFromPrev(prev, 1000, 10)).toBe(true);
+  });
+
+  it('mtime 变了 → 不能复用', () => {
+    const prev: PrevSyncEntry = { localMtime: 1000, remoteMtime: 1000, size: 10, localHash: 'h1' };
+    expect(isLocalFileUnchangedFromPrev(prev, 5000, 10)).toBe(false);
+  });
+
+  it('size 变了 → 不能复用', () => {
+    const prev: PrevSyncEntry = { localMtime: 1000, remoteMtime: 1000, size: 10, localHash: 'h1' };
+    expect(isLocalFileUnchangedFromPrev(prev, 1000, 99)).toBe(false);
+  });
+
+  it('上次没有本地 hash → 不能复用（需重算）', () => {
+    const prev: PrevSyncEntry = { localMtime: 1000, remoteMtime: 1000, size: 10 };
+    expect(isLocalFileUnchangedFromPrev(prev, 1000, 10)).toBe(false);
+  });
+
+  it('无 prevSync 条目 → 不能复用', () => {
+    expect(isLocalFileUnchangedFromPrev(undefined, 1000, 10)).toBe(false);
   });
 });

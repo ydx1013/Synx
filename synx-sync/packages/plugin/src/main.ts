@@ -9,7 +9,7 @@ import { hideMarkdownUuidExtension } from './markdownUuidEditor.js';
 import { listObsConfigFiles } from './obsConfigLister.js';
 import { loadPluginSettings, type SynxPluginSettings } from './settings.js';
 import { SynxSettingTab } from './settingsTab.js';
-import { hashContent, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
+import { hashContent, isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
 import { enqueueDeletion, pendingForTarget, type PendingDeletion } from './deletionQueue.js';
 import { SyncDetailsView, SYNC_DETAILS_VIEW_TYPE } from './syncDetailsView.js';
 import { SyncExecutor, type ExecutableSyncAction, type SyncExecutionResult } from './syncExecutor.js';
@@ -335,7 +335,8 @@ export default class SynxSyncPlugin extends Plugin {
     this.updateProgress();
     try {
       await this.flushPendingDeletions();
-      const { files, skipped } = await this.enumerateLocalFiles();
+      const prevSyncMap = this.getPrevSyncMap();
+      const { files, skipped } = await this.enumerateLocalFiles(prevSyncMap);
       const rawRemote = await this.client.list();
       const targetFiles = rawRemote.map((entity) => ({
         storageId: this.settings.storageId!,
@@ -355,7 +356,6 @@ export default class SynxSyncPlugin extends Plugin {
       this.remoteEntities = remote;
       this.reportStore.setPhase('planning');
       this.updateProgress();
-      const prevSyncMap = this.getPrevSyncMap();
       // #region debug-point B:plan-inputs
       dbg('B', 'main.ts:runSync', 'plan inputs', {
         trigger,
@@ -459,16 +459,25 @@ export default class SynxSyncPlugin extends Plugin {
     }
   }
 
-  private async enumerateLocalFiles(): Promise<{ files: LocalFile[]; skipped: ExecutableSyncAction[] }> {
+  private async enumerateLocalFiles(prevSync?: PrevSyncMap): Promise<{ files: LocalFile[]; skipped: ExecutableSyncAction[] }> {
     const files: LocalFile[] = [];
     const skipped: ExecutableSyncAction[] = [];
     for (const file of this.app.vault.getFiles()) {
       const result = evaluateFile(file.path, file.stat.size, this.settings);
       if (result.sync) {
-        const fileUuid = isMarkdownPath(file.path)
-          ? extractMarkdownUuid(await this.app.vault.read(file)) ?? undefined
-          : undefined;
+        // 快路径：文件相对上次同步未变（mtime+size 一致且上次有 hash）时，
+        // 复用 prevSync 的 hash 与 uuid，跳过读取与 sha256 重算。
+        const prev = prevSync?.get(file.path);
+        if (isLocalFileUnchangedFromPrev(prev, file.stat.mtime, file.stat.size)) {
+          files.push({ path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash: prev!.localHash, fileUuid: prev!.fileUuid });
+          continue;
+        }
+        // 变化的文件只读一次二进制：hash 用二进制，uuid 从解码文本中提取
+        // （避免旧实现 read 文本 + readBinary 两次读取）。
         const content = await this.app.vault.readBinary(file);
+        const fileUuid = isMarkdownPath(file.path)
+          ? extractMarkdownUuid(new TextDecoder().decode(content)) ?? undefined
+          : undefined;
         files.push({ path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash: await hashContent(content), fileUuid });
       }
       else skipped.push({ type: 'skip', path: file.path, reason: result.reason, rule: result.rule, size: result.size });
@@ -483,6 +492,11 @@ export default class SynxSyncPlugin extends Plugin {
       for (const f of obsFiles) {
         const result = evaluateFile(f.path, f.size, this.settings);
         if (result.sync) {
+          const prev = prevSync?.get(f.path);
+          if (isLocalFileUnchangedFromPrev(prev, f.mtime, f.size)) {
+            files.push({ path: f.path, mtime: f.mtime, size: f.size, hash: prev!.localHash, fileUuid: prev!.fileUuid });
+            continue;
+          }
           const content = await this.app.vault.adapter.readBinary(f.path);
           files.push({ ...f, hash: await hashContent(content) });
         }
@@ -981,7 +995,7 @@ export default class SynxSyncPlugin extends Plugin {
     const dbgT0 = Date.now();
     // #endregion
     try {
-      const { files } = await this.enumerateLocalFiles();
+      const { files } = await this.enumerateLocalFiles(this.getPrevSyncMap());
       const remote = await this.client.list();
       const remoteMap = new Map<string, Entity>();
       const remoteUuidMap = new Map<string, Entity>();

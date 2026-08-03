@@ -35,7 +35,7 @@ sync.post('/put', async (c) => {
     const { fs } = await getFs(c.env, userId, storageId);
     const content = await c.req.arrayBuffer();
     // put 前校验文件大小
-    const policy = await getRetentionPolicy(c.env, storageId);
+    const policy = await getRetentionPolicy(c.env, storageId, fs);
     enforceMaxFileSize(content.byteLength, policy);
     const version = await putVersion({
       env: c.env,

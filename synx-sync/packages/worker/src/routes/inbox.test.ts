@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import app from '../index.js';
+import { windowsDuplicateFileName } from './inbox.js';
 import { hashApiToken } from '../auth/apiToken.js';
 import { encryptString } from '../auth/crypto.js';
 import { makeEnv } from '../test/helpers.js';
@@ -40,6 +41,14 @@ beforeEach(() => {
   }));
 });
 
+describe('windowsDuplicateFileName', () => {
+  it('按 Windows 风格选择第一个可用的同名编号', () => {
+    expect(windowsDuplicateFileName('1.md', new Set())).toBe('1.md');
+    expect(windowsDuplicateFileName('1.md', new Set(['1.md']))).toBe('1 (2).md');
+    expect(windowsDuplicateFileName('1.md', new Set(['1.md', '1 (2).md', '1 (4).md']))).toBe('1 (3).md');
+  });
+});
+
 describe('POST /api/inbox/notes', () => {
   it('creates a markdown note in the token-bound folder', async () => {
     const db = await makeInboxDb();
@@ -53,6 +62,14 @@ describe('POST /api/inbox/notes', () => {
     const data = await response.json<{ note: { path: string; fileUuid: string } }>();
     expect(data.note.path).toBe('收件箱/会议记录.md');
     expect(data.note.fileUuid).toMatch(/^[0-9a-f-]{36}$/);
+    const preparedSql = (db.prepare as ReturnType<typeof vi.fn>).mock.calls.map(([sql]) => sql as string);
+    expect(preparedSql.some(sql => sql.includes('DELETE FROM api_note_paths') && sql.includes('created_at <'))).toBe(true);
+    expect(preparedSql.some(sql => sql.includes('DELETE FROM api_note_paths') && !sql.includes('created_at <'))).toBe(true);
+    const staleLockStatement = (db.prepare as ReturnType<typeof vi.fn>).mock.results
+      .map(result => result.value as { bind: ReturnType<typeof vi.fn> })
+      .find((_, index) => preparedSql[index].includes('created_at <'));
+    expect(staleLockStatement?.bind.mock.calls[0][3]).toBeGreaterThan(Date.now() - 11_000);
+    expect(staleLockStatement?.bind.mock.calls[0][3]).toBeLessThanOrEqual(Date.now() - 10_000);
   });
 
   it('rejects an unknown API token', async () => {
@@ -72,7 +89,7 @@ describe('POST /api/inbox/notes', () => {
       body: JSON.stringify({ title: '会议记录', content: '正文' }),
     }, makeEnv({ DB: db }));
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ code: 'NOTE_ALREADY_EXISTS' });
+    expect(await response.json()).toMatchObject({ code: 'NOTE_PATH_UNAVAILABLE' });
   });
 
   it('still succeeds when updating last-used time fails after the note is written', async () => {

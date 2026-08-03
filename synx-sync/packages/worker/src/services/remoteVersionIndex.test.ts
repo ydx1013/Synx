@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, beforeEach } from 'vitest';
 import type { WorkerFs } from '@synx/shared';
 import type { Env } from '../types.js';
 import { deleteFile, getHistory, getVersion, listFiles, putVersion, rollback, VersionConflict, VersionDeleted, VersionNotFound } from './versionService.js';
+import { resetRetentionPolicyCache } from './retention.js';
 
 const USER = 'user-1';
 const STORAGE_ID = 'storage-1';
@@ -9,6 +10,12 @@ const SYNC_FOLDER = 'vault';
 const UUID = '550e8400-e29b-41d4-a716-446655440000';
 const PATH = 'notes/idea.md';
 const META_PREFIX = `vault/.synx/files/${UUID}/versions/`;
+
+// 保留策略缓存是模块级全局状态，每个用例前清空（首个用例的 D1 proxy env 会缓存 DEFAULT，
+// 若不清空，后续期望 noPrune 的用例会命中缓存拿到非零窗口策略而触发裁剪）
+beforeEach(() => {
+  resetRetentionPolicyCache();
+});
 
 /**
  * 返回一个禁用保留裁剪的 env：各层窗口为 0，保留全部历史版本。

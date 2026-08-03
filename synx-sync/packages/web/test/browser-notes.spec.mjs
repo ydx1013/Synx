@@ -40,7 +40,7 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
     if (pathname === '/api/get' && request.method() === 'GET') {
       const filePath = url.searchParams.get('path') || '';
       const content = CONTENTS[filePath] ?? '# 空';
-      await route.fulfill({ json: { content: Buffer.from(content, 'utf8').toString('base64') } });
+      await route.fulfill({ body: Buffer.from(content, 'utf8'), headers: { 'Content-Type': 'text/markdown; charset=utf-8', 'X-Synx-Version': JSON.stringify({ versionId: 'v1', size: content.length, mtime: 1700000000000, hash: 'h1', author: 'web' }) } });
       return;
     }
     if (pathname === '/api/history' && request.method() === 'GET') {
@@ -49,7 +49,12 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
       return;
     }
     if (pathname === '/api/put' && request.method() === 'POST') {
-      putBodies.push(request.postDataJSON());
+      putBodies.push({
+        path: url.searchParams.get('path'),
+        fileUuid: url.searchParams.get('fileUuid'),
+        baseVersionId: url.searchParams.get('baseVersionId'),
+        content: Buffer.from(await request.postDataBuffer() ?? new Uint8Array()).toString('utf8'),
+      });
       await route.fulfill({ json: { version: { versionId: 'v-new', size: 16, mtime: Date.now(), hash: 'h-new', author: 'web' } } });
       return;
     }
@@ -94,7 +99,7 @@ test('笔记应用加载、渲染 Markdown、编辑并携带 baseVersionId 保�
   expect(last.path).toBe('笔记/会议记录.md');
   expect(last.fileUuid).toBe('11111111-1111-4111-8111-111111111111');
   expect(last.baseVersionId).toBe('v1');
-  expect(Buffer.from(last.content, 'base64').toString('utf8')).toContain('synx-id:11111111-1111-4111-8111-111111111111');
+  expect(last.content).toContain('synx-id:11111111-1111-4111-8111-111111111111');
 
   // 历史面板
   await page.getByRole('button', { name: '历史', exact: true }).click();

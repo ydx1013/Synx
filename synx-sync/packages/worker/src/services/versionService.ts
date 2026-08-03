@@ -319,7 +319,7 @@ export async function putVersion(input: PutVersionInput): Promise<VersionRecord>
     throw error;
   }
 
-  const policy = await getRetentionPolicy(env, storageId);
+  const policy = await getRetentionPolicy(env, storageId, fs);
   // 时间桶分层保留：每小时/每天/每月/每年各保留桶内最新 1 份，超窗口删除。
   // 仅当策略未禁用（各层窗口不全为 0）时才裁剪。
   const currentHistory = await readRecords(fs, metadataPrefix(syncFolder, identity));

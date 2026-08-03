@@ -23,6 +23,22 @@ export class StorageError extends Error {
   }
 }
 
+// 存储行内存缓存：同一 isolate 内短 TTL，避免同步突发中每请求查 D1。
+const rowCache = new Map<string, { row: StorageRow; expiresAt: number }>();
+const ROW_CACHE_TTL = 60 * 1000;
+
+/** 存储创建/更新/删除后调用，避免缓存过期前读到旧凭证 */
+export function invalidateStorageRowCache(storageId: string): void {
+  for (const key of rowCache.keys()) {
+    if (key.endsWith(`:${storageId}`)) rowCache.delete(key);
+  }
+}
+
+/** 仅供测试：清空全部缓存，避免用例间污染 */
+export function resetStorageRowCache(): void {
+  rowCache.clear();
+}
+
 /**
  * 取 storage 行（含归属校验）。
  * 不解密 config；调用方决定何时解密。
@@ -32,11 +48,18 @@ export async function getStorageRow(
   userId: string,
   storageId: string,
 ): Promise<StorageRow> {
+  const key = `${userId}:${storageId}`;
+  const now = Date.now();
+  const cached = rowCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.row;
+
   const row = await env.DB.prepare('SELECT * FROM storages WHERE id = ?')
     .bind(storageId)
     .first<StorageRow>();
   if (!row) throw new StorageError(404, 'storage not found');
   if (row.user_id !== userId) throw new StorageError(403, 'forbidden');
+
+  rowCache.set(key, { row, expiresAt: now + ROW_CACHE_TTL });
   return row;
 }
 

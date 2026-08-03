@@ -31,7 +31,7 @@ test('左侧文件夹树、中栏笔记列表、右侧编辑器内容均可独�
       return;
     }
     if (url.pathname === '/api/get' && request.method() === 'GET') {
-      await route.fulfill({ json: { content: Buffer.from(LONG_CONTENT, 'utf8').toString('base64') } });
+      await route.fulfill({ body: Buffer.from(LONG_CONTENT, 'utf8'), headers: { 'Content-Type': 'text/markdown; charset=utf-8', 'X-Synx-Version': JSON.stringify({ versionId: 'v1', size: LONG_CONTENT.length, mtime: 1700000000000, hash: 'h1', author: 'web' }) } });
       return;
     }
     await route.fulfill({ status: 404, json: { error: 'not found' } });
