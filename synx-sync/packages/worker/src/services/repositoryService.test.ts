@@ -38,11 +38,13 @@ class MemFs implements WorkerFs {
   putIfNoneMatch?: WorkerFs['putIfNoneMatch'];
   getEtag?: WorkerFs['getEtag'];
 
-  constructor(private supportsConditional = true) {
-    // 模拟真实后端：不支持条件写时方法保持 undefined，触发锁对象降级路径
+  constructor(private supportsConditional = true, private ifMatchFlaky = false) {
+    // 模拟真实后端：不支持条件写时方法保持 undefined，触发锁对象降级路径。
+    // ifMatchFlaky=true 模拟「If-Match 恒失配」的后端：etag 匹配也返回 false（假冲突 412）。
     if (this.supportsConditional) {
       this.putIfMatch = async (key, content, etag) => {
         if (this.etags.get(key) !== etag) return false;
+        if (this.ifMatchFlaky) return false;
         await this.put(key, content);
         return true;
       };
@@ -258,6 +260,30 @@ describe('finalizeCommit（原子提交）', () => {
     const tree = await resolveTree(fs, SYNC_FOLDER, commit);
     expect(tree.size).toBe(61); // note.md + 60 bulk 文件
     expect(tree.get('bulk/59.md')!.blobId).toBe(makeStorageKey(SYNC_FOLDER, 'bulk/59.md', 'v59'));
+  });
+
+  it('If-Match 恒失配的后端（假冲突）→ 降级锁路径写入，提交成功', async () => {
+    const fs = new MemFs(true, true); // 支持条件写但 putIfMatch 恒返回 false（模拟不稳定的 S3 If-Match）
+    const { head: initialHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+
+    const blobId = makeStorageKey(SYNC_FOLDER, 'note.md', 'v2');
+    await fs.putText(blobId, 'v2-content');
+    const { commit, head } = await finalizeCommit({
+      env,
+      userId: 'u1',
+      storageId: 's1',
+      syncFolder: SYNC_FOLDER,
+      fs,
+      baseCommitId: initialHead.commitId,
+      baseGeneration: initialHead.generation,
+      changes: [
+        { identity: 'uuid-note', operation: 'add', path: 'note.md', blobId, hash: 'h2', size: 11, mtime: 2000 },
+      ],
+    });
+
+    expect(commit.generation).toBe(2);
+    expect(head.commitId).toBe(commit.commitId);
+    expect(await readHead(fs, SYNC_FOLDER)).toMatchObject({ commitId: commit.commitId, generation: 2 });
   });
 
   it('基于过期基线提交 → HEAD_CONFLICT，HEAD 不变', async () => {

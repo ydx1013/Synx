@@ -192,8 +192,30 @@ async function casWriteHead(
   }
 
   if (fs.putIfMatch && fs.getEtag) {
-    const etag = await fs.getEtag(key);
-    if (etag) return fs.putIfMatch(key, encoded, etag);
+    let matched = false;
+    try {
+      const etag = await fs.getEtag(key);
+      if (etag) matched = await fs.putIfMatch(key, encoded, etag);
+    } catch {
+      // 后端不支持 If-Match（400/501/网络错误等）→ 视为条件写不可用，走降级
+      matched = false;
+    }
+    if (matched) return true;
+
+    // 条件写失配（412）：可能是真冲突（HEAD 被并发推进），也可能是后端 If-Match
+    // 语义不稳导致的假冲突（HEAD 内容其实没变）。重读 HEAD 区分：
+    // 内容未变 → 假冲突，降级到锁路径安全写入；内容已变 → 真冲突，返回 false。
+    // 锁路径内部会再次校验，仍可保证并发下不覆盖他人提交。
+    const latest = await readHead(fs, syncFolder);
+    if (latest && latest.generation === expected.generation && latest.commitId === expected.commitId) {
+      return withRepoLock(fs, syncFolder, async () => {
+        const again = await readHead(fs, syncFolder);
+        if (!again || again.generation !== expected.generation || again.commitId !== expected.commitId) return false;
+        await fs.put(key, encoded);
+        return true;
+      });
+    }
+    return false;
   }
 
   // 降级：锁对象串行化（WebDAV / OneDrive 等无条件写后端）。best-effort。
