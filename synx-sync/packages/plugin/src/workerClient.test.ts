@@ -119,6 +119,22 @@ describe('uploadBlob', () => {
   });
 });
 
+describe('multipart upload', () => {
+  it('creates a session then uploads a part directly without Worker headers', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonRes({ blobId: 'my-vault/a.bin@id', uploadId: 'u1', partSize: 16, partCount: 1, uploadedParts: [] }, 201))
+      .mockResolvedValueOnce(new Response('', { status: 200, headers: { ETag: '"etag-1"' } }));
+    const client = makeClient(fetchMock);
+    const session = await client.startMultipart({ path: 'a.bin', size: 5, hash: 'a'.repeat(64), mtime: 1 });
+    const etag = await client.uploadMultipartPart('https://storage.example.com/a?signature=x', new Uint8Array([1, 2]));
+    expect(session.uploadId).toBe('u1');
+    expect(etag).toBe('"etag-1"');
+    const directInit = fetchMock.mock.calls[1][1] as RequestInit;
+    expect(directInit.method).toBe('PUT');
+    expect(directInit.headers).toBeUndefined();
+  });
+});
+
 describe('error handling', () => {
   it('throws WorkerApiError on 4xx (non-401)', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"forbidden"}', { status: 403 }));

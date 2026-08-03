@@ -14,6 +14,13 @@ import {
   type RepoFile,
   type RepoFileHistoryResponse,
   type RepoGcResponse,
+  type MultipartStartRequest,
+  type MultipartSessionResponse,
+  type MultipartPartsRequest,
+  type MultipartPartsResponse,
+  type MultipartCompleteRequest,
+  type MultipartCompleteResponse,
+  type MultipartAbortRequest,
 } from '@synx/shared';
 
 /**
@@ -78,6 +85,16 @@ export class WorkerClient {
     this.opts.syncFolder = syncFolder;
   }
 
+  /** 当前请求标识的存储 */
+  get storageId(): string {
+    return this.opts.storageId;
+  }
+
+  /** 当前请求标识的仓库目录 */
+  get syncFolder(): string {
+    return this.opts.syncFolder;
+  }
+
   // ===== Git 式仓库 API（同步走全库原子提交） =====
 
   /** 读取仓库 HEAD + 当前完整树（替代旧 list() 作为远端状态来源） */
@@ -102,6 +119,30 @@ export class WorkerClient {
     const res = await this.requestResponse('POST', `${API.repoBlobs}?${params.toString()}`, content, true);
     const data = (await res.json()) as { blobId: string };
     return data.blobId;
+  }
+
+  async startMultipart(input: MultipartStartRequest): Promise<MultipartSessionResponse> {
+    return this.request<MultipartSessionResponse>('POST', API.repoMultipartStart, input);
+  }
+
+  async getMultipartPartUrls(input: MultipartPartsRequest): Promise<MultipartPartsResponse> {
+    return this.request<MultipartPartsResponse>('POST', API.repoMultipartParts, input);
+  }
+
+  async uploadMultipartPart(url: string, content: ArrayBuffer | Uint8Array): Promise<string> {
+    const res = await this.fetchImpl(url, { method: 'PUT', body: content as BodyInit });
+    if (!res.ok) throw new WorkerApiError(res.status, await safeErrorText(res));
+    const etag = res.headers.get('etag');
+    if (!etag) throw new Error('对象存储响应缺少 ETag，请检查 CORS ExposeHeaders 配置');
+    return etag;
+  }
+
+  async completeMultipart(input: MultipartCompleteRequest): Promise<MultipartCompleteResponse> {
+    return this.request<MultipartCompleteResponse>('POST', API.repoMultipartComplete, input);
+  }
+
+  async abortMultipart(input: MultipartAbortRequest): Promise<void> {
+    await this.request<{ ok: true }>('POST', API.repoMultipartAbort, input);
   }
 
   /** 原子提交变更集（CAS）。HEAD 已被推进时抛 WorkerApiError(409) */
