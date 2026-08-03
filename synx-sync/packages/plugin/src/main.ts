@@ -22,7 +22,8 @@ import { WorkerClient, WorkerApiError } from './workerClient.js';
 import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 
 interface PersistedPluginData {
-  settings: SynxPluginSettings;
+  /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
+  settings: Omit<SynxPluginSettings, 'deviceName'>;
 }
 
 interface PrevSyncState {
@@ -33,6 +34,8 @@ interface PrevSyncState {
 }
 
 interface SynxStateData {
+  /** 每设备独立的设备名：存 state（不同步），避免 data.json 跨设备互相覆盖设备名 */
+  deviceName?: string;
   reports: readonly SyncReport[];
   pendingDeletions?: readonly PendingDeletion[];
   knownRemoteFiles?: readonly { storageId: string; syncFolder: string; path: string; fileUuid?: string }[];
@@ -146,13 +149,17 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    // data.json 只保存 settings（轻量、稳定）
+    // data.json 只保存 settings（轻量、稳定；deviceName 已在 persist 时剥离）
     const raw = await this.loadData() as unknown;
     const structured = isPersistedData(raw);
     const settingsSource = structured ? raw.settings : raw;
     this.settings = loadPluginSettings(settingsSource, Platform.isMobile);
-    // reports / pendingDeletions / knownRemoteFiles 从独立状态文件加载
+    // reports / pendingDeletions / knownRemoteFiles / deviceName 从独立状态文件加载
     const state = await this.loadState();
+    // deviceName 是每设备独立状态，保存在 state（不同步）。优先取本机保存的设备名；
+    // 若 state 还没有（首次拆分或旧版升级），沿用旧版 data.json / 默认随机名，
+    // 并随下一次 persist 写入 state 完成迁移。
+    if (state.deviceName) this.settings.deviceName = state.deviceName;
     this.reportStore = new SyncReportStore([...state.reports], this.settings.reportRetention);
     this.pendingDeletions = [...(state.pendingDeletions ?? [])];
     this.knownRemoteFiles = [...(state.knownRemoteFiles ?? [])];
@@ -163,7 +170,7 @@ export default class SynxSyncPlugin extends Plugin {
     try {
       const text = await this.app.vault.adapter.read(STATE_FILE);
       const raw = JSON.parse(text) as unknown;
-      if (isStateData(raw)) return { reports: raw.reports, pendingDeletions: raw.pendingDeletions ?? [], knownRemoteFiles: raw.knownRemoteFiles ?? [], prevSync: raw.prevSync };
+      if (isStateData(raw)) return { deviceName: raw.deviceName, reports: raw.reports, pendingDeletions: raw.pendingDeletions ?? [], knownRemoteFiles: raw.knownRemoteFiles ?? [], prevSync: raw.prevSync };
     } catch { /* 文件不存在或解析失败，返回空状态 */ }
     return { reports: [], pendingDeletions: [], knownRemoteFiles: [] };
   }
@@ -1109,14 +1116,18 @@ export default class SynxSyncPlugin extends Plugin {
       settingsJsonLen: JSON.stringify(this.settings).length,
     });
     // #endregion
-    // data.json 只保存 settings（不随同步报告频繁变化）
-    await this.saveData({ settings: this.settings } satisfies PersistedPluginData);
-    // 运行时状态单独存储，永不被同步
+    // data.json 只保存 settings（不随同步报告频繁变化）。
+    // deviceName 是每设备独立状态，剥离出去存 state，避免 data.json 跨设备同步时
+    // 互相覆盖设备名（否则会导致"本地新→push→远端新→pull"的同步抖动）。
+    const { deviceName: _deviceName, ...syncableSettings } = this.settings;
+    await this.saveData({ settings: syncableSettings } satisfies PersistedPluginData);
+    // 运行时状态 + 设备名单独存储，永不被同步
     await this.persistState();
   }
 
   private async persistState(): Promise<void> {
     const state: SynxStateData = {
+      deviceName: this.settings.deviceName,
       reports: this.reportStore.reports,
       pendingDeletions: this.pendingDeletions,
       knownRemoteFiles: this.knownRemoteFiles,
