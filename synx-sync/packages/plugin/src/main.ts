@@ -8,7 +8,7 @@ import { HistoryPaneView, HISTORY_VIEW_TYPE } from './historyPane.js';
 import { ensureMarkdownUuid, extractMarkdownUuid, isMarkdownPath, replaceMarkdownUuid } from './markdownUuid.js';
 import { hideMarkdownUuidExtension } from './markdownUuidEditor.js';
 import { listObsConfigFiles } from './obsConfigLister.js';
-import { loadPluginSettings, type SynxPluginSettings } from './settings.js';
+import { loadPluginSettings, DEFAULT_REPORT_RETENTION, type SynxPluginSettings } from './settings.js';
 import { SynxSettingTab } from './settingsTab.js';
 import { hashContent, isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
 import { enqueueDeletion, pendingForTarget, type PendingDeletion } from './deletionQueue.js';
@@ -178,6 +178,8 @@ export default class SynxSyncPlugin extends Plugin {
     const structured = isPersistedData(raw);
     const settingsSource = structured ? raw.settings : raw;
     this.settings = loadPluginSettings(settingsSource, Platform.isMobile);
+    // 报告保留迁移：旧默认只保留 1 份，无法满足「同步详情显示最近 500 条日志」，把旧默认值提升到新默认
+    if (this.settings.reportRetention === 1) this.settings.reportRetention = DEFAULT_REPORT_RETENTION;
     // reports / pendingDeletions / knownRemoteFiles / deviceName 从独立状态文件加载
     const state = await this.loadState();
     // deviceName 是每设备独立状态，保存在 state（不同步）。优先取本机保存的设备名；
