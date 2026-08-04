@@ -23,6 +23,8 @@ app.use('/api/*', async (c, next) => {
   c.set('requestId', requestId);
   const startedAt = Date.now();
   await next();
+  // 响应头回传 requestId，便于客户端在日志中按 ID 精确关联错误
+  c.header('x-request-id', requestId);
   console.log(JSON.stringify({
     event: 'http_request',
     requestId,
@@ -37,6 +39,7 @@ app.use('/api/*', async (c, next) => {
 // 并记录完整堆栈（结构化），便于用 wrangler tail 定位生产错误。
 app.onError((err, c) => {
   const requestId = c.get('requestId') ?? 'unknown';
+  c.header('x-request-id', requestId);
   console.error(JSON.stringify({
     event: 'http_error',
     requestId,
@@ -52,7 +55,7 @@ app.use('/api/*', cors({
   origin: (origin) => (origin && OBSIDIAN_ORIGINS.has(origin) ? origin : ''),
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Authorization', 'Content-Type', 'X-Storage-Id', 'X-Sync-Folder'],
-  exposeHeaders: ['X-Synx-Version', 'Content-Length'],
+  exposeHeaders: ['X-Synx-Version', 'X-Request-Id', 'Content-Length'],
 }));
 
 app.get('/api/health', (c) => c.json({ ok: true, ts: Date.now() }));
