@@ -23,7 +23,6 @@ import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type Re
 import { uploadImageWithRetry } from './imageUpload.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
 import { parsePrivateImageUrl } from './privateImage.js';
-import { privateImageEditorExtension } from './privateImageEditor.js';
 
 interface PersistedPluginData {
   /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
@@ -118,9 +117,6 @@ export default class SynxSyncPlugin extends Plugin {
     this.registerView(HISTORY_VIEW_TYPE, (leaf) => new HistoryPaneView(leaf, this));
     this.registerView(SYNC_DETAILS_VIEW_TYPE, (leaf) => new SyncDetailsView(leaf, this));
     this.registerEditorExtension(this.uuidEditorExtensions);
-    this.registerEditorExtension(privateImageEditorExtension((galleryId, path) => {
-      return this.resolvePrivateImageUrl(galleryId, path);
-    }));
     this.updateUuidEditorExtension();
     this.registerMarkdownPostProcessor((element) => void this.renderPrivateImages(element));
     this.ribbonIcon = this.addRibbonIcon('refresh-cw', 'Synx 同步', () => void this.triggerSync());
@@ -175,6 +171,15 @@ export default class SynxSyncPlugin extends Plugin {
     const endpoint = `/api/image-galleries/${encodeURIComponent(galleryId)}/images/content`;
     const params = new URLSearchParams({ path, token: this.settings.jwt });
     return `${base}${endpoint}?${params.toString()}`;
+  }
+
+  /** 上传成功后，把 Worker 返回的 markdownUrl 转成可直接写入 Markdown 的 URL。
+   *  私有图库返回 synx-image://，这里转成 HTTPS URL（含 JWT），Obsidian 原生支持。 */
+  private resolveMarkdownUrl(markdownUrl: string): string {
+    if (!markdownUrl.startsWith('synx-image://')) return markdownUrl;
+    const reference = parsePrivateImageUrl(markdownUrl);
+    if (!reference) return markdownUrl;
+    return this.resolvePrivateImageUrl(reference.galleryId, reference.path);
   }
 
   private renderPrivateImages(element: HTMLElement): void {
@@ -232,7 +237,8 @@ export default class SynxSyncPlugin extends Plugin {
     try {
       const bytes = await file.arrayBuffer();
       const image = await uploadImageWithRetry(() => client.uploadGalleryImage(this.settings.imageGalleryId, bytes, file.type));
-      this.replaceEditorText(view, placeholder, `![](${image.markdownUrl})`);
+      const url = this.resolveMarkdownUrl(image.markdownUrl);
+      this.replaceEditorText(view, placeholder, `![](${url})`);
     } catch (error) {
       await this.saveFailedImageLocally(file, view, placeholder, error);
     }
@@ -269,7 +275,8 @@ export default class SynxSyncPlugin extends Plugin {
         const bytes = await this.app.vault.readBinary(local);
         const image = await uploadImageWithRetry(() => this.client!.uploadGalleryImage(item.galleryId, bytes, item.mimeType));
         const content = await this.app.vault.read(note);
-        const updated = replaceExactEmbed(content, item.originalEmbed, `![](${image.markdownUrl})`);
+        const url = this.resolveMarkdownUrl(image.markdownUrl);
+        const updated = replaceExactEmbed(content, item.originalEmbed, `![](${url})`);
         if (updated === null) continue;
         await this.app.vault.modify(note, updated);
         const referencedElsewhere = await this.localImageReferenced(item.localPath, note.path);
