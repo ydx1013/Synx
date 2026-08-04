@@ -99,6 +99,7 @@ jobs:
             synx-sync/packages/plugin/manifest.json > release/manifest.json
           echo "--- manifest.json ---"
           cat release/manifest.json
+          (cd release && zip "synx-sync-${{ steps.version.outputs.version }}.zip" manifest.json main.js styles.css)
           ls -la release/
 
       - name: Create Release
@@ -109,4 +110,5 @@ jobs:
             release/manifest.json
             release/main.js
             release/styles.css
+            release/synx-sync-${{ steps.version.outputs.version }}.zip
           generate_release_notes: true

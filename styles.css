@@ -62,12 +62,68 @@
 
 .synx-version-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
 .synx-version-actions button {
   font-size: var(--font-ui-smaller);
   padding: 2px 8px;
+}
+
+.synx-version-more {
+  margin-top: 12px;
+  text-align: center;
+}
+
+.synx-version-more button {
+  font-size: var(--font-ui-smaller);
+  padding: 4px 16px;
+}
+
+.synx-version-timeline {
+  position: relative;
+  margin-top: 4px;
+}
+
+.synx-version-timeline::before {
+  content: '';
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 6px;
+  width: 2px;
+  background: var(--interactive-accent);
+}
+
+.synx-version-timeline .synx-version-item {
+  position: relative;
+  margin: 0;
+  padding: 6px 4px 10px 24px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.synx-version-timeline .synx-version-item.is-current {
+  background: var(--background-modifier-hover);
+}
+
+.synx-version-dot {
+  position: absolute;
+  z-index: 1;
+  top: 10px;
+  left: 1px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--background-primary);
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  box-shadow: 0 0 0 1px var(--interactive-accent);
+}
+
+.synx-version-timeline .synx-version-meta {
+  margin-bottom: 4px;
 }
 
 /* ===== 设置面板确认弹窗 ===== */
@@ -107,7 +163,7 @@
   z-index: var(--layer-popover);
   display: flex;
   flex-direction: column;
-  min-width: 360px;
+  min-width: 280px;
   min-height: 240px;
   max-width: calc(100vw - 24px);
   max-height: calc(100vh - 24px);
@@ -167,8 +223,8 @@
 }
 
 .synx-history-diff {
-  min-width: max-content;
-  overflow: hidden;
+  min-width: 0;
+  overflow-x: auto;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-s);
   font-family: var(--font-monospace);
@@ -177,7 +233,7 @@
 
 .synx-history-diff-line {
   display: grid;
-  grid-template-columns: 48px 48px 24px minmax(360px, 1fr);
+  grid-template-columns: minmax(32px, 48px) minmax(32px, 48px) 24px minmax(0, 1fr);
   min-height: 24px;
   line-height: 24px;
 }
@@ -227,4 +283,48 @@
   min-height: 180px;
   place-items: center;
   color: var(--text-muted);
+}
+
+/* ===== 同步详情（移动端自适应） ===== */
+.synx-report-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.synx-report-item {
+  word-break: break-word;
+}
+
+.synx-report-item strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.synx-report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* ===== 设置页（移动端自适应：多控件行内换行） ===== */
+.synx-settings .setting-item-control {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* ===== 私有图床 Live Preview ===== */
+.synx-private-image-preview {
+  display: block;
+  margin: 8px 0;
+  color: var(--text-muted);
+}
+
+.synx-private-image-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: var(--radius-s);
 }
