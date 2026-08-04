@@ -23,6 +23,7 @@ import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type Re
 import { uploadImageWithRetry } from './imageUpload.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
 import { parsePrivateImageUrl } from './privateImage.js';
+import { privateImageEditorExtension } from './privateImageEditor.js';
 
 interface PersistedPluginData {
   /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
@@ -118,6 +119,10 @@ export default class SynxSyncPlugin extends Plugin {
     this.registerView(HISTORY_VIEW_TYPE, (leaf) => new HistoryPaneView(leaf, this));
     this.registerView(SYNC_DETAILS_VIEW_TYPE, (leaf) => new SyncDetailsView(leaf, this));
     this.registerEditorExtension(this.uuidEditorExtensions);
+    this.registerEditorExtension(privateImageEditorExtension(async (galleryId, path) => {
+      if (!this.client) throw new Error('Synx 尚未登录');
+      return this.client.readGalleryImage(galleryId, path);
+    }));
     this.updateUuidEditorExtension();
     this.registerMarkdownPostProcessor((element) => void this.renderPrivateImages(element));
     this.ribbonIcon = this.addRibbonIcon('refresh-cw', 'Synx 同步', () => void this.triggerSync());

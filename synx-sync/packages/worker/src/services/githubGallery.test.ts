@@ -49,4 +49,24 @@ describe('uploadGitHubImage', () => {
     expect(init.method).toBe('PUT');
     expect(JSON.parse(String(init.body))).toMatchObject({ branch: 'main', content: 'AQID' });
   });
+
+  it('preserves image bytes when the Worker base64 path uses multiple chunks', async () => {
+    const content = new Uint8Array(422429);
+    for (let index = 0; index < content.length; index++) content[index] = index % 251;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ content: { sha: 'abc' } }),
+    } as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const nodeBuffer = (globalThis as typeof globalThis & {
+      Buffer: { from(value: string | Uint8Array, encoding?: string): Uint8Array };
+    }).Buffer;
+    vi.stubGlobal('Buffer', undefined);
+    await uploadGitHubImage(config, 'uploads/2026/08/image.png', content);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const encoded = (JSON.parse(String(init.body)) as { content: string }).content;
+    expect(new Uint8Array(nodeBuffer.from(encoded, 'base64'))).toEqual(content);
+  });
 });

@@ -287,7 +287,8 @@ repository.get('/file-history', async (c) => {
     const head = await readHead(fs, syncFolder);
     if (!head) throw new RepoNotInitializedError();
     const identity = fileUuid ?? `path:${path}`;
-    const { commits, changes, nextCursor } = await fileHistory(fs, syncFolder, head, identity, undefined, from);
+    const scanLimit = fileUuid ? undefined : 10;
+    const { commits, changes, nextCursor } = await fileHistory(fs, syncFolder, head, identity, undefined, from, scanLimit);
     const res: RepoFileHistoryResponse = { identity, commits, changes, nextCursor };
     return c.json(res);
   } catch (e) {

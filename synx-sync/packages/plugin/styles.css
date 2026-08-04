@@ -314,3 +314,17 @@
   flex-wrap: wrap;
   gap: 4px;
 }
+
+/* ===== 私有图床 Live Preview ===== */
+.synx-private-image-preview {
+  display: block;
+  margin: 8px 0;
+  color: var(--text-muted);
+}
+
+.synx-private-image-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: var(--radius-s);
+}

@@ -68,7 +68,11 @@ jobs:
 
       - name: Build all workspaces
         working-directory: synx-sync
-        run: npm run build
+        run: |
+          npm run build -w @synx/shared
+          npm run build -w @synx/web
+          npm run build -w @synx/worker
+          npm run build -w @synx/plugin
 
       - name: Bump manifest version and auto tag patch release
         if: steps.version.outputs.trigger == 'main'

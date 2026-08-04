@@ -11,7 +11,7 @@ export function arrayBufferToBase64(buf: ArrayBuffer | Uint8Array): string {
   }
   // 分块编码：避免逐字节拼接字符串的 O(n²)。大文件（如 PDF）用逐字节循环会让
   // Cloudflare Workers 免费版 CPU 超限（错误码 1102）→ 503。每块 32KiB 内做一次 btoa。
-  const CHUNK = 0x8000;
+  const CHUNK = 0x7ffe;
   let result = '';
   for (let i = 0; i < bytes.length; i += CHUNK) {
     const end = Math.min(i + CHUNK, bytes.length);
