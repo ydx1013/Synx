@@ -6,6 +6,7 @@ import { getFs, StorageError } from '../storage/factory.js';
 import { enforceMaxFileSize, FileTooLarge, getRetentionPolicy } from '../services/retention.js';
 import { finalizeCommit, initRepository, readHead, readTree, RepoExistsError } from '../services/repositoryService.js';
 import type { AppVars, Env } from '../types.js';
+import { logError } from '../logger.js';
 
 interface ApiTokenRow {
   id: string;
@@ -118,7 +119,7 @@ inbox.post('/notes', async c => {
     try {
       await c.env.DB.prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?').bind(Date.now(), token.id).run();
     } catch (error) {
-      console.error('inbox last-used update failed', error instanceof Error ? error.message : String(error));
+      logError(c, 'inbox_last_used_update_failed', error);
     }
     await c.env.DB.prepare('DELETE FROM api_note_paths WHERE storage_id = ? AND sync_folder = ? AND path = ?').bind(token.storage_id, token.sync_folder, path).run();
     reserved = false;
@@ -127,7 +128,7 @@ inbox.post('/notes', async c => {
     if (reserved) await c.env.DB.prepare('DELETE FROM api_note_paths WHERE storage_id = ? AND sync_folder = ? AND path = ?').bind(token.storage_id, token.sync_folder, path).run();
     if (error instanceof FileTooLarge) return c.json({ error: error.message, code: 'FILE_TOO_LARGE' }, 413);
     if (error instanceof StorageError) return c.json({ error: error.message, code: 'STORAGE_ERROR' }, error.status as 400 | 403 | 404);
-    console.error('inbox note creation failed', error instanceof Error ? error.message : String(error));
+    logError(c, 'inbox_note_creation_failed', error, { tokenId: token.id, storageId: token.storage_id });
     return c.json({ error: 'internal error', code: 'INTERNAL_ERROR' }, 500);
   }
 });

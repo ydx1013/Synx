@@ -11,4 +11,6 @@ export interface Env {
 /** Hono 上下文变量（由 auth 中间件注入） */
 export interface AppVars {
   userId: string;
+  /** 每个请求的关联 ID（请求日志/错误日志用） */
+  requestId: string;
 }

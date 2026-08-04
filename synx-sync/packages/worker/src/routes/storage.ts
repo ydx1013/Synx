@@ -9,6 +9,7 @@ import { OneDriveFs } from '../storage/onedriveFs.js';
 import { S3Fs } from '../storage/s3Fs.js';
 import { WebDAVFs } from '../storage/webdavFs.js';
 import type { Env, AppVars } from '../types.js';
+import { logError } from '../logger.js';
 
 interface StorageRow {
   id: string;
@@ -221,7 +222,7 @@ storage.post('/test', async (c) => {
       onedrive: 'ONEDRIVE_CONNECTION_FAILED',
       dropbox: 'DROPBOX_CONNECTION_FAILED',
     };
-    console.error('storage/test failed', { type, stage: error instanceof ConnectivityError ? error.stage : 'unknown' });
+    logError(c, 'storage_connectivity_test_failed', error, { type, stage: error instanceof ConnectivityError ? error.stage : 'unknown' });
     return c.json({ error: connectivityErrorMessage(error, type), code: codes[type] || 'CONNECTION_FAILED' }, 422);
   }
 });
@@ -330,7 +331,7 @@ storage.get('/:id/retention', async (c) => {
     return c.json({ policy });
   } catch (e) {
     if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
-    console.error('get retention error:', e);
+    logError(c, 'storage_retention_get_failed', e);
     return c.json({ error: 'internal error' }, 500);
   }
 });
@@ -346,7 +347,7 @@ storage.put('/:id/retention', async (c) => {
     return c.json({ policy });
   } catch (e) {
     if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
-    console.error('save retention error:', e);
+    logError(c, 'storage_retention_save_failed', e);
     return c.json({ error: 'failed to save retention policy to storage' }, 500);
   }
 });
@@ -393,7 +394,7 @@ storage.post('/:id/purge', async (c) => {
     return c.json({ ok: true, total: keys.length, deleted, failed });
   } catch (e) {
     if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
-    console.error('purge error:', e);
+    logError(c, 'storage_purge_failed', e);
     return c.json({ error: 'internal error' }, 500);
   }
 });

@@ -47,6 +47,7 @@ import {
   restoreRepository,
 } from '../services/repositoryService.js';
 import type { AppVars, Env } from '../types.js';
+import { logError } from '../logger.js';
 
 export const repository = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
@@ -457,6 +458,6 @@ function handleError(c: any, e: unknown): Response {
   if (e instanceof BlobMissingError) return c.json({ error: e.message, code: 'BLOB_MISSING' }, 422);
   if (e instanceof EmptyChangesError) return c.json({ error: e.message, code: 'EMPTY_CHANGES' }, 400);
   if (e instanceof RepoIntegrityError) return c.json({ error: e.message, code: 'REPO_INTEGRITY' }, 500);
-  console.error('repository route error:', e);
+  logError(c, 'repository_route_error', e);
   return c.json({ error: 'internal error' }, 500);
 }
