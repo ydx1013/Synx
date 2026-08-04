@@ -1,7 +1,7 @@
 {
   "id": "synx-sync",
   "name": "Synx Sync",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "minAppVersion": "1.4.0",
   "description": "Sync vault to Synx-Sync Workers with multi-version history and rollback.",
   "author": "Synx",
