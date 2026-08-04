@@ -110,6 +110,7 @@ export class SynxSettingTab extends PluginSettingTab {
         this.showError('拉取图库列表失败', error);
       }
     });
+    new Setting(container).setName('检查未使用图片').setDesc('扫描当前 Vault 引用；仅报告超过 30 天的疑似未使用图片，不会自动删除').addButton((button) => button.setButtonText('开始扫描').onClick(async () => this.plugin.scanUnusedImages()));
   }
 
   /** 备份存储多选：主存储同步完成后，本地内容以仅 push 方式镜像到这些存储 */

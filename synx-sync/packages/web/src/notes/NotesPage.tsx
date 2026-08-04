@@ -9,13 +9,24 @@ import { markdown } from '@codemirror/lang-markdown';
 import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Edit3, FileText, Folder, History, LogOut, Menu, MoreHorizontal, Plus, Save, Search, Settings, Trash2 } from 'lucide-react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import type { FileMeta, RepoFileHistoryResponse, RepositoryHead } from '@synx/shared';
-import { authApi, notesApi } from '../api/queries';
+import { authApi, galleryApi, notesApi } from '../api/queries';
 import { ApiError } from '../api/client';
 import { useAuth } from '../auth/AuthProvider';
 import { Dialog } from '../components/Dialog';
 import { buildLineDiff, DiffTooLargeError, type DiffLine } from './lineDiff';
 
 const md = new MarkdownIt({ html: true, linkify: true, breaks: true }).use(taskLists, { enabled: true, label: true }).use(wikilinksPlugin);
+const defaultImageRenderer = md.renderer.rules.image;
+md.renderer.rules.image = (tokens, index, options, env, self) => {
+  const token = tokens[index];
+  const srcIndex = token.attrIndex('src');
+  const src = srcIndex >= 0 ? token.attrs?.[srcIndex]?.[1] ?? '' : '';
+  if (src.startsWith('synx-image://')) {
+    token.attrSet('data-synx-image', src);
+    token.attrSet('src', '');
+  }
+  return defaultImageRenderer ? defaultImageRenderer(tokens, index, options, env, self) : self.renderToken(tokens, index, options);
+};
 
 /** Obsidian 双向链接/嵌入：[[笔记名]]、[[笔记名|显示文本]]、![[文件]]。
  *  渲染为带 data-wikilink 的链接，点击由 NotesPage 事件委托解析并打开对应笔记。 */
@@ -114,6 +125,30 @@ export function NotesPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const previewRef = useRef<HTMLElement>(null);
+  const previewObjectUrls = useRef<string[]>([]);
+
+  const previewHtml = useMemo(() => DOMPurify.sanitize(md.render(text)), [text]);
+  useEffect(() => {
+    const element = previewRef.current;
+    for (const url of previewObjectUrls.current) URL.revokeObjectURL(url);
+    previewObjectUrls.current = [];
+    if (!element || editing) return;
+    let cancelled = false;
+    void Promise.all(Array.from(element.querySelectorAll('img')).map(async image => {
+      const source = image.getAttribute('data-synx-image') ?? '';
+      if (!source.startsWith('synx-image://')) return;
+      try {
+        const url = new URL(source);
+        const blob = await galleryApi.readImage(decodeURIComponent(url.hostname), url.pathname.slice(1).split('/').map(decodeURIComponent).join('/'));
+        if (cancelled) return;
+        const objectUrl = URL.createObjectURL(blob);
+        previewObjectUrls.current.push(objectUrl);
+        image.src = objectUrl;
+      } catch { image.alt = 'Synx 私有图片加载失败'; image.removeAttribute('src'); }
+    }));
+    return () => { cancelled = true; };
+  }, [previewHtml, editing]);
 
   const files = useMemo(() => (filesQuery.data?.files ?? []).filter(file => isMarkdown(file.path)), [filesQuery.data]);
   // vault 根目录下的独立笔记（路径不含斜杠）
@@ -197,7 +232,7 @@ export function NotesPage() {
       <div className="sidebar-account"><span className="avatar">{user?.username[0].toUpperCase()}</span><span className="sidebar-username">{user?.username}</span><div className="sidebar-account-actions"><button className="sidebar-account-action" aria-label="设置" title="设置" onClick={() => navigate('/settings')}><Settings size={19} /></button><button className="sidebar-account-action logout" aria-label="退出" title="退出" onClick={() => { logout(); navigate('/login'); }}><LogOut size={19} /></button></div></div>
     </aside>
     <section className="note-list-pane"><header className="list-toolbar"><button className="menu-button" aria-label="打开导航" onClick={() => setNavOpen(true)}><Menu size={18} /></button><label className="search-box"><Search size={15} /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索笔记" /></label></header><div className="list-heading"><strong>{folder || '全部笔记'}</strong><span>{visible.length} 篇</span></div><ul className="note-list">{filesQuery.isLoading ? <li className="list-state">正在载入远程笔记…</li> : visible.length ? visible.map(file => <li key={`${file.path}:${file.versionId}`}><button className={current?.path === file.path ? 'note-item active' : 'note-item'} onClick={() => openNote(file)}><FileText size={15} /><span className="note-copy"><strong>{displayName(file.path)}</strong><small>{file.path}</small><span><time>{new Date(file.mtime).toLocaleDateString()}</time><small>{formatSize(file.size)}</small></span></span></button></li>) : <li className="list-state">这里还没有笔记</li>}</ul></section>
-    <main className="editor-pane">{current ? <><header className="editor-header"><button className="mobile-back" onClick={() => { setMobileEditor(false); setOpenPath(null); }}><ArrowLeft size={18} /></button><div className="document-title"><strong>{displayName(current.path)}</strong><span className={dirty ? 'dirty' : ''}>{dirty ? '未保存' : status || '已保存'}</span></div><div className="document-actions"><button onClick={() => setEditing(value => !value)}><Edit3 size={15} />{editing ? '预览' : '编辑'}</button><button onClick={save} disabled={!dirty}><Save size={15} />保存</button><button onClick={() => setHistoryOpen(true)}><History size={15} />历史</button><DropdownMenu.Root><DropdownMenu.Trigger asChild><button aria-label="更多操作"><MoreHorizontal size={18} /></button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="dropdown-content" align="end"><DropdownMenu.Item onSelect={() => setRenameOpen(true)}>重命名</DropdownMenu.Item><DropdownMenu.Item className="danger-text" onSelect={() => setDeleteOpen(true)}>删除</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root></div></header><div className="format-toolbar"><button onClick={() => setEditing(true)}>正文</button><span />Markdown 笔记<span />{current.path}</div><section className="editor-content">{editing ? <MarkdownEditor value={text} onChange={value => { setText(value); setDirty(true); setStatus('未保存'); }} /> : <article className="markdown-body" onClick={onWikiLinkClick} dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(md.render(text)) }} />}</section></> : <div className="editor-empty"><FileText size={42} /><h2>选择一篇笔记</h2><p>从左侧列表打开笔记，或新建一篇 Markdown 笔记。</p></div>}</main>
+    <main className="editor-pane">{current ? <><header className="editor-header"><button className="mobile-back" onClick={() => { setMobileEditor(false); setOpenPath(null); }}><ArrowLeft size={18} /></button><div className="document-title"><strong>{displayName(current.path)}</strong><span className={dirty ? 'dirty' : ''}>{dirty ? '未保存' : status || '已保存'}</span></div><div className="document-actions"><button onClick={() => setEditing(value => !value)}><Edit3 size={15} />{editing ? '预览' : '编辑'}</button><button onClick={save} disabled={!dirty}><Save size={15} />保存</button><button onClick={() => setHistoryOpen(true)}><History size={15} />历史</button><DropdownMenu.Root><DropdownMenu.Trigger asChild><button aria-label="更多操作"><MoreHorizontal size={18} /></button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="dropdown-content" align="end"><DropdownMenu.Item onSelect={() => setRenameOpen(true)}>重命名</DropdownMenu.Item><DropdownMenu.Item className="danger-text" onSelect={() => setDeleteOpen(true)}>删除</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root></div></header><div className="format-toolbar"><button onClick={() => setEditing(true)}>正文</button><span />Markdown 笔记<span />{current.path}</div><section className="editor-content">{editing ? <MarkdownEditor value={text} onChange={value => { setText(value); setDirty(true); setStatus('未保存'); }} /> : <article ref={previewRef} className="markdown-body" onClick={onWikiLinkClick} dangerouslySetInnerHTML={{ __html: previewHtml }} />}</section></> : <div className="editor-empty"><FileText size={42} /><h2>选择一篇笔记</h2><p>从左侧列表打开笔记，或新建一篇 Markdown 笔记。</p></div>}</main>
     <PathDialog open={createOpen} title="新建笔记" initial={folder ? `${folder}/未命名.md` : '未命名.md'} onClose={() => setCreateOpen(false)} onSubmit={create} />
     <PathDialog open={renameOpen} title="重命名笔记" initial={current?.path ?? ''} onClose={() => setRenameOpen(false)} onSubmit={rename} />
     <Dialog open={deleteOpen} onOpenChange={setDeleteOpen} title="删除笔记"><p>删除“{current?.path}”？历史版本会保留，可以从版本记录恢复。</p><div className="dialog-actions"><button onClick={() => setDeleteOpen(false)}>取消</button><button className="danger-button" onClick={remove}><Trash2 size={15} />删除</button></div></Dialog>

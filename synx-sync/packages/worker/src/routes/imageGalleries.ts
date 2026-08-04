@@ -2,7 +2,7 @@ import { Hono, type Context } from 'hono';
 import type { GitHubGalleryConfig, ImageGallery, SaveImageGalleryRequest } from '@synx/shared';
 import { authMiddleware } from '../middleware/auth.js';
 import { decryptString, encryptString } from '../auth/crypto.js';
-import { checkGitHubGallery, GitHubGalleryError, readGitHubImage, uploadGitHubImage } from '../services/githubGallery.js';
+import { checkGitHubGallery, deleteGitHubGalleryFile, GitHubGalleryError, listGitHubGalleryFiles, readGitHubImage, uploadGitHubImage } from '../services/githubGallery.js';
 import type { AppVars, Env } from '../types.js';
 
 interface GalleryRow {
@@ -170,6 +170,39 @@ imageGalleries.post('/:id/images', async (c) => {
   } catch (err) {
     return githubError(c, err);
   }
+});
+
+imageGalleries.post('/:id/orphans/scan', async (c) => {
+  const gallery = await loadOwnedGallery(c, c.req.param('id'));
+  if (!gallery) return c.json({ error: '图库不存在', code: 'GALLERY_NOT_FOUND' }, 404);
+  const body = await c.req.json<{ referencedPaths?: string[] }>();
+  const referenced = new Set(body.referencedPaths ?? []);
+  try {
+    const files = await listGitHubGalleryFiles(gallery.config);
+    const protectedAfter = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const images = files.flatMap((file) => {
+      const match = file.path.match(/\/(\d{4})\/(\d{2})\/([0-9a-f-]+)\.(png|jpg|gif|webp|svg|avif)$/i);
+      if (!match || referenced.has(file.path)) return [];
+      const uploadedAt = Date.UTC(Number(match[1]), Number(match[2]) - 1, 1);
+      return uploadedAt >= protectedAfter ? [] : [{ ...file, uploadedAt }];
+    });
+    return c.json({ images });
+  } catch (err) { return githubError(c, err); }
+});
+
+imageGalleries.post('/:id/orphans/delete', async (c) => {
+  const gallery = await loadOwnedGallery(c, c.req.param('id'));
+  if (!gallery) return c.json({ error: '图库不存在', code: 'GALLERY_NOT_FOUND' }, 404);
+  const body = await c.req.json<{ images?: Array<{ path: string; sha: string }> }>();
+  try {
+    const latest = new Map((await listGitHubGalleryFiles(gallery.config)).map((file) => [file.path, file]));
+    for (const image of body.images ?? []) {
+      const synxPath = image.path.match(/\/(\d{4})\/(\d{2})\/([0-9a-f-]+)\.(png|jpg|gif|webp|svg|avif)$/i);
+      if (!image.path.startsWith(`${gallery.config.folder}/`) || !synxPath || latest.get(image.path)?.sha !== image.sha) return c.json({ error: '图片已变化，请重新扫描', code: 'IMAGE_CHANGED' }, 409);
+    }
+    for (const image of body.images ?? []) await deleteGitHubGalleryFile(gallery.config, image.path, image.sha);
+    return c.json({ deleted: (body.images ?? []).map((image) => image.path) });
+  } catch (err) { return githubError(c, err); }
 });
 
 imageGalleries.get('/:id/images/content', async (c) => {

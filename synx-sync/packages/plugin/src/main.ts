@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { MarkdownView, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
 import type { RepoChange, RepoFile } from '@synx/shared';
@@ -20,6 +20,9 @@ import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient, WorkerApiError } from './workerClient.js';
 import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
+import { uploadImageWithRetry } from './imageUpload.js';
+import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
+import { parsePrivateImageUrl } from './privateImage.js';
 
 interface PersistedPluginData {
   /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
@@ -40,6 +43,7 @@ interface SynxStateData {
   pendingDeletions?: readonly PendingDeletion[];
   knownRemoteFiles?: readonly { storageId: string; syncFolder: string; path: string; fileUuid?: string }[];
   prevSync?: PrevSyncState;
+  pendingImageUploads?: readonly PendingImageUpload[];
 }
 
 function isPersistedData(raw: unknown): raw is PersistedPluginData {
@@ -87,7 +91,9 @@ export default class SynxSyncPlugin extends Plugin {
   private pendingDeletions: PendingDeletion[] = [];
   private knownRemoteFiles: { storageId: string; syncFolder: string; path: string; fileUuid?: string }[] = [];
   private prevSync: PrevSyncState | null = null;
+  private pendingImageUploads: PendingImageUpload[] = [];
   private internalDeletes = new Set<string>();
+  private privateImageObjectUrls = new Set<string>();
 
   // Git 式仓库同步状态（本次同步内累积，runSync 结束/失败时清理）
   private repoUploads = new Map<string, RepoUploadedFile>();
@@ -113,11 +119,17 @@ export default class SynxSyncPlugin extends Plugin {
     this.registerView(SYNC_DETAILS_VIEW_TYPE, (leaf) => new SyncDetailsView(leaf, this));
     this.registerEditorExtension(this.uuidEditorExtensions);
     this.updateUuidEditorExtension();
+    this.registerMarkdownPostProcessor((element) => void this.renderPrivateImages(element));
     this.ribbonIcon = this.addRibbonIcon('refresh-cw', 'Synx 同步', () => void this.triggerSync());
     this.addCommand({ id: 'synx-sync-now', name: '立即同步', icon: 'refresh-cw', callback: () => void this.triggerSync() });
     this.addCommand({ id: 'synx-open-history', name: '打开版本历史', icon: 'history', callback: () => void this.activateHistoryPane() });
     this.addCommand({ id: 'synx-open-sync-details', name: '打开同步详情', icon: 'activity', callback: () => void this.activateSyncDetails() });
-    this.app.workspace.onLayoutReady(() => void this.ensureHistoryPane());
+    this.registerDomEvent(document, 'paste', (event) => void this.handleImagePaste(event), true);
+    this.registerDomEvent(document, 'drop', (event) => void this.handleImageDrop(event), true);
+    this.app.workspace.onLayoutReady(() => {
+      void this.ensureHistoryPane();
+      void this.retryPendingImageUploads();
+    });
     for (const event of ['modify', 'create', 'rename'] as const) {
       this.registerEvent(this.app.vault.on(event as 'rename', (file) => {
         // 诊断日志写入 vault 根目录会触发 modify/create 事件，
@@ -152,6 +164,133 @@ export default class SynxSyncPlugin extends Plugin {
 
   onunload(): void {
     this.scheduler?.dispose();
+    for (const url of this.privateImageObjectUrls) URL.revokeObjectURL(url);
+    this.privateImageObjectUrls.clear();
+  }
+
+  private async renderPrivateImages(element: HTMLElement): Promise<void> {
+    if (!this.client) return;
+    for (const image of Array.from(element.querySelectorAll('img'))) {
+      const reference = parsePrivateImageUrl(image.getAttribute('src') ?? '');
+      if (!reference) continue;
+      try {
+        const blob = await this.client.readGalleryImage(reference.galleryId, reference.path);
+        const objectUrl = URL.createObjectURL(blob);
+        this.privateImageObjectUrls.add(objectUrl);
+        image.src = objectUrl;
+      } catch {
+        image.alt = 'Synx 私有图片加载失败，请确认已登录且图库仍有效';
+        image.removeAttribute('src');
+      }
+    }
+  }
+
+  private imageUploadReady(): boolean {
+    return Boolean(this.settings.imageHostingEnabled && this.settings.imageGalleryId && this.settings.jwt && this.client);
+  }
+
+  private async handleImagePaste(event: ClipboardEvent): Promise<void> {
+    if (!this.imageUploadReady()) return;
+    const file = Array.from(event.clipboardData?.files ?? []).find((item) => item.type.startsWith('image/'));
+    if (!file) return;
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) return;
+    event.preventDefault();
+    event.stopPropagation();
+    await this.uploadImageIntoEditor(file, view);
+  }
+
+  private async handleImageDrop(event: DragEvent): Promise<void> {
+    if (!this.imageUploadReady()) return;
+    const file = Array.from(event.dataTransfer?.files ?? []).find((item) => item.type.startsWith('image/'));
+    if (!file) return;
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) return;
+    event.preventDefault();
+    event.stopPropagation();
+    await this.uploadImageIntoEditor(file, view);
+  }
+
+  private async uploadImageIntoEditor(file: File, view: MarkdownView): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    const placeholder = `![上传中](synx-uploading://${crypto.randomUUID()})`;
+    view.editor.replaceSelection(placeholder);
+    try {
+      const bytes = await file.arrayBuffer();
+      const image = await uploadImageWithRetry(() => client.uploadGalleryImage(this.settings.imageGalleryId, bytes, file.type));
+      this.replaceEditorText(view, placeholder, `![](${image.markdownUrl})`);
+    } catch (error) {
+      await this.saveFailedImageLocally(file, view, placeholder, error);
+    }
+  }
+
+  private async saveFailedImageLocally(file: File, view: MarkdownView, placeholder: string, error: unknown): Promise<void> {
+    const note = view.file;
+    if (!note) {
+      this.replaceEditorText(view, placeholder, '');
+      new Notice('图片上传失败，当前笔记尚未保存，无法暂存本地', 10000);
+      return;
+    }
+    const attachmentPath = await this.app.fileManager.getAvailablePathForAttachment(file.name || `image-${Date.now()}.png`, note.path);
+    await this.app.vault.createBinary(attachmentPath, await file.arrayBuffer());
+    const attachment = this.app.vault.getAbstractFileByPath(attachmentPath);
+    if (!(attachment instanceof TFile)) throw new Error('本地附件保存失败');
+    const embed = this.app.fileManager.generateMarkdownLink(attachment, note.path);
+    if (!this.replaceEditorText(view, placeholder, embed)) return;
+    const item: PendingImageUpload = { id: crypto.randomUUID(), localPath: attachmentPath, notePath: note.path, originalEmbed: embed, galleryId: this.settings.imageGalleryId, mimeType: file.type, createdAt: Date.now(), startupAttempts: 0, lastError: error instanceof Error ? error.message : String(error) };
+    const key = pendingUploadKey(item.localPath, item.notePath);
+    this.pendingImageUploads = [...this.pendingImageUploads.filter((entry) => pendingUploadKey(entry.localPath, entry.notePath) !== key), item];
+    await this.persistState();
+    new Notice('图片上传失败，已暂存本地，将在下次启动重试', 10000);
+  }
+
+  private async retryPendingImageUploads(): Promise<void> {
+    if (!this.client || !this.settings.jwt || this.pendingImageUploads.length === 0) return;
+    let changed = false;
+    for (const item of [...this.pendingImageUploads]) {
+      const local = this.app.vault.getAbstractFileByPath(item.localPath);
+      const note = this.app.vault.getAbstractFileByPath(item.notePath);
+      if (!(local instanceof TFile) || !(note instanceof TFile)) continue;
+      try {
+        const bytes = await this.app.vault.readBinary(local);
+        const image = await uploadImageWithRetry(() => this.client!.uploadGalleryImage(item.galleryId, bytes, item.mimeType));
+        const content = await this.app.vault.read(note);
+        const updated = replaceExactEmbed(content, item.originalEmbed, `![](${image.markdownUrl})`);
+        if (updated === null) continue;
+        await this.app.vault.modify(note, updated);
+        const referencedElsewhere = await this.localImageReferenced(item.localPath, note.path);
+        if (!referencedElsewhere) await this.app.vault.delete(local);
+        this.pendingImageUploads = this.pendingImageUploads.filter((entry) => entry.id !== item.id);
+        changed = true;
+      } catch (error) {
+        item.startupAttempts += 1;
+        item.lastError = error instanceof Error ? error.message : String(error);
+        changed = true;
+        new Notice(`暂存图片重传失败：${item.localPath}，请在设置中检查图库`, 10000);
+      }
+    }
+    if (changed) await this.persistState();
+  }
+
+  private async localImageReferenced(localPath: string, replacedNotePath: string): Promise<boolean> {
+    const fileName = localPath.split('/').pop() ?? localPath;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path === replacedNotePath) continue;
+      const content = await this.app.vault.cachedRead(file);
+      if (content.includes(localPath) || content.includes(fileName)) return true;
+    }
+    return false;
+  }
+
+  private replaceEditorText(view: MarkdownView, search: string, replacement: string): boolean {
+    const value = view.editor.getValue();
+    const offset = value.indexOf(search);
+    if (offset < 0) return false;
+    const from = view.editor.offsetToPos(offset);
+    const to = view.editor.offsetToPos(offset + search.length);
+    view.editor.replaceRange(replacement, from, to);
+    return true;
   }
 
   async loadSettings(): Promise<void> {
@@ -172,6 +311,7 @@ export default class SynxSyncPlugin extends Plugin {
     this.pendingDeletions = [...(state.pendingDeletions ?? [])];
     this.knownRemoteFiles = [...(state.knownRemoteFiles ?? [])];
     this.prevSync = state.prevSync ?? null;
+    this.pendingImageUploads = [...(state.pendingImageUploads ?? [])];
   }
 
   private async loadState(): Promise<SynxStateData> {
@@ -184,6 +324,7 @@ export default class SynxSyncPlugin extends Plugin {
         pendingDeletions: raw.pendingDeletions ?? [],
         knownRemoteFiles: raw.knownRemoteFiles ?? [],
         prevSync: raw.prevSync,
+        pendingImageUploads: raw.pendingImageUploads ?? [],
       };
     } catch { /* 文件不存在或解析失败，返回空状态 */ }
     return { reports: [], pendingDeletions: [], knownRemoteFiles: [] };
@@ -213,6 +354,20 @@ export default class SynxSyncPlugin extends Plugin {
 
   getWorkerClient(): WorkerClient | null {
     return this.client;
+  }
+
+  async scanUnusedImages(): Promise<void> {
+    if (!this.client || !this.settings.imageGalleryId) {
+      new Notice('请先选择默认图库');
+      return;
+    }
+    const referenced = new Set<string>();
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const content = await this.app.vault.cachedRead(file);
+      for (const path of collectReferencedImagePaths(content, this.settings.imageGalleryId)) referenced.add(path);
+    }
+    const images = await this.client.scanGalleryOrphans(this.settings.imageGalleryId, [...referenced]);
+    new Notice(images.length ? `发现 ${images.length} 张疑似未使用图片。请前往 Synx 网页后台确认删除。` : '未发现超过 30 天的疑似未使用图片', 10000);
   }
 
   async getFileUuid(path: string): Promise<string | undefined> {
@@ -1182,6 +1337,7 @@ export default class SynxSyncPlugin extends Plugin {
       pendingDeletions: this.pendingDeletions,
       knownRemoteFiles: this.knownRemoteFiles,
       prevSync: this.prevSync ?? undefined,
+      pendingImageUploads: this.pendingImageUploads,
     };
     try {
       await this.app.vault.adapter.write(STATE_FILE, JSON.stringify(state));

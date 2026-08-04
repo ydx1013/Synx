@@ -19,6 +19,7 @@ import {
   type ImageGallery,
   type ImageGalleryListResponse,
   type ImageUploadResponse,
+  type OrphanScanResponse,
 } from '@synx/shared';
 
 /**
@@ -203,8 +204,19 @@ export class WorkerClient {
 
   async uploadGalleryImage(galleryId: string, content: ArrayBuffer | Uint8Array, mimeType: string): Promise<ImageUploadResponse['image']> {
     const path = API.imageGalleryImages.replace(':id', encodeURIComponent(galleryId));
-    const res = await this.requestResponse('POST', path, content, true, mimeType);
+    const res = await this.requestResponse('POST', path, content, true, mimeType, 0);
     return ((await res.json()) as ImageUploadResponse).image;
+  }
+
+  async readGalleryImage(galleryId: string, path: string): Promise<Blob> {
+    const endpoint = API.imageGalleryContent.replace(':id', encodeURIComponent(galleryId));
+    const res = await this.requestResponse('GET', `${endpoint}?path=${encodeURIComponent(path)}`);
+    return res.blob();
+  }
+
+  async scanGalleryOrphans(galleryId: string, referencedPaths: string[]): Promise<OrphanScanResponse['images']> {
+    const endpoint = API.imageGalleryOrphanScan.replace(':id', encodeURIComponent(galleryId));
+    return (await this.request<OrphanScanResponse>('POST', endpoint, { referencedPaths })).images;
   }
 
   /** 读取当前 storage 的保留策略（未配置时返回服务端默认） */
@@ -233,13 +245,13 @@ export class WorkerClient {
    * @param body 普通对象（JSON）或 ArrayBuffer/Uint8Array（二进制直传）
    * @param isBinary body 为二进制时置 true（Content-Type 用 octet-stream）
    */
-  private async requestResponse(method: string, path: string, body?: unknown, isBinary = false, binaryContentType = 'application/octet-stream'): Promise<Response> {
+  private async requestResponse(method: string, path: string, body?: unknown, isBinary = false, binaryContentType = 'application/octet-stream', maxRetries = this.maxRetries): Promise<Response> {
     let lastErr: unknown;
     const url = joinUrl(this.opts.serverUrl, path);
     const isUpload = method === 'POST' && body !== undefined;
     // 大文件上传给 120s，其他请求 30s
     const timeoutMs = isUpload ? 120_000 : 30_000;
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       const startedAt = Date.now();
@@ -264,7 +276,7 @@ export class WorkerClient {
           const errBody = await safeErrorText(res);
           throw new WorkerApiError(413, errBody || 'file too large', attempt + 1);
         }
-        if (res.status >= 500 && attempt < this.maxRetries) {
+        if (res.status >= 500 && attempt < maxRetries) {
           // 5xx：指数退避重试
           const backoff = 500 * Math.pow(2, attempt);
           console.warn('synx 5xx retry', { status: res.status, attempt: attempt + 1, elapsedMs: elapsed, backoffMs: backoff });
@@ -295,7 +307,7 @@ export class WorkerClient {
         } else {
           lastErr = e;
         }
-        if (attempt < this.maxRetries) {
+        if (attempt < maxRetries) {
           // 退避：500ms, 1000ms, 2000ms（给间歇性 503 足够恢复时间）
           const backoff = 500 * Math.pow(2, attempt);
           console.warn('synx retry backoff', { attempt: attempt + 1, backoffMs: backoff });

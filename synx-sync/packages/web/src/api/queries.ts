@@ -38,6 +38,12 @@ export const galleryApi = {
   save: (id: string | undefined, body: SaveImageGalleryRequest) => api<ImageGalleryResponse>(id ? `/api/image-galleries/${encodeURIComponent(id)}` : '/api/image-galleries', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) }),
   test: (body: SaveImageGalleryRequest) => api<{ isPrivate: boolean }>('/api/image-galleries/test', { method: 'POST', body: JSON.stringify(body) }),
   remove: (id: string) => api<{ ok: true; remoteImagesPreserved: true }>(`/api/image-galleries/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  readImage: async (id: string, path: string) => {
+    const token = window.localStorage.getItem('synx-token');
+    const response = await fetch(`/api/image-galleries/${encodeURIComponent(id)}/images/content?path=${encodeURIComponent(path)}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!response.ok) throw new ApiError(response.status, '私有图片加载失败');
+    return response.blob();
+  },
 };
 
 export const tokenApi = {

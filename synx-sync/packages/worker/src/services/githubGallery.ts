@@ -87,3 +87,23 @@ export async function readGitHubImage(config: GitHubGalleryConfig, path: string)
     headers: { Accept: 'application/vnd.github.raw+json' },
   });
 }
+
+export interface GitHubGalleryFile {
+  path: string;
+  sha: string;
+  size: number;
+}
+
+export async function listGitHubGalleryFiles(config: GitHubGalleryConfig): Promise<GitHubGalleryFile[]> {
+  const response = await githubFetch(`${repoBase(config)}/git/trees/${encodeURIComponent(config.branch)}?recursive=1`, config.token);
+  const result = await response.json() as { tree?: Array<{ path: string; type: string; sha: string; size?: number }> };
+  return (result.tree ?? []).filter((entry) => entry.type === 'blob' && entry.path.startsWith(`${config.folder}/`)).map((entry) => ({ path: entry.path, sha: entry.sha, size: entry.size ?? 0 }));
+}
+
+export async function deleteGitHubGalleryFile(config: GitHubGalleryConfig, path: string, sha: string): Promise<void> {
+  await githubFetch(`${repoBase(config)}/contents/${encodePath(path)}`, config.token, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Remove unused image ${path.split('/').pop() ?? 'image'}`, sha, branch: config.branch }),
+  });
+}
