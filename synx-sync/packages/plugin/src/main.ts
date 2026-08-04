@@ -94,7 +94,6 @@ export default class SynxSyncPlugin extends Plugin {
   private prevSync: PrevSyncState | null = null;
   private pendingImageUploads: PendingImageUpload[] = [];
   private internalDeletes = new Set<string>();
-  private privateImageObjectUrls = new Set<string>();
 
   // Git 式仓库同步状态（本次同步内累积，runSync 结束/失败时清理）
   private repoUploads = new Map<string, RepoUploadedFile>();
@@ -119,9 +118,8 @@ export default class SynxSyncPlugin extends Plugin {
     this.registerView(HISTORY_VIEW_TYPE, (leaf) => new HistoryPaneView(leaf, this));
     this.registerView(SYNC_DETAILS_VIEW_TYPE, (leaf) => new SyncDetailsView(leaf, this));
     this.registerEditorExtension(this.uuidEditorExtensions);
-    this.registerEditorExtension(privateImageEditorExtension(async (galleryId, path) => {
-      if (!this.client) throw new Error('Synx 尚未登录');
-      return this.client.readGalleryImage(galleryId, path);
+    this.registerEditorExtension(privateImageEditorExtension((galleryId, path) => {
+      return this.resolvePrivateImageUrl(galleryId, path);
     }));
     this.updateUuidEditorExtension();
     this.registerMarkdownPostProcessor((element) => void this.renderPrivateImages(element));
@@ -169,24 +167,34 @@ export default class SynxSyncPlugin extends Plugin {
 
   onunload(): void {
     this.scheduler?.dispose();
-    for (const url of this.privateImageObjectUrls) URL.revokeObjectURL(url);
-    this.privateImageObjectUrls.clear();
   }
 
-  private async renderPrivateImages(element: HTMLElement): Promise<void> {
-    if (!this.client) return;
-    for (const image of Array.from(element.querySelectorAll('img'))) {
-      const reference = parsePrivateImageUrl(image.getAttribute('src') ?? '');
+  /** 把 synx-image://galleryId/path 转换为带 token 的 HTTPS URL，让 Obsidian 直接渲染 <img src> */
+  private resolvePrivateImageUrl(galleryId: string, path: string): string {
+    const base = this.settings.serverUrl.replace(/\/+$/, '');
+    const endpoint = `/api/image-galleries/${encodeURIComponent(galleryId)}/images/content`;
+    const params = new URLSearchParams({ path, token: this.settings.jwt });
+    return `${base}${endpoint}?${params.toString()}`;
+  }
+
+  private renderPrivateImages(element: HTMLElement): void {
+    if (!this.settings.jwt) return;
+    // 处理 img 标签（Obsidian 可能保留 synx-image:// src）
+    for (const img of Array.from(element.querySelectorAll('img'))) {
+      const src = img.getAttribute('src') ?? '';
+      const reference = parsePrivateImageUrl(src);
       if (!reference) continue;
-      try {
-        const blob = await this.client.readGalleryImage(reference.galleryId, reference.path);
-        const objectUrl = URL.createObjectURL(blob);
-        this.privateImageObjectUrls.add(objectUrl);
-        image.src = objectUrl;
-      } catch {
-        image.alt = 'Synx 私有图片加载失败，请确认已登录且图库仍有效';
-        image.removeAttribute('src');
-      }
+      img.src = this.resolvePrivateImageUrl(reference.galleryId, reference.path);
+    }
+    // 处理 a 标签（Obsidian sanitizer 可能把它解析为链接）
+    for (const link of Array.from(element.querySelectorAll('a'))) {
+      const href = link.getAttribute('href') ?? '';
+      const reference = parsePrivateImageUrl(href);
+      if (!reference) continue;
+      const img = document.createElement('img');
+      img.src = this.resolvePrivateImageUrl(reference.galleryId, reference.path);
+      img.alt = link.textContent ?? '';
+      link.replaceWith(img);
     }
   }
 
