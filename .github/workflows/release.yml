@@ -43,22 +43,6 @@ jobs:
             echo "trigger=main" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bump manifest version and auto tag patch release
-        if: steps.version.outputs.trigger == 'main'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 把计算出的新版本写回仓库 manifest.json，保持仓库与发布版本一致。
-          # 用 GITHUB_TOKEN 提交/push 不会递归触发本工作流，无需手动二次推送。
-          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' \
-            synx-sync/packages/plugin/manifest.json > /tmp/manifest.json
-          mv /tmp/manifest.json synx-sync/packages/plugin/manifest.json
-          git add synx-sync/packages/plugin/manifest.json
-          git commit -m "chore(plugin): bump manifest version to ${{ steps.version.outputs.version }}"
-          git push origin main
-          git tag "${{ steps.version.outputs.release_tag }}"
-          git push origin "${{ steps.version.outputs.release_tag }}"
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -70,9 +54,36 @@ jobs:
         working-directory: synx-sync
         run: npm ci
 
-      - name: Build plugin
-        working-directory: synx-sync/packages/plugin
+      - name: Type check
+        working-directory: synx-sync
+        run: npm run typecheck
+
+      - name: Unit tests
+        working-directory: synx-sync
+        run: npm test
+
+      - name: Audit production dependencies
+        working-directory: synx-sync
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build all workspaces
+        working-directory: synx-sync
         run: npm run build
+
+      - name: Bump manifest version and auto tag patch release
+        if: steps.version.outputs.trigger == 'main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 质量门禁全部通过后才写回版本、提交并打 tag。
+          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' \
+            synx-sync/packages/plugin/manifest.json > /tmp/manifest.json
+          mv /tmp/manifest.json synx-sync/packages/plugin/manifest.json
+          git add synx-sync/packages/plugin/manifest.json
+          git commit -m "chore(plugin): bump manifest version to ${{ steps.version.outputs.version }}"
+          git push origin main
+          git tag "${{ steps.version.outputs.release_tag }}"
+          git push origin "${{ steps.version.outputs.release_tag }}"
 
       - name: Stage release files
         run: |

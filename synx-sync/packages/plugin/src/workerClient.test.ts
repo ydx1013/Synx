@@ -119,16 +119,21 @@ describe('uploadBlob', () => {
   });
 });
 
-describe('multipart upload', () => {
-  it('creates a session then uploads a part directly without Worker headers', async () => {
+describe('direct upload', () => {
+  it('requests a presigned URL then PUTs the whole file without Worker headers', async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(jsonRes({ blobId: 'my-vault/a.bin@id', uploadId: 'u1', partSize: 16, partCount: 1, uploadedParts: [] }, 201))
-      .mockResolvedValueOnce(new Response('', { status: 200, headers: { ETag: '"etag-1"' } }));
+      .mockResolvedValueOnce(jsonRes({ blobId: 'my-vault/a.bin@id', uploadUrl: 'https://storage.example.com/a?X-Amz-Signature=x', expiresIn: 900 }, 201))
+      .mockResolvedValueOnce(new Response('', { status: 200 }));
     const client = makeClient(fetchMock);
-    const session = await client.startMultipart({ path: 'a.bin', size: 5, hash: 'a'.repeat(64), mtime: 1 });
-    const etag = await client.uploadMultipartPart('https://storage.example.com/a?signature=x', new Uint8Array([1, 2]));
-    expect(session.uploadId).toBe('u1');
-    expect(etag).toBe('"etag-1"');
+    const session = await client.startDirectUpload({ path: 'a.bin', size: 5, hash: 'a'.repeat(64), mtime: 1 });
+    await client.uploadDirect(session.uploadUrl, new Uint8Array([1, 2]));
+    expect(session.blobId).toBe('my-vault/a.bin@id');
+    expect(session.uploadUrl).toContain('X-Amz-Signature');
+    expect(session.expiresIn).toBe(900);
+    const controlInit = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(controlInit.method).toBe('POST');
+    expect(fetchMock.mock.calls[0][0]).toContain('/direct-upload/start');
+    expect((controlInit.headers as Record<string, string>)['X-Storage-Id']).toBe(STORAGE_ID);
     const directInit = fetchMock.mock.calls[1][1] as RequestInit;
     expect(directInit.method).toBe('PUT');
     expect(directInit.headers).toBeUndefined();
@@ -217,6 +222,25 @@ describe('static methods', () => {
     expect(storages.length).toBe(1);
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer tok');
+  });
+});
+
+describe('image galleries', () => {
+  it('lists galleries with the current JWT', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ galleries: [{ id: 'g1', name: '图库' }] }));
+    const galleries = await WorkerClient.listImageGalleries(SERVER, JWT, fetchMock as unknown as typeof fetch);
+    expect(galleries[0].id).toBe('g1');
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({ Authorization: `Bearer ${JWT}` });
+  });
+
+  it('uploads an image using its MIME type', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ image: { galleryId: 'g1', path: 'images/a.png', visibility: 'public', markdownUrl: 'https://raw.example/a.png' } }, 201));
+    const client = makeClient(fetchMock, { maxRetries: 0 });
+    const result = await client.uploadGalleryImage('g1', new Uint8Array([1, 2]), 'image/png');
+    expect(result.markdownUrl).toBe('https://raw.example/a.png');
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('image/png');
   });
 });
 

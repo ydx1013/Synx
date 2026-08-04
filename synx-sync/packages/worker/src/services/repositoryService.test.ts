@@ -642,6 +642,220 @@ describe('gcRepository', () => {
     // 仅被淘汰提交引用的 a.md 旧版本可删（a1 由 gen2 引用）
     expect(fs.map.has(a1)).toBe(false);
   });
+
+  it('长链（>40 提交）可跨多次调用渐进收敛：链未遍历完时不删，到链尾才裁剪+清理', async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const base = Date.now();
+    const N = 65; // init(gen1) + gen2..gen65 = 65 个提交，超过默认单次遍历上限 40
+    const fs = new MemFs();
+    const { head: initHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const idOf = new Map<number, string>();
+    const commitOf = new Map<number, RepoCommit>();
+    const blobOf = new Map<number, string>();
+    idOf.set(1, initHead.commitId);
+    let head = initHead;
+    for (let gen = 2; gen <= N; gen++) {
+      const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `v${gen}`);
+      fs.putText(blob, `v${gen}`);
+      blobOf.set(gen, blob);
+      const { commit, head: nextHead } = await finalizeCommit({
+        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        baseCommitId: head.commitId, baseGeneration: head.generation,
+        now: base - (N - gen) * DAY, // gen65 最新，越旧越靠前
+        changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
+      });
+      idOf.set(gen, commit.commitId);
+      commitOf.set(gen, commit);
+      head = nextHead;
+    }
+    const policy = { maxFileSize: 0, hourlyWindowHours: 0, dailyWindowDays: 3, monthlyWindowMonths: 0, yearlyWindowYears: 0, maxVersionsPerFile: 0 };
+
+    // 首轮只扫 10 个提交：链未遍历完 → more=true 且不删任何对象（保守）
+    const first = await gcRepository({ fs, syncFolder: SYNC_FOLDER, maxCommits: 10, policy });
+    expect(first.more).toBe(true);
+    expect(first.deleted).toBe(0);
+    expect(first.deletedCommits).toBe(0);
+
+    // 持续以小步长调用（每轮 10 提交扫描 + 15 删除预算），直到 more=false 收敛
+    let result = first;
+    let totalDeletedCommits = 0;
+    let totalDeleted = 0;
+    let rounds = 0;
+    while (result.more && rounds < 30) {
+      result = await gcRepository({ fs, syncFolder: SYNC_FOLDER, maxCommits: 10, maxDeletes: 15, policy });
+      totalDeleted += result.deleted;
+      totalDeletedCommits += result.deletedCommits;
+      rounds++;
+    }
+    expect(result.more).toBe(false);
+    expect(rounds).toBeLessThan(30);
+
+    // 3 天窗口下长链确实被裁剪：>50 个提交被淘汰，边界 checkpoint（gen60）保留
+    expect(totalDeletedCommits).toBeGreaterThanOrEqual(50);
+    expect(totalDeleted).toBeGreaterThan(0);
+
+    const key = (id: string): string => `Vault/.synx/repo/commits/${id}.json`;
+    const ckey = (id: string): string => `Vault/.synx/repo/checkpoints/${id}.json`;
+    // HEAD 与边界提交（含其 checkpoint）保留；更旧提交淘汰
+    expect(fs.map.has(key(idOf.get(N)!))).toBe(true);
+    expect(fs.map.has(key(idOf.get(60)!))).toBe(true);
+    expect(fs.map.has(ckey(idOf.get(60)!))).toBe(true);
+    expect(fs.map.has(key(idOf.get(59)!))).toBe(false);
+    // 内容对象：边界提交引用的 v60 保留；仅被已淘汰提交引用的 v2 删除
+    expect(fs.map.has(blobOf.get(60)!)).toBe(true);
+    expect(fs.map.has(blobOf.get(2)!)).toBe(false);
+
+    // HEAD 不变，边界提交内容树仍可解析（checkpoint 对齐）
+    const headAfter = (await readHead(fs, SYNC_FOLDER))!;
+    expect(headAfter.commitId).toBe(idOf.get(N));
+    const tree = await resolveTree(fs, SYNC_FOLDER, commitOf.get(60)!);
+    expect(tree.get('a.md')?.blobId).toBe(blobOf.get(60)!);
+  });
+
+  it('GC 进行中 HEAD 被推进时补扫新提交并续扫，不误删新提交引用的对象', async () => {
+    const fs = await createRepoWithFiles([{ path: 'a.md', fileUuid: 'uuid-a', versionId: 'v1', content: 'v1', mtime: 1000 }]);
+    let head = (await readHead(fs, SYNC_FOLDER))!;
+    for (let gen = 2; gen <= 5; gen++) {
+      const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `v${gen}`);
+      fs.putText(blob, `v${gen}`);
+      ({ head } = await finalizeCommit({
+        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        baseCommitId: head.commitId, baseGeneration: head.generation,
+        changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
+      }));
+    }
+
+    // 两轮小步扫描建立进度（head=gen5，cursor 停在旧链中间）
+    let r = await gcRepository({ fs, syncFolder: SYNC_FOLDER, maxCommits: 1 });
+    expect(r.more).toBe(true);
+    r = await gcRepository({ fs, syncFolder: SYNC_FOLDER, maxCommits: 1 });
+    expect(r.more).toBe(true);
+    // 进度已持久化（否则 HEAD 推进时无从丢弃，长链也永远无法续扫）
+    expect(fs.map.has('Vault/.synx/gc-state.json')).toBe(true);
+
+    // 另一设备推进 HEAD → 新增 gen6（引用新 blob v6）
+    const v6 = makeStorageKey(SYNC_FOLDER, 'a.md', 'v6');
+    fs.putText(v6, 'v6');
+    const { commit: gen6Commit, head: gen6Head } = await finalizeCommit({
+      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: v6, hash: 'h6', size: 2, mtime: 6000 }],
+    });
+
+    // 旧进度基于 gen5 → HEAD 推进后应把 gen6 补扫进进度头部（而非丢弃重扫），
+    // 否则长链在多次同步之间永远无法推进到链尾
+    r = await gcRepository({ fs, syncFolder: SYNC_FOLDER, maxCommits: 1 });
+    expect(r.more).toBe(true); // 链仍未遍历完
+    const stateAfter = JSON.parse(await fs.getText('Vault/.synx/gc-state.json'));
+    expect(stateAfter.head).toBe(gen6Head.commitId);
+    // 补扫合并：进度含 gen6 + 旧进度(gen5/gen4)；若是丢弃重扫则只有 gen6 一条
+    expect(stateAfter.commits.length).toBeGreaterThanOrEqual(2);
+    expect(stateAfter.commits[0].id).toBe(gen6Commit.commitId);
+
+    let result = r;
+    let guard = 0;
+    while (result.more && guard++ < 10) {
+      result = await gcRepository({ fs, syncFolder: SYNC_FOLDER });
+    }
+    expect(result.more).toBe(false);
+    // 新提交与其 blob 绝不能被误删
+    expect(fs.map.has(v6)).toBe(true);
+    expect(fs.map.has(makeStorageKey(SYNC_FOLDER, 'a.md', 'v5'))).toBe(true);
+    const headAfter = (await readHead(fs, SYNC_FOLDER))!;
+    expect(headAfter.commitId).toBe(gen6Head.commitId);
+    const tree = await resolveTree(fs, SYNC_FOLDER, gen6Commit);
+    expect(tree.get('a.md')?.blobId).toBe(v6);
+  });
+
+  it('链深超过单次同步预算(8轮×40)且同步间持续追加提交时，补扫续扫跨同步收敛', async () => {
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    const base = Date.now();
+    const RET_POLICY = { maxFileSize: 0, hourlyWindowHours: 0, dailyWindowDays: 3, monthlyWindowMonths: 0, yearlyWindowYears: 0, maxVersionsPerFile: 0 };
+    const N_A = 351; // init(gen1) + gen2..gen351 = 351 个提交，超过单次同步预算 320
+    const fs = new MemFs();
+    const { head: initHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const idOf = new Map<number, string>();
+    const blobOf = new Map<number, string>();
+    idOf.set(1, initHead.commitId);
+    let head = initHead;
+    // 批 A：350 条提交，时间覆盖约 87 天（远超 3 天保留窗口）——模拟仓库历史积累超深
+    for (let gen = 2; gen <= N_A; gen++) {
+      const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `v${gen}`);
+      fs.putText(blob, `v${gen}`);
+      blobOf.set(gen, blob);
+      const { commit, head: nextHead } = await finalizeCommit({
+        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        baseCommitId: head.commitId, baseGeneration: head.generation,
+        now: base - (N_A - gen) * SIX_HOURS, // gen351 最新，越旧越靠前
+        changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
+      });
+      idOf.set(gen, commit.commitId);
+      head = nextHead;
+    }
+    expect(head.generation).toBe(N_A);
+
+    // 第一次同步的自动 GC：默认 8 轮 × 40 = 320 条预算扫不完 350 条链 → 始终 more=true 且不删任何对象
+    let result = await gcRepository({ fs, syncFolder: SYNC_FOLDER, policy: RET_POLICY });
+    for (let i = 0; i < 7; i++) {
+      expect(result.more).toBe(true);
+      expect(result.deleted).toBe(0); // 链未扫完 → 保守不删
+      result = await gcRepository({ fs, syncFolder: SYNC_FOLDER, policy: RET_POLICY });
+    }
+    // 8 轮后进度正好 320 条，游标停在链中部，仍有 31 条未扫（链深超预算，本次同步无法收敛）
+    const stateAfter8 = JSON.parse(await fs.getText('Vault/.synx/gc-state.json'));
+    expect(stateAfter8.commits.length).toBe(320);
+    expect(stateAfter8.cursor).not.toBeNull();
+
+    // 第二次同步：批 B 追加 30 条提交（gen352..gen381，最近 1 分钟），HEAD 推进
+    for (let gen = N_A + 1; gen <= N_A + 30; gen++) {
+      const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `v${gen}`);
+      fs.putText(blob, `v${gen}`);
+      blobOf.set(gen, blob);
+      const { commit, head: nextHead } = await finalizeCommit({
+        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        baseCommitId: head.commitId, baseGeneration: head.generation,
+        now: base + (gen - N_A) * 1000,
+        changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
+      });
+      idOf.set(gen, commit.commitId);
+      head = nextHead;
+    }
+    const N = N_A + 30; // 381
+    expect(head.generation).toBe(N);
+
+    // 第二次同步的自动 GC：补扫 30 条新提交进进度头部，再沿旧游标向链尾推进
+    let checkedMerge = false;
+    let guard = 0;
+    while (result.more && guard < 20) {
+      result = await gcRepository({ fs, syncFolder: SYNC_FOLDER, policy: RET_POLICY });
+      if (!checkedMerge) {
+        // 补扫合并生效：进度头部是批 B 最新提交，且旧进度(320)保留——而非丢弃重扫
+        const st = JSON.parse(await fs.getText('Vault/.synx/gc-state.json'));
+        expect(st.commits[0].id).toBe(idOf.get(N));
+        expect(st.commits.length).toBeGreaterThan(320);
+        checkedMerge = true;
+      }
+      guard++;
+    }
+    expect(result.more).toBe(false);
+    expect(guard).toBeLessThan(20);
+    expect(8 + guard).toBeGreaterThan(8); // 单次同步 8 轮预算内无法收敛，必须跨同步继续
+
+    // 时间机器裁剪确实发生：3 天窗口，批 B 同一天仅保留 HEAD，边界对齐到 gen380 checkpoint
+    expect(result.deletedCommits).toBeGreaterThan(0);
+    expect(result.deleted).toBeGreaterThan(0);
+    const ckey = (id: string): string => `Vault/.synx/repo/checkpoints/${id}.json`;
+    // HEAD 与边界 checkpoint（gen380）保留；早期提交 blob 按保留策略淘汰
+    expect(fs.map.has(blobOf.get(N)!)).toBe(true);
+    expect(fs.map.has(ckey(idOf.get(380)!))).toBe(true);
+    expect(fs.map.has(blobOf.get(2)!)).toBe(false);
+    // HEAD 不变，且内容树经边界 checkpoint 仍完整可解析
+    const headAfter = (await readHead(fs, SYNC_FOLDER))!;
+    expect(headAfter.commitId).toBe(idOf.get(N));
+    const headCommit = await getCommitDetail(fs, SYNC_FOLDER, headAfter.commitId);
+    const tree = await resolveTree(fs, SYNC_FOLDER, headCommit);
+    expect(tree.get('a.md')?.blobId).toBe(blobOf.get(N)!);
+  });
 });
 
 describe('withRepoLock（原子建锁）', () => {

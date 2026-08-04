@@ -19,7 +19,6 @@ import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncSt
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient, WorkerApiError } from './workerClient.js';
-import { MULTIPART_THRESHOLD, uploadMultipartContent } from './multipartUpload.js';
 import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 
 interface PersistedPluginData {
@@ -41,23 +40,6 @@ interface SynxStateData {
   pendingDeletions?: readonly PendingDeletion[];
   knownRemoteFiles?: readonly { storageId: string; syncFolder: string; path: string; fileUuid?: string }[];
   prevSync?: PrevSyncState;
-  /** 未完成的大文件 Multipart 会话断点（跨同步/重启恢复用，不同步） */
-  multipartResumes?: readonly MultipartResumeEntry[];
-}
-
-/** 大文件 Multipart 断点：按 storage+syncFolder+path 匹配文件身份，恢复时以服务端 ListParts 为权威 */
-interface MultipartResumeEntry {
-  storageId: string;
-  syncFolder: string;
-  path: string;
-  size: number;
-  mtime: number;
-  hash: string;
-  blobId: string;
-  uploadId: string;
-  partSize: number;
-  uploadedParts: Array<{ partNumber: number; etag: string }>;
-  updatedAt: number;
 }
 
 function isPersistedData(raw: unknown): raw is PersistedPluginData {
@@ -68,12 +50,9 @@ function isStateData(raw: unknown): raw is SynxStateData {
   return typeof raw === 'object' && raw !== null && 'reports' in raw;
 }
 
-/** Multipart 断点在内存 Map 中的键：storage + syncFolder + path */
-function resumeKey(entry: { storageId: string; syncFolder: string; path: string }): string {
-  return `${entry.storageId}\0${entry.syncFolder}\0${entry.path}`;
-}
-
 const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
+/** 大文件直传阈值：超过该大小（字节）的文件走预签名 PUT 直传对象存储（不经过 Worker） */
+const DIRECT_UPLOAD_THRESHOLD = 20 * 1024 * 1024;
 // .obsidian 同步诊断日志：每次同步后写入 vault 根目录。
 // 注意：必须写成 .md 后缀——iOS 文件 App / Obsidian 内只显示 .md 文件，
 // .log 等附件后缀在移动端不可见（实测 iOS 只能看到 .md）。
@@ -81,6 +60,10 @@ const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
 // 该文件在 fileFilter 中被排除，不会被同步到远端。
 // 说明：早期版本用固定名 synx-debug.md，现在用 getter 动态生成带设备名的文件名。
 const OBS_DEBUG_FILE = 'synx-debug.md'; // 兼容旧版本号（用于事件忽略判断）
+// 同步后自动 GC 的单次驱动轮数上限：服务端受单请求子请求预算限制，
+// 长提交链一次跑不完（more=true），循环多轮驱动同一批清理收敛；
+// 仍跑不完时进度持久化在服务端 .synx/gc-state.json，下次同步继续，不会卡死。
+const MAX_GC_ROUNDS = 8;
 
 // #region debug-point Z:helper
 // 之前版本把日志 POST 到 http://127.0.0.1:7777/event（本地调试服务器），
@@ -104,7 +87,6 @@ export default class SynxSyncPlugin extends Plugin {
   private pendingDeletions: PendingDeletion[] = [];
   private knownRemoteFiles: { storageId: string; syncFolder: string; path: string; fileUuid?: string }[] = [];
   private prevSync: PrevSyncState | null = null;
-  private multipartResumes = new Map<string, MultipartResumeEntry>();
   private internalDeletes = new Set<string>();
 
   // Git 式仓库同步状态（本次同步内累积，runSync 结束/失败时清理）
@@ -190,7 +172,6 @@ export default class SynxSyncPlugin extends Plugin {
     this.pendingDeletions = [...(state.pendingDeletions ?? [])];
     this.knownRemoteFiles = [...(state.knownRemoteFiles ?? [])];
     this.prevSync = state.prevSync ?? null;
-    this.multipartResumes = new Map((state.multipartResumes ?? []).map((entry) => [resumeKey(entry), entry]));
   }
 
   private async loadState(): Promise<SynxStateData> {
@@ -203,10 +184,9 @@ export default class SynxSyncPlugin extends Plugin {
         pendingDeletions: raw.pendingDeletions ?? [],
         knownRemoteFiles: raw.knownRemoteFiles ?? [],
         prevSync: raw.prevSync,
-        multipartResumes: raw.multipartResumes ?? [],
       };
     } catch { /* 文件不存在或解析失败，返回空状态 */ }
-    return { reports: [], pendingDeletions: [], knownRemoteFiles: [], multipartResumes: [] };
+    return { reports: [], pendingDeletions: [], knownRemoteFiles: [] };
   }
 
   async saveSettings(patch: Partial<SynxPluginSettings>): Promise<void> {
@@ -561,12 +541,18 @@ export default class SynxSyncPlugin extends Plugin {
         }
       }
       if (attempt >= 2) throw new Error('同步冲突过多（远端提交被其他设备持续推进），请稍后重试');
-      // 提交成功后顺带触发一次垃圾回收：清理"任何提交都未引用"的孤儿内容对象
-      // （中断上传残留等）。静默执行，失败只记日志，绝不影响同步结果。
+      // 提交成功后顺带触发一次垃圾回收：清理"任何提交都未引用"的孤儿内容对象 +
+      // 按保留策略做时间机器式历史裁剪。服务端单请求受子请求预算限制，长提交链
+      // 一次跑不完（返回 more=true）→ 循环多轮驱动同一批清理收敛；受上限保护，
+      // 剩余进度持久化在服务端，下次同步继续，不会卡死。静默执行，失败只记日志，
+      // 绝不影响同步结果。
       try {
-        const gc = await this.client.repoGc();
-        if (gc.deleted > 0 || gc.deletedCommits > 0 || gc.more) {
-          console.info('synx: gc done after sync', gc);
+        for (let i = 0; i < MAX_GC_ROUNDS; i++) {
+          const gc = await this.client.repoGc();
+          if (gc.deleted > 0 || gc.deletedCommits > 0 || gc.more) {
+            console.info('synx: gc progress', gc);
+          }
+          if (!gc.more) break;
         }
       } catch (error) {
         console.warn('synx: gc after sync failed', error);
@@ -968,46 +954,12 @@ export default class SynxSyncPlugin extends Plugin {
     }
     const hash = await hashContent(content);
     try {
-      // 大文件走 S3 Multipart 直传（文件内容不经过 Worker）；小文件保持原二进制直传
-      const isLarge = content.byteLength > MULTIPART_THRESHOLD;
+      // 大文件走预签名 PUT 直传对象存储（文件内容不经过 Worker）；小文件保持 Worker 中转二进制直传
       let blobId: string;
-      if (isLarge) {
-        const key = resumeKey({ storageId: client.storageId, syncFolder: client.syncFolder, path });
-        const saved = this.multipartResumes.get(key);
-        const resume = saved && saved.size === content.byteLength && saved.mtime === mtime && saved.hash === hash
-          ? { blobId: saved.blobId, uploadId: saved.uploadId }
-          : undefined;
-        try {
-          blobId = await uploadMultipartContent(client, {
-            path,
-            content,
-            hash,
-            mtime,
-            resume,
-            onProgress: (progress) => {
-              this.multipartResumes.set(key, {
-                storageId: client.storageId,
-                syncFolder: client.syncFolder,
-                path,
-                size: content.byteLength,
-                mtime,
-                hash,
-                updatedAt: Date.now(),
-                ...progress,
-              });
-              void this.persistState();
-            },
-          });
-        } catch (error) {
-          // 会话已失效：丢弃本地断点，下次同步重建会话
-          if (error instanceof WorkerApiError && error.status === 404) {
-            this.multipartResumes.delete(key);
-            void this.persistState();
-          }
-          throw error;
-        }
-        this.multipartResumes.delete(key);
-        void this.persistState();
+      if (content.byteLength > DIRECT_UPLOAD_THRESHOLD) {
+        const session = await client.startDirectUpload({ path, size: content.byteLength, hash, mtime });
+        await client.uploadDirect(session.uploadUrl, content);
+        blobId = session.blobId;
       } else {
         blobId = await client.uploadBlob(path, content, mtime);
       }
@@ -1230,7 +1182,6 @@ export default class SynxSyncPlugin extends Plugin {
       pendingDeletions: this.pendingDeletions,
       knownRemoteFiles: this.knownRemoteFiles,
       prevSync: this.prevSync ?? undefined,
-      multipartResumes: [...this.multipartResumes.values()],
     };
     try {
       await this.app.vault.adapter.write(STATE_FILE, JSON.stringify(state));

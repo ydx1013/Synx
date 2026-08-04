@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Check, Cloud, Copy, KeyRound, Pencil, Plus, Settings, Trash2 } from 'lucide-react';
+import { ArrowLeft, Check, Cloud, Copy, Images, KeyRound, Pencil, Plus, Settings, Trash2 } from 'lucide-react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { authApi, onedriveApi, storageApi, tokenApi } from '../api/queries';
+import { authApi, galleryApi, onedriveApi, storageApi, tokenApi } from '../api/queries';
 import { useAuth } from '../auth/AuthProvider';
 import { Dialog } from '../components/Dialog';
 import { buildApiExamples } from './apiGuide';
@@ -13,12 +13,14 @@ export function SettingsLayout() {
   return <div className="settings-shell"><aside className="settings-sidebar">
     <Link className="settings-back" to="/notes"><ArrowLeft size={17} />返回笔记</Link>
     <div className="settings-account"><span className="avatar">{user?.username.slice(0, 1).toUpperCase()}</span><div><strong>{user?.username}</strong><small>{user?.email}</small></div></div>
-    <nav><Link className={path === '/settings' ? 'active' : ''} to="/settings"><Settings size={17} />常规设置</Link><Link className={path.startsWith('/settings/storage') ? 'active' : ''} to="/settings/storage"><Cloud size={17} />存储管理</Link><Link className={path === '/settings/tokens' ? 'active' : ''} to="/settings/tokens"><KeyRound size={17} />API Token</Link></nav>
+    <nav><Link className={path === '/settings' ? 'active' : ''} to="/settings"><Settings size={17} />常规设置</Link><Link className={path.startsWith('/settings/storage') ? 'active' : ''} to="/settings/storage"><Cloud size={17} />存储管理</Link><Link className={path.startsWith('/settings/galleries') ? 'active' : ''} to="/settings/galleries"><Images size={17} />图片图库</Link><Link className={path === '/settings/tokens' ? 'active' : ''} to="/settings/tokens"><KeyRound size={17} />API Token</Link></nav>
   </aside><SettingsContent /></div>;
 }
 
 function SettingsContent() {
   const path = useLocation().pathname;
+  if (path === '/settings/galleries/new' || /^\/settings\/galleries\/[^/]+$/.test(path)) return <GalleryForm />;
+  if (path === '/settings/galleries') return <GalleryList />;
   if (path === '/settings/storage/new' || /^\/settings\/storage\/[^/]+$/.test(path)) return <StorageForm />;
   if (path === '/settings/storage') return <StorageList />;
   if (path === '/settings/tokens') return <TokenSettings />;
@@ -101,6 +103,53 @@ function TokenSettings() {
     <Dialog open={createOpen} onOpenChange={setCreateOpen} title="创建 API Token"><form className="settings-form" onSubmit={create}><label>名称<input name="name" required maxLength={100} placeholder="例如：快捷指令" /></label><label>存储<select name="storageId" required defaultValue={me.data?.preferences.defaultStorageId ?? ''}><option value="">请选择</option>{storages.data?.storages.map(storage => <option key={storage.id} value={storage.id}>{storage.name}</option>)}</select></label><label>同步根目录<input name="syncFolder" required defaultValue={me.data?.preferences.defaultSyncFolder ?? 'my-vault/'} /></label><label>目标子文件夹<input name="targetFolder" required placeholder="收件箱/API" /></label><div className="dialog-actions"><button type="button" onClick={() => setCreateOpen(false)}>取消</button><button className="primary-button">创建</button></div></form></Dialog>
     <Dialog open={Boolean(secret)} onOpenChange={open => !open && setSecret('')} title="保存 API Token"><p>此 Token 只显示一次，请立即复制并妥善保存。</p><label className="dialog-field">API Token<input value={secret} readOnly /></label><div className="dialog-actions"><button onClick={() => void navigator.clipboard.writeText(secret)}><Copy size={15} />复制</button><button className="primary-button" onClick={() => setSecret('')}>完成</button></div></Dialog>
     <Dialog open={Boolean(removeId)} onOpenChange={open => !open && setRemoveId(null)} title="撤销 API Token"><p>撤销后，使用该 Token 的外部程序将立即无法添加笔记。</p><div className="dialog-actions"><button onClick={() => setRemoveId(null)}>取消</button><button className="danger-button" onClick={remove}>确认撤销</button></div></Dialog>
+  </main>;
+}
+
+function GalleryList() {
+  const client = useQueryClient();
+  const galleries = useQuery({ queryKey: ['image-galleries'], queryFn: galleryApi.list });
+  const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
+  async function remove() {
+    if (!removeTarget) return;
+    await galleryApi.remove(removeTarget.id);
+    await client.invalidateQueries({ queryKey: ['image-galleries'] });
+    setRemoveTarget(null);
+  }
+  return <main className="settings-content"><header className="settings-heading row"><div><h1>图片图库</h1><p>管理粘贴图片使用的 GitHub 仓库。Token 仅在服务器加密保存。</p></div><Link className="primary-button" to="/settings/galleries/new"><Plus size={16} />添加图库</Link></header>
+    <section className="storage-grid">{galleries.data?.galleries.length ? galleries.data.galleries.map(gallery => <article className="storage-card" key={gallery.id}><div className="storage-icon"><Images /></div><div className="storage-details"><div><h2>{gallery.name}</h2><span className="default-tag">{gallery.isPrivate ? '私有' : '公开'}</span></div><p>{gallery.owner}/{gallery.repo} · {gallery.branch}</p><small>{gallery.folder}/</small></div><div className="storage-actions"><Link to={`/settings/galleries/${gallery.id}`}><Pencil size={15} />编辑</Link><button className="danger-text" onClick={() => setRemoveTarget(gallery)}><Trash2 size={15} />移除</button></div></article>) : <div className="empty-settings"><Images size={38} /><h2>还没有图片图库</h2><p>添加 GitHub 仓库后，Synx 插件可自动上传粘贴和拖入的图片。</p><Link className="primary-button" to="/settings/galleries/new">添加图库</Link></div>}</section>
+    <Dialog open={Boolean(removeTarget)} onOpenChange={open => !open && setRemoveTarget(null)} title="移除图库"><p>仅移除“{removeTarget?.name}”的 Synx 配置，GitHub 中已有图片不会删除。</p><div className="dialog-actions"><button onClick={() => setRemoveTarget(null)}>取消</button><button className="danger-button" onClick={remove}>确认移除</button></div></Dialog>
+  </main>;
+}
+
+function GalleryForm() {
+  const { galleryId } = useParams();
+  const navigate = useNavigate();
+  const gallery = useQuery({ queryKey: ['image-gallery', galleryId], queryFn: () => galleryApi.get(galleryId!), enabled: Boolean(galleryId) });
+  const [status, setStatus] = useState('');
+  const formRef = useRef<HTMLFormElement>(null);
+  const values = gallery.data?.gallery;
+  const isEdit = Boolean(galleryId);
+  function bodyFromForm(): { name: string; owner: string; repo: string; branch: string; folder: string; token?: string } | null {
+    if (!formRef.current) return null;
+    const data = Object.fromEntries(new FormData(formRef.current)) as Record<string, string>;
+    const body = { name: data.name.trim(), owner: data.owner.trim(), repo: data.repo.trim(), branch: data.branch.trim(), folder: data.folder.trim(), token: data.token.trim() || undefined };
+    return body;
+  }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const body = bodyFromForm(); if (!body) return;
+    try { await galleryApi.save(galleryId, body); navigate('/settings/galleries'); }
+    catch (error) { setStatus(error instanceof Error ? error.message : '保存失败'); }
+  }
+  async function test() {
+    const body = bodyFromForm(); if (!body) return;
+    if (!body.token) { setStatus('连接测试需要填写 GitHub Token；保存编辑时可留空沿用原 Token'); return; }
+    try { const result = await galleryApi.test(body); setStatus(`连接成功：${result.isPrivate ? '私有仓库' : '公开仓库'}`); }
+    catch (error) { setStatus(error instanceof Error ? error.message : '连接失败'); }
+  }
+  return <main className="settings-content narrow"><header className="settings-heading"><Link className="back-link" to="/settings/galleries"><ArrowLeft size={16} />图片图库</Link><h1>{isEdit ? '编辑 GitHub 图库' : '添加 GitHub 图库'}</h1><p>建议使用仅授权该仓库 Contents 读写权限的 fine-grained PAT。公开仓库图片任何人都可访问。</p></header>
+    <form className="settings-form storage-form" ref={formRef} onSubmit={submit} key={values?.id ?? 'new'}><label>图库名称<input name="name" defaultValue={values?.name} required /></label><label>GitHub 用户或组织<input name="owner" defaultValue={values?.owner} required /></label><label>仓库名称<input name="repo" defaultValue={values?.repo} required /></label><label>分支<input name="branch" defaultValue={values?.branch ?? 'main'} required /></label><label>图片目录<input name="folder" defaultValue={values?.folder ?? 'images'} required /></label><label>GitHub Token<input name="token" type="password" required={!isEdit} placeholder={isEdit ? '留空则沿用已保存 Token' : 'github_pat_...'} /></label>{status && <p className="notice" role="status">{status}</p>}<div className="dialog-actions"><button type="button" onClick={() => void test()}>测试连接</button><button className="primary-button">保存图库</button></div></form>
   </main>;
 }
 

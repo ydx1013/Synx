@@ -1,12 +1,48 @@
-# S3/R2/MinIO 大文件直传任务
+# GitHub 图床与孤儿图片清理任务
 
-- [x] 1. 定义 shared Multipart 请求、响应和 API 常量
-- [x] 2. 为 S3Fs 实现 Create/ListParts/Presign/Complete/Abort 及单元测试
-- [x] 3. 实现 repository Multipart 控制面路由与 S3-only 鉴权校验
-- [x] 4. 覆盖幂等、安全错误码、XML 内嵌错误和凭证脱敏
-- [x] 5. 扩展 WorkerClient 控制面方法和对象存储直传 PUT
-- [x] 6. 实现可测试的 16 MiB 分片上传状态机与断点持久化回调
-- [x] 7. 扩展 synx-state.json 以持久化并恢复 Multipart 会话（服务端 ListParts 为权威）
-- [x] 8. 将 Multipart 接入主同步和备份同步，保留旧小文件路径
-- [ ] 9. 验证桌面分段读取并为移动端限制提供明确错误（未做：读取仍走 readBinary 整文件，需单独验证 Obsidian/Electron 范围读取 API）
-- [ ] 10. 在真实 S3、R2、MinIO 上验证 >100 MiB 直传与续传（需真实凭证与 CORS 配置）
+## Phase 1：Worker 基础与上传闭环
+
+- [ ] 1. shared 图库契约、错误码与 `0005_image_galleries.sql`
+- [ ] 2. GitHub 图库客户端：仓库检查、上传、读取、列表、删除及错误映射
+- [ ] 3. Worker 图库 CRUD/测试接口：加密 Token、用户隔离、永不回显
+- [ ] 4. Worker 图片上传与私有内容读取：20 MiB、目录边界、公共/私有引用
+
+### Checkpoint 1
+
+- [ ] shared/worker 类型检查通过
+- [ ] Worker 全部测试通过
+
+## Phase 2：图库管理网页
+
+- [ ] 5. Web 图库 API Client 与私有图片 Blob 读取
+- [ ] 6. Web 图库列表、添加/编辑/测试/移除与公开性提示
+
+### Checkpoint 2
+
+- [ ] Web 测试、类型检查和构建通过
+- [ ] Token 不出现在任何读取响应中
+
+## Phase 3：插件上传与失败恢复
+
+- [ ] 7. 插件图床开关、默认图库设置与下拉选择
+- [ ] 8. 粘贴/拖入上传、唯一占位、公共/私有链接替换与三次重试
+- [ ] 9. 本地附件降级、本机队列、启动重传、安全替换与引用后删除
+
+### Checkpoint 3
+
+- [ ] 插件测试和类型检查通过
+- [ ] 5xx/403/重启场景不丢图、不误删
+
+## Phase 4：私有渲染与孤儿清理
+
+- [ ] 10. Obsidian Reading View/Live Preview 私有图片渲染和 Blob 回收
+- [ ] 11. Synx 网页私有图片渲染和 Blob 回收
+- [ ] 12. Worker 疑似孤儿扫描、30 天保护和 SHA 安全删除
+- [ ] 13. 插件引用收集与网页人工勾选、二次确认删除
+
+### Checkpoint 4
+
+- [ ] 全仓 `npm run typecheck`
+- [ ] 全仓 `npm test --workspaces --if-present`
+- [ ] 全仓 `npm run build`
+- [ ] 真实公共/私有仓库端到端验证

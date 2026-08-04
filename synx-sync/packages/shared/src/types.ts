@@ -75,6 +75,30 @@ export interface OnedriveConfig {
 
 export type StorageConfig = S3Config | WebdavConfig | OnedriveConfig;
 
+/** GitHub 图库凭证（明文仅存在于 Worker 内存，D1 中 AES 加密） */
+export interface GitHubGalleryConfig {
+  token: string;
+  owner: string;
+  repo: string;
+  branch: string;
+  folder: string;
+}
+
+export interface ImageGallery {
+  id: string;
+  userId: string;
+  name: string;
+  provider: 'github';
+  owner: string;
+  repo: string;
+  branch: string;
+  folder: string;
+  isPrivate: boolean;
+  hasToken: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 /** 文件实体（FakeFs 读写单位，兼容 remotely-save 的 Entity 用法） */
 export interface Entity {
   /** vault 内相对路径（含前导 /） */

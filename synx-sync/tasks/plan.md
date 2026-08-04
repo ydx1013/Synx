@@ -1,42 +1,41 @@
-# 实施计划：S3/R2/MinIO 大文件直传
+# 实施计划：GitHub 图床与孤儿图片清理
 
 ## 概览
 
-实现最大 2 GiB 的 S3 Multipart 上传。Worker 只创建、签名、校验和完成会话；插件把 16 MiB 分片直接 PUT 到 S3/R2/MinIO。最终仍生成一个普通对象，并沿用现有 Git finalize、HEAD/CAS、历史、恢复和 GC。
+在现有 Synx Worker、网页和 Obsidian 插件中增加独立 GitHub 图床。GitHub Token 只在 Worker 加密保存；插件按设置中的默认图库上传新粘贴/拖入图片。公共仓库写入 Raw URL，私有仓库写入 `synx-image://` 并由登录客户端鉴权渲染。失败最多尝试 3 次，随后安全保存本地并在下次启动重传。孤儿清理只报告疑似未引用图片并由用户确认删除。
+
+设计依据：[GitHub 图床设计](../docs/superpowers/specs/2026-08-04-github-image-hosting-design.md)。
 
 ## 架构决策
 
-- 首版仅支持 `StorageType === 's3'`，不改变 WebDAV、OneDrive 和下载链路。
-- 最终 key 沿用 `makeStorageKey(syncFolder, path, blobId)`，不引入清单格式或数据迁移。
-- Worker 不接收文件分片；凭证不离开 Worker，只返回 15 分钟 UploadPart URL。
-- 采用 16 MiB 固定分片、2 GiB 上限、单文件并发 2。
-- 断点存在 `synx-state.json`，恢复时以 S3 `ListParts` 为权威。
-- 在功能完整验证前保留默认 20 MiB 限制；用户显式提高限制后，大文件才进入直传路径。
+- 图库与笔记同步存储分离，不把 GitHub 接入 `WorkerFs`。
+- 先固定共享契约，再按 Worker → 网页 → 插件 → 私有渲染 → 孤儿清理交付。
+- Token 复用 Worker 的 AES-GCM 加密能力，读取接口永不回显。
+- 插件失败队列只存 `synx-state.json`，避免多设备重复上传。
+- 不做自动孤儿删除；30 天保护期后仍需人工勾选和二次确认。
 
 ## 依赖关系
 
 ```text
-共享 API 类型
-  └─ S3Fs Multipart 能力
-       └─ Worker Multipart 路由
-            └─ WorkerClient 方法
-                 └─ 插件上传状态机
-                      └─ 本地断点恢复
-                           └─ 主同步/备份接入
-                                └─ 集成回归
+共享契约 + D1 migration
+  └─ Worker 图库 CRUD/测试
+       └─ Worker 上传/私有读取
+            ├─ 网页图库管理
+            ├─ 插件图库选择/上传
+            │    └─ 失败队列/启动重试
+            └─ 私有图片双端渲染
+                 └─ 孤儿扫描/人工删除
 ```
 
-## 任务列表
+## Phase 1：Worker 基础与上传闭环
 
-### 阶段 1：协议基础
+### 任务 1：共享契约与图库表
 
-#### 任务 1：定义共享 Multipart API 契约
-
-**说明：** 在 shared 中增加 start、parts、complete、abort 的请求/响应类型与 API 路径。
+**说明：** 定义图库 DTO、请求响应、错误码和 API 路径，新增 `image_galleries` migration。
 
 **验收标准：**
-- 类型包含 `blobId`、`uploadId`、1-based `partNumber`、ETag、大小和分片参数。
-- API 常量只增加四条 repository multipart 路径。
+- 图库 summary/detail 不包含明文 Token。
+- migration 包含用户外键和用户索引。
 - shared 类型检查通过。
 
 **验证：** `npm run typecheck -w @synx/shared`
@@ -44,215 +43,276 @@
 **依赖：** 无
 
 **可能涉及：**
-- `packages/shared/src/types.ts`
 - `packages/shared/src/api.ts`
+- `packages/shared/src/types.ts`
 - `packages/shared/src/index.ts`
+- `packages/worker/migrations/0005_image_galleries.sql`
 
-#### 任务 2：实现 S3Fs Multipart 原语
+### 任务 2：GitHub 客户端与配置校验
 
-**说明：** 复用现有 aws4fetch 与 URL 构造，实现 Create、ListParts、UploadPart 预签名、Complete 和 Abort。
+**说明：** 新建小型 GitHub 图库客户端，封装仓库检查、Contents 上传/读取、目录树和删除；先写失败测试。
 
 **验收标准：**
-- path-style 与 virtual-host 均构造正确。
-- ListParts 支持分页并安全解析 XML。
-- Complete 按 partNumber 排序，识别 HTTP 200 内嵌错误。
-- 预签名 URL 为 PUT、900 秒，并包含指定 uploadId/partNumber。
+- 正确编码 owner/repo/branch/path，映射 401/403/404/429/5xx。
+- 可识别仓库公开性、分支存在性和 push 权限。
+- 日志和错误不包含 Token。
 
-**验证：** `npm test -w @synx/worker -- s3Fs.test.ts`
+**验证：** `npm test -w @synx/worker -- githubGallery.test.ts`
 
 **依赖：** 任务 1
 
 **可能涉及：**
-- `packages/worker/src/storage/s3Fs.ts`
-- `packages/worker/src/storage/s3Fs.test.ts`
+- `packages/worker/src/services/githubGallery.ts`
+- `packages/worker/src/services/githubGallery.test.ts`
 
-### 检查点：协议基础
+### 任务 3：图库 CRUD 与连接测试
 
-- shared、worker 类型检查通过。
-- 原有 S3Fs 测试无回归。
-- 测试中没有真实文件内容经过 Worker 路由。
-
-### 阶段 2：Worker 控制面
-
-#### 任务 3：增加 S3-only Multipart 路由
-
-**说明：** 在 repository 路由中实现 start、parts、complete、abort，复用 repoScope、getFs、保留策略和统一错误处理。
+**说明：** 实现用户隔离的图库管理路由，配置加密保存，编辑留空 Token 时沿用旧值。
 
 **验收标准：**
-- 仅当前用户拥有的 S3 存储可调用。
-- start 生成服务端对象 key 与 blobId；resume 通过 ListParts 对账。
-- parts 限制编号和每批签名数量。
-- complete 对 ListParts 的数量、顺序、大小和 ETag 完整校验后才完成，并 HEAD 校验最终大小。
-- 请求体均为小型 JSON，不接收二进制分片。
+- 支持列表、详情、创建、编辑、测试、移除。
+- 跨用户读取和修改被拒绝。
+- Token 保存后永不回显；删除配置不删除 GitHub 文件。
 
-**验证：** `npm test -w @synx/worker -- repository.test.ts`
+**验证：** `npm test -w @synx/worker -- imageGalleries.test.ts`
 
-**依赖：** 任务 1、2
+**依赖：** 任务 2
 
 **可能涉及：**
-- `packages/worker/src/routes/repository.ts`
-- `packages/worker/src/routes/repository.test.ts`
-- `packages/worker/src/storage/factory.ts`
+- `packages/worker/src/routes/imageGalleries.ts`
+- `packages/worker/src/routes/imageGalleries.test.ts`
+- `packages/worker/src/index.ts`
 
-#### 任务 4：补齐幂等与安全错误路径
+### 任务 4：图片上传与私有内容读取
 
-**说明：** 覆盖会话失效、完成响应丢失、非 S3、越权、超限、错误 ETag 和上游故障。
+**说明：** 实现二进制上传、服务端路径生成、公共/私有引用返回和私有图片代理读取。
 
 **验收标准：**
-- 稳定错误码与规格一致。
-- complete 后重试可通过 HEAD 幂等返回。
-- abort 对不存在会话幂等。
-- 错误和日志不泄露凭证或完整预签名 URL。
+- 仅接受规定图片类型且不超过 20 MiB。
+- 公共仓库返回 Raw URL；私有仓库返回 `synx-image://`。
+- 私有读取必须鉴权、校验图库归属并限制在配置目录。
 
-**验证：** `npm test -w @synx/worker -- repository.test.ts s3Fs.test.ts`
+**验证：** `npm test -w @synx/worker -- imageGalleries.test.ts`
 
 **依赖：** 任务 3
 
 **可能涉及：**
-- `packages/worker/src/routes/repository.ts`
-- `packages/worker/src/routes/repository.test.ts`
-- `packages/worker/src/storage/s3Fs.ts`
+- `packages/worker/src/routes/imageGalleries.ts`
+- `packages/worker/src/routes/imageGalleries.test.ts`
+- `packages/worker/src/index.ts`
 
-### 检查点：Worker 控制面
+### Checkpoint 1
 
-- Worker 测试、类型检查、dry-run build 全部通过。
-- mock 断言 UploadPart URL 返回客户端，而不是由 Worker fetch 上传。
+- `npm run typecheck -w @synx/shared`
+- `npm run typecheck -w @synx/worker`
+- `npm test -w @synx/worker`
 
-### 阶段 3：插件直传
+## Phase 2：图库管理网页
 
-#### 任务 5：扩展 WorkerClient Multipart 方法
+### 任务 5：网页图库 API Client
 
-**说明：** 增加四个控制面调用以及对预签名 URL 的无 Worker 鉴权直传方法。
+**说明：** 接入共享契约，实现图库 CRUD、测试和后续二进制读取方法。
 
 **验收标准：**
-- 控制面请求仍携带 JWT、storageId、syncFolder。
-- 分片 PUT 只请求预签名对象存储 URL，不附加 Worker JWT。
-- 成功读取并返回 ETag；缺失 ETag 视为失败。
-- 单片网络/5xx 可重试，403 URL 失效由上层重新申请 URL。
+- API Client 覆盖图库管理全部接口。
+- 私有图片读取携带 JWT 并返回 Blob。
+- API Client 单元测试通过。
 
-**验证：** `npm test -w @synx/plugin -- workerClient.test.ts`
+**验证：** `npm test -w @synx/web -- client.test.ts`
 
-**依赖：** 任务 1、3
+**依赖：** 任务 4
 
 **可能涉及：**
-- `packages/plugin/src/workerClient.ts`
-- `packages/plugin/src/workerClient.test.ts`
+- `packages/web/src/api/queries.ts`
+- `packages/web/src/api/client.ts`
+- `packages/web/src/api/client.test.ts`
 
-#### 任务 6：实现可测试的 Multipart 上传状态机
+### 任务 6：图库列表和配置表单
 
-**说明：** 把分片计算、缺片选择、有限并发、ETag 收集、重新签名和 complete 编排放到独立可测试模块；不在 main.ts 内堆叠协议细节。
+**说明：** 在设置中新增“图片图库”导航、列表、添加/编辑/测试/移除页面，遵循现有存储管理样式。
 
 **验收标准：**
-- 20 MiB + 1 与 2 GiB 的分片边界正确，2 GiB + 1 被拒绝。
-- 并发不超过 2；失败只影响对应分片。
-- 已由 ListParts 确认的分片不会重复上传。
-- 测试使用小型模拟数据，不分配 2 GiB。
+- 可管理多个图库并展示公开/私有状态。
+- Token 编辑时留空表示不轮换，已保存值不回显。
+- 公共图库风险和 fine-grained PAT 权限说明清晰。
 
-**验证：** 运行新增 Multipart 上传模块测试。
+**验证：** `npm test -w @synx/web`、`npm run typecheck -w @synx/web`
 
 **依赖：** 任务 5
 
 **可能涉及：**
-- `packages/plugin/src/multipartUpload.ts`（仅在确认独立模块确有必要时新增）
-- `packages/plugin/src/multipartUpload.test.ts`
+- `packages/web/src/settings/SettingsPage.tsx`
+- `packages/web/src/App.tsx`
+- `packages/web/src/styles/globals.css`
+- `packages/web/src/App.test.tsx`
 
-#### 任务 7：增加本地断点持久化与恢复
+### Checkpoint 2
 
-**说明：** 扩展现有 SynxStateData，按文件身份保存 uploadId/blobId/parts；每片成功后持久化，并在恢复时与 Worker ListParts 对账。
+- Worker 和 Web 测试通过。
+- Web 构建通过。
+- 手工确认 Token 不出现在列表、详情和浏览器响应中。
 
-**验收标准：**
-- 旧 synx-state.json 可无迁移加载。
-- 匹配 storageId、syncFolder、path、size、mtime、hash 时可恢复。
-- 文件变化、会话失效或完成后清除对应断点。
-- 7 天前状态会被忽略/清理。
+## Phase 3：插件上传与失败恢复
 
-**验证：** 相关状态测试与插件类型检查通过。
+### 任务 7：插件设置和图库选择
 
-**依赖：** 任务 6
-
-**可能涉及：**
-- `packages/plugin/src/main.ts`
-- `packages/plugin/src/multipartUpload.ts`
-- 对应测试文件
-
-### 检查点：插件直传
-
-- WorkerClient 和上传状态机测试通过。
-- 模拟重启后仅上传缺失分片。
-- 分片请求中没有 Worker JWT 或存储密钥。
-
-### 阶段 4：同步接入与平台边界
-
-#### 任务 8：接入主同步和备份同步上传路径
-
-**说明：** 在 uploadToClient 中按文件大小和目标存储能力选择旧 uploadBlob 或 Multipart；主同步与备份共用同一路径。
+**说明：** 增加图床开关、图库 ID/名称设置和与主存储相同的下拉选择。
 
 **验收标准：**
-- ≤20 MiB 保持原有路径。
-- >20 MiB 仅 S3 走 Multipart；非 S3 返回清晰限制，不改变原行为。
-- Multipart 完成得到的 blobId 继续进入现有 RepoUploadedFile/finalize。
-- HEAD 冲突后可复用已完成对象。
+- 默认关闭，不改变现有用户行为。
+- 登录后可拉取图库并固定选择一个默认图库。
+- 图库切换仅影响后续上传。
 
-**验证：** 插件同步测试、类型检查和 build 通过。
+**验证：** `npm test -w @synx/plugin -- settings.test.ts workerClient.test.ts`
 
-**依赖：** 任务 6、7
+**依赖：** 任务 4
 
 **可能涉及：**
-- `packages/plugin/src/main.ts`
-- `packages/plugin/src/repoSync.ts`
 - `packages/plugin/src/settings.ts`
+- `packages/plugin/src/settings.test.ts`
 - `packages/plugin/src/settingsTab.ts`
-- 对应测试文件
+- `packages/plugin/src/workerClient.ts`
+- `packages/plugin/src/workerClient.test.ts`
 
-#### 任务 9：实现分段文件读取能力与明确降级
+### 任务 8：粘贴/拖入上传闭环
 
-**说明：** 桌面端优先按范围读取；移动端不具备分段读取时明确报告平台内存限制，不伪装成端到端低内存。
+**说明：** 提取独立图片上传控制器，拦截图片事件、插入唯一占位符、调用 Worker，并精准替换 Markdown。
 
 **验收标准：**
-- 桌面上传峰值受分片并发约束，不完整读取 2 GiB。
-- .obsidian 与普通 vault 文件路径均有可验证读取方案。
-- 移动端不支持时产生稳定、可理解错误且保留断点。
-- 不引入未经 Obsidian/Electron 类型与运行时验证的私有 API。
+- 开关关闭、未登录或未选图库时不拦截默认行为。
+- 成功时公共/私有链接均正确插入。
+- 临时错误总尝试 3 次；确定性错误不做连续重试。
 
-**验证：** 单元模拟 + 桌面开发环境手动上传大文件。
+**验证：** `npm test -w @synx/plugin -- imageUpload.test.ts`
+
+**依赖：** 任务 7
+
+**可能涉及：**
+- `packages/plugin/src/imageUpload.ts`
+- `packages/plugin/src/imageUpload.test.ts`
+- `packages/plugin/src/main.ts`
+
+### 任务 9：本地降级队列与启动重试
+
+**说明：** 上传失败后按 Obsidian 附件规则落盘，记录本机队列；启动重试成功后安全替换和清理。
+
+**验收标准：**
+- 本地附件、Markdown 嵌入和队列写入保持原子顺序。
+- 队列只写本机状态，按本地路径和笔记路径去重。
+- 成功后先替换链接，再扫描引用；无其他引用才删本地文件。
+- 文本已变化或再次失败时保留文件并提示，支持手动重试。
+
+**验证：** `npm test -w @synx/plugin -- pendingImageUploads.test.ts`
 
 **依赖：** 任务 8
 
 **可能涉及：**
+- `packages/plugin/src/pendingImageUploads.ts`
+- `packages/plugin/src/pendingImageUploads.test.ts`
 - `packages/plugin/src/main.ts`
-- `packages/plugin/src/multipartUpload.ts`
-- 插件构建配置（仅实际需要时）
+- `packages/plugin/src/settingsTab.ts`
 
-### 阶段 5：完整回归
+### Checkpoint 3
 
-#### 任务 10：回归与真实后端验收
+- 插件单元测试与类型检查通过。
+- 手工模拟 5xx、403 和重启恢复，确认不丢图、不误删。
 
-**说明：** 执行全仓测试、类型检查、构建，并分别验证 S3、R2、MinIO 的 CORS、ETag 和断点续传。
+## Phase 4：私有渲染与孤儿清理
+
+### 任务 10：Obsidian 私有图片渲染
+
+**说明：** Reading View 和 Live Preview 识别 `synx-image://`，鉴权获取并缓存 Blob URL。
 
 **验收标准：**
-- `npm run typecheck`、`npm test`、`npm run build` 全部通过。
-- 三个后端各完成一次 >100 MiB 上传和断点恢复。
-- 抓包确认分片目标是存储域名，Worker 请求体没有分片。
-- 旧小文件、WebDAV、OneDrive、历史、恢复、GC 无回归。
+- 两种视图均可显示私有图片。
+- 未登录/无权限时显示错误占位。
+- 插件卸载时释放全部 Object URL。
 
-**验证：** 自动化命令 + 真实存储手工检查。
+**验证：** `npm test -w @synx/plugin -- privateImage.test.ts`
 
-**依赖：** 任务 1–9
+**依赖：** 任务 7、任务 4
 
-**可能涉及：** 仅测试修复直接相关文件。
+**可能涉及：**
+- `packages/plugin/src/privateImage.ts`
+- `packages/plugin/src/privateImage.test.ts`
+- `packages/plugin/src/main.ts`
+
+### 任务 11：Synx 网页私有图片渲染
+
+**说明：** 网页 Markdown 渲染器解析 `synx-image://`，携 JWT 获取 Blob 并管理 Object URL 生命周期。
+
+**验收标准：**
+- 已登录用户可看自己图库图片。
+- 退出登录或无权限不能读取。
+- 组件卸载时释放 Object URL。
+
+**验证：** `npm test -w @synx/web -- NotesPage.test.tsx`
+
+**依赖：** 任务 5
+
+**可能涉及：**
+- `packages/web/src/notes/NotesPage.tsx`
+- `packages/web/src/notes/privateImage.ts`
+- `packages/web/src/notes/privateImage.test.ts`
+
+### 任务 12：Worker 孤儿扫描和安全删除
+
+**说明：** 根据插件提交的引用集合计算疑似孤儿，应用 30 天保护期，并以最新 SHA 删除用户确认项。
+
+**验收标准：**
+- 只处理图库目录内符合 Synx 命名规则的图片。
+- 30 天内图片不进入结果。
+- 路径或 SHA 变化时拒绝删除并要求重扫。
+
+**验证：** `npm test -w @synx/worker -- imageGalleries.test.ts`
+
+**依赖：** 任务 4
+
+**可能涉及：**
+- `packages/worker/src/routes/imageGalleries.ts`
+- `packages/worker/src/routes/imageGalleries.test.ts`
+- `packages/worker/src/services/githubGallery.ts`
+
+### 任务 13：引用收集与网页人工清理
+
+**说明：** 插件扫描 Markdown、Canvas 和 HTML 图片引用并提交；网页显示疑似孤儿、默认不选中并二次确认删除。
+
+**验收标准：**
+- 插件只提交规范化的图库路径，不上传笔记正文。
+- 网页清楚标记“疑似未使用”和 30 天保护规则。
+- 删除必须显式勾选并二次确认。
+
+**验证：** `npm test -w @synx/plugin -- imageReferences.test.ts`、`npm test -w @synx/web`
+
+**依赖：** 任务 12、任务 6
+
+**可能涉及：**
+- `packages/plugin/src/imageReferences.ts`
+- `packages/plugin/src/imageReferences.test.ts`
+- `packages/plugin/src/settingsTab.ts`
+- `packages/web/src/settings/SettingsPage.tsx`
+- `packages/web/src/api/queries.ts`
+
+### Checkpoint 4：完整验收
+
+- `npm run typecheck`
+- `npm test --workspaces --if-present`
+- `npm run build`
+- 真实公共/私有 GitHub 仓库完成上传、渲染、失败恢复与人工删除。
 
 ## 风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| Obsidian 移动端缺少范围读取 | 无法稳定处理 2 GiB | 明确平台限制，先保证桌面端低内存；不伪造支持 |
-| 对象存储 CORS 未暴露 ETag | 无法 Complete | 部署指引要求 ExposeHeaders: ETag；首次失败返回明确错误 |
-| MinIO/S3 endpoint 风格差异 | 签名不匹配 | 复用现有 pathStyle/region 配置并做真实后端测试 |
-| Complete 返回 HTTP 200 内嵌错误 | 误认为上传完成 | 必须解析 XML，并最终 HEAD 校验大小 |
-| 未完成分片长期残留 | 存储费用 | abort 接口 + 后端生命周期清理规则 |
-| 设置层提前放开 2 GiB | 非 S3 或未完成代码误读大文件 | 完整功能验证前保留默认 20 MiB，按存储能力路由 |
+| Worker 二进制/Base64 内存放大 | 高 | 首版单图限制 20 MiB；超限直接本地降级 |
+| 私有链接无法由普通 `<img>` 鉴权 | 高 | 双端 fetch Blob，不把 JWT 放 URL |
+| 多设备或外部网站引用导致误判孤儿 | 高 | 30 天保护、仅疑似报告、人工确认、Git SHA 二次校验 |
+| Markdown 在重试期间被编辑 | 高 | 精确匹配原嵌入；不做模糊替换，不删除本地文件 |
+| GitHub 限流或权限变化 | 中 | 稳定错误码、三次临时重试、本地降级和显式提示 |
+| Token 泄漏 | 高 | Worker AES-GCM 加密、永不回显、日志不记录请求体/上游头 |
 
-## 开放问题
+## 实施原则
 
-- 真正编码任务 9 前，需要确认当前 Obsidian 桌面端可用的底层文件路径/范围读取 API；若无法从官方类型或项目运行时证据确认，应先暂停并向用户说明限制。
-- 真实 S3/R2/MinIO 的 CORS 配置需由部署者完成，代码无法代替桶级策略。
+- 每个行为修改先写失败测试，再写最少实现。
+- 不改造现有同步存储抽象，不做规格之外的 NotePix 功能。
+- 不提交、不部署、不使用真实 Token，除非用户另行明确要求。

@@ -90,6 +90,14 @@ describe('loadPluginSettings', () => {
     expect(loadPluginSettings({ backupStorageIds: 'not-an-array' }, false).backupStorageIds).toEqual([]);
   });
 
+  it('defaults image hosting to disabled without a selected gallery', () => {
+    expect(loadPluginSettings({}, false)).toMatchObject({
+      imageHostingEnabled: false,
+      imageGalleryId: '',
+      imageGalleryName: '',
+    });
+  });
+
   it('normalizes path rules and accepts supported custom timings', () => {
     const settings = loadPluginSettings({
       autoSyncIntervalMin: 7,

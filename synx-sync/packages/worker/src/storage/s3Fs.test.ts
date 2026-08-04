@@ -125,59 +125,14 @@ describe('S3Fs', () => {
   });
 });
 
-describe('S3Fs multipart', () => {
-  it('creates a multipart upload and returns UploadId', async () => {
-    fetchMock.mockResolvedValue(mockResponse({ status: 200, text: '<InitiateMultipartUploadResult><UploadId>up&amp;1</UploadId></InitiateMultipartUploadResult>' }));
+describe('S3Fs presignPut', () => {
+  it('presigns a single PUT for the whole object for 900 seconds without sending a request', async () => {
     const fs = new S3Fs(config);
-    await expect(fs.createMultipartUpload('folder/file.bin')).resolves.toBe('up&1');
-    expect(callArgs().method).toBe('POST');
-    expect(callArgs().url).toBe('https://s3.example.com/b/folder/file.bin?uploads=');
-  });
-
-  it('lists uploaded parts across pages', async () => {
-    fetchMock
-      .mockResolvedValueOnce(mockResponse({ status: 200, text: '<ListPartsResult><IsTruncated>true</IsTruncated><NextPartNumberMarker>2</NextPartNumberMarker><Part><PartNumber>1</PartNumber><ETag>&quot;e1&quot;</ETag><Size>10</Size></Part><Part><PartNumber>2</PartNumber><ETag>&quot;e2&quot;</ETag><Size>20</Size></Part></ListPartsResult>' }))
-      .mockResolvedValueOnce(mockResponse({ status: 200, text: '<ListPartsResult><IsTruncated>false</IsTruncated><Part><PartNumber>3</PartNumber><ETag>&quot;e3&quot;</ETag><Size>5</Size></Part></ListPartsResult>' }));
-    const fs = new S3Fs(config);
-    await expect(fs.listMultipartParts('k', 'u&1')).resolves.toEqual([
-      { partNumber: 1, etag: '"e1"', size: 10 },
-      { partNumber: 2, etag: '"e2"', size: 20 },
-      { partNumber: 3, etag: '"e3"', size: 5 },
-    ]);
-    expect(callArgs(1).url).toContain('part-number-marker=2');
-    expect(callArgs(1).url).toContain('uploadId=u%261');
-  });
-
-  it('presigns one UploadPart PUT for 900 seconds', async () => {
-    const fs = new S3Fs(config);
-    const url = await fs.presignUploadPart('k', 'u', 3, 900);
+    const url = await fs.presignPut('folder/file.bin', 900);
     const parsed = new URL(url);
-    expect(parsed.searchParams.get('partNumber')).toBe('3');
-    expect(parsed.searchParams.get('uploadId')).toBe('u');
+    expect(parsed.origin + parsed.pathname).toBe('https://s3.example.com/b/folder/file.bin');
     expect(parsed.searchParams.get('X-Amz-Expires')).toBe('900');
     expect(parsed.searchParams.has('X-Amz-Signature')).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it('completes parts in ascending order and rejects embedded S3 errors', async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({ status: 200, text: '<CompleteMultipartUploadResult><ETag>&quot;done&quot;</ETag></CompleteMultipartUploadResult>' }));
-    const fs = new S3Fs(config);
-    await fs.completeMultipartUpload('k', 'u', [
-      { partNumber: 2, etag: '"e2"', size: 5 },
-      { partNumber: 1, etag: '"e1"', size: 10 },
-    ]);
-    const request = fetchMock.mock.calls[0][0] as Request;
-    const body = await request.text();
-    expect(body.indexOf('<PartNumber>1</PartNumber>')).toBeLessThan(body.indexOf('<PartNumber>2</PartNumber>'));
-
-    fetchMock.mockResolvedValueOnce(mockResponse({ status: 200, text: '<Error><Code>InvalidPart</Code></Error>' }));
-    await expect(fs.completeMultipartUpload('k', 'u', [{ partNumber: 1, etag: '"e1"', size: 10 }])).rejects.toThrow('InvalidPart');
-  });
-
-  it('aborts idempotently when upload is missing', async () => {
-    fetchMock.mockResolvedValue(mockResponse({ status: 404 }));
-    const fs = new S3Fs(config);
-    await expect(fs.abortMultipartUpload('k', 'u')).resolves.toBeUndefined();
-    expect(callArgs().method).toBe('DELETE');
   });
 });

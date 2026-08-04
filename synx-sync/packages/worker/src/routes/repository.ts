@@ -13,18 +13,13 @@ import type {
   RepoRestoreRequest,
   RepoRestoreResponse,
   RepoTreeResponse,
-  MultipartStartRequest,
-  MultipartSessionResponse,
-  MultipartPartsRequest,
-  MultipartPartsResponse,
-  MultipartCompleteRequest,
-  MultipartCompleteResponse,
-  MultipartAbortRequest,
+  DirectUploadStartRequest,
+  DirectUploadSessionResponse,
 } from '@synx/shared';
 import { makeStorageKey } from '@synx/shared';
 import { authMiddleware } from '../middleware/auth.js';
 import { getFs, StorageError } from '../storage/factory.js';
-import { S3Fs, type S3UploadedPart } from '../storage/s3Fs.js';
+import { S3Fs } from '../storage/s3Fs.js';
 import { enforceMaxFileSize, FileTooLarge, getRetentionPolicy } from '../services/retention.js';
 import {
   BlobMissingError,
@@ -53,9 +48,8 @@ export const repository = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
 repository.use('*', authMiddleware);
 
-const MULTIPART_PART_SIZE = 16 * 1024 * 1024;
-const MULTIPART_MAX_SIZE = 2 * 1024 * 1024 * 1024;
-const MULTIPART_URL_EXPIRES_SECONDS = 15 * 60;
+const DIRECT_UPLOAD_MAX_SIZE = 5 * 1024 * 1024 * 1024; // S3 单次 PUT 上限 5GiB
+const DIRECT_UPLOAD_URL_EXPIRES_SECONDS = 15 * 60;
 
 /** 取请求头中的仓库定位信息 */
 function repoScope(c: { req: { header: (name: string) => string | undefined } }): { storageId: string; syncFolder: string } {
@@ -218,102 +212,22 @@ repository.get('/tree', async (c) => {
   }
 });
 
-repository.post('/multipart/start', async (c) => {
+// POST /api/repository/direct-upload/start  body: { path, size, hash, mtime }
+// 大文件直传：服务端生成对象键 + 预签名 PUT URL，插件把整个文件内容直接 PUT 到对象存储（不经过 Worker）。
+// 客户端负责算内容 hash（finalize 变更集携带），服务端在 finalize 时仅校验 blob 存在。
+repository.post('/direct-upload/start', async (c) => {
   const { storageId, syncFolder } = repoScope(c);
-  const body = await c.req.json<MultipartStartRequest>();
+  const body = await c.req.json<DirectUploadStartRequest>();
   try {
-    validateMultipartFile(body.path, body.size, body.hash, body.mtime);
+    validateDirectUploadFile(body.path, body.size, body.hash, body.mtime);
     const { fs, type } = await getFs(c.env, c.get('userId'), storageId);
     const s3 = requireS3(fs, type);
     const policy = await getRetentionPolicy(c.env, storageId, fs);
     enforceMaxFileSize(body.size, policy);
-    if (body.resume) {
-      validateBlobId(syncFolder, body.path, body.resume.blobId);
-      let uploadedParts: S3UploadedPart[];
-      try {
-        uploadedParts = await s3.listMultipartParts(body.resume.blobId, body.resume.uploadId);
-      } catch (e) {
-        // S3 对不存在的 uploadId 返回 404：转换为稳定的会话失效错误，插件据此丢弃本地断点重新开始
-        if (e instanceof Error && /\(404\)/.test(e.message)) {
-          throw new StorageError(404, 'multipart session not found');
-        }
-        throw e;
-      }
-      const res: MultipartSessionResponse = {
-        blobId: body.resume.blobId,
-        uploadId: body.resume.uploadId,
-        partSize: MULTIPART_PART_SIZE,
-        partCount: Math.ceil(body.size / MULTIPART_PART_SIZE),
-        uploadedParts,
-      };
-      return c.json(res);
-    }
     const blobId = makeStorageKey(syncFolder, body.path, crypto.randomUUID());
-    const uploadId = await s3.createMultipartUpload(blobId);
-    const res: MultipartSessionResponse = {
-      blobId,
-      uploadId,
-      partSize: MULTIPART_PART_SIZE,
-      partCount: Math.ceil(body.size / MULTIPART_PART_SIZE),
-      uploadedParts: [],
-    };
+    const uploadUrl = await s3.presignPut(blobId, DIRECT_UPLOAD_URL_EXPIRES_SECONDS);
+    const res: DirectUploadSessionResponse = { blobId, uploadUrl, expiresIn: DIRECT_UPLOAD_URL_EXPIRES_SECONDS };
     return c.json(res, 201);
-  } catch (e) {
-    return handleError(c, e);
-  }
-});
-
-repository.post('/multipart/parts', async (c) => {
-  const { storageId, syncFolder } = repoScope(c);
-  const body = await c.req.json<MultipartPartsRequest>();
-  try {
-    validateBlobId(syncFolder, body.path, body.blobId);
-    if (!body.uploadId || !Array.isArray(body.partNumbers) || body.partNumbers.length < 1 || body.partNumbers.length > 16
-      || body.partNumbers.some((n) => !Number.isInteger(n) || n < 1 || n > 128)) {
-      throw new StorageError(400, 'invalid multipart parts');
-    }
-    const { fs, type } = await getFs(c.env, c.get('userId'), storageId);
-    const s3 = requireS3(fs, type);
-    const parts = await Promise.all(body.partNumbers.map(async (partNumber) => ({
-      partNumber,
-      url: await s3.presignUploadPart(body.blobId, body.uploadId, partNumber, MULTIPART_URL_EXPIRES_SECONDS),
-    })));
-    const res: MultipartPartsResponse = { parts };
-    return c.json(res);
-  } catch (e) {
-    return handleError(c, e);
-  }
-});
-
-repository.post('/multipart/complete', async (c) => {
-  const { storageId, syncFolder } = repoScope(c);
-  const body = await c.req.json<MultipartCompleteRequest>();
-  try {
-    validateMultipartFile(body.path, body.size, body.hash, 1);
-    validateBlobId(syncFolder, body.path, body.blobId);
-    if (!body.uploadId || !Array.isArray(body.parts)) throw new StorageError(400, 'invalid multipart completion');
-    const { fs, type } = await getFs(c.env, c.get('userId'), storageId);
-    const s3 = requireS3(fs, type);
-    const remoteParts = await s3.listMultipartParts(body.blobId, body.uploadId);
-    validateCompletedParts(body.size, remoteParts, body.parts);
-    await s3.completeMultipartUpload(body.blobId, body.uploadId, remoteParts);
-    if (!await s3.head(body.blobId)) throw new StorageError(502, 'multipart object missing after completion');
-    const res: MultipartCompleteResponse = { blobId: body.blobId, size: body.size, hash: body.hash };
-    return c.json(res);
-  } catch (e) {
-    return handleError(c, e);
-  }
-});
-
-repository.post('/multipart/abort', async (c) => {
-  const { storageId, syncFolder } = repoScope(c);
-  const body = await c.req.json<MultipartAbortRequest>();
-  try {
-    validateBlobId(syncFolder, body.path, body.blobId);
-    if (!body.uploadId) throw new StorageError(400, 'missing uploadId');
-    const { fs, type } = await getFs(c.env, c.get('userId'), storageId);
-    await requireS3(fs, type).abortMultipartUpload(body.blobId, body.uploadId);
-    return c.json({ ok: true });
   } catch (e) {
     return handleError(c, e);
   }
@@ -411,41 +325,11 @@ function requireS3(fs: unknown, type: string): S3Fs {
   return fs;
 }
 
-function validateMultipartFile(path: string, size: number, hash: string, mtime: number): void {
-  if (!path || path.startsWith('/') || path.includes('..') || !Number.isInteger(size) || size <= 0 || size > MULTIPART_MAX_SIZE
+function validateDirectUploadFile(path: string, size: number, hash: string, mtime: number): void {
+  if (!path || path.startsWith('/') || path.includes('..') || !Number.isInteger(size) || size <= 0 || size > DIRECT_UPLOAD_MAX_SIZE
     || !/^[0-9a-f]{64}$/i.test(hash) || !Number.isFinite(mtime) || mtime <= 0) {
-    throw new StorageError(size > MULTIPART_MAX_SIZE ? 413 : 400, 'invalid multipart file');
+    throw new StorageError(size > DIRECT_UPLOAD_MAX_SIZE ? 413 : 400, 'invalid direct upload file');
   }
-}
-
-function validateBlobId(syncFolder: string, path: string, blobId: string): void {
-  const prefix = `${syncFolder.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}@`;
-  if (!blobId || !blobId.startsWith(prefix) || blobId.length <= prefix.length) {
-    throw new StorageError(400, 'invalid multipart blobId');
-  }
-}
-
-function validateCompletedParts(
-  size: number,
-  remote: S3UploadedPart[],
-  submitted: Array<{ partNumber: number; etag: string }>,
-): void {
-  const count = Math.ceil(size / MULTIPART_PART_SIZE);
-  const submittedEtags = new Map(submitted.map((part) => [part.partNumber, stripQuotes(part.etag)]));
-  if (remote.length !== count || submitted.length !== count) throw new StorageError(422, 'multipart upload is incomplete');
-  for (let index = 0; index < count; index++) {
-    const part = remote[index];
-    const partNumber = index + 1;
-    const expectedSize = partNumber === count ? size - MULTIPART_PART_SIZE * index : MULTIPART_PART_SIZE;
-    if (part?.partNumber !== partNumber || part.size !== expectedSize || submittedEtags.get(partNumber) !== stripQuotes(part.etag)) {
-      throw new StorageError(422, 'multipart parts do not match');
-    }
-  }
-}
-
-/** 不同 S3 实现在 ETag 引号上有差异，比较前去掉首尾引号避免误报 */
-function stripQuotes(etag: string): string {
-  return etag.startsWith('"') && etag.endsWith('"') ? etag.slice(1, -1) : etag;
 }
 
 function handleError(c: any, e: unknown): Response {

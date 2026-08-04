@@ -845,7 +845,7 @@ function buildRetentionLayers(policy: RetentionPolicy): RetentionLayer[] {
  *
  * 注意：为保证裁剪后历史链可解析，调用方还需把保留边界对齐到带 checkpoint 的提交。
  */
-function computeKeepBoundary(commits: RepoCommit[], layers: RetentionLayer[]): number {
+function computeKeepBoundary(commits: Array<{ createdAt: number }>, layers: RetentionLayer[]): number {
   if (layers.length === 0) return commits.length;
   let layerIdx = 0;
   const buckets = new Set<string>();
@@ -865,49 +865,191 @@ function computeKeepBoundary(commits: RepoCommit[], layers: RetentionLayer[]): n
   return keep;
 }
 
+/**
+ * GC 跨请求进度：长提交链受 Workers 子请求预算限制无法一次扫完，
+ * 把「已扫描提交元数据 + 待续删对象」持久化到 .synx/gc-state.json，
+ * 后续调用（如每次同步后的自动 repoGc）从上次位置继续，直到链尾收敛。
+ * 该文件位于 .synx/ 下，被 GC 自身排除，不参与同步与清理。
+ */
+interface GcState {
+  v: 1;
+  /** 扫描基准 HEAD commitId：HEAD 变了即丢弃进度重扫（避免基于旧链裁剪/清理） */
+  head: string;
+  /** 已扫描提交（新→旧），含裁剪与孤儿判定所需的元数据与 blob 引用 */
+  commits: Array<{ id: string; createdAt: number; checkpointId: string | null; blobs: string[] }>;
+  /** 下一个待扫描提交（null = 已到链尾，可进入裁剪阶段） */
+  cursor: string | null;
+  /** 超出单次删除预算、待后续调用续删的对象 key 列表 */
+  pending: string[];
+  /** 本次 GC 已因保留策略淘汰的提交数（跨请求累计，供结果报告） */
+  deletedCommits: number;
+}
+
+function gcStateKey(syncFolder: string): string {
+  return `${syncFolder.replace(/\/+$/, '')}/.synx/gc-state.json`;
+}
+
+async function loadGcState(fs: WorkerFs, syncFolder: string): Promise<GcState | null> {
+  try {
+    const raw = await fs.get(gcStateKey(syncFolder));
+    const state = JSON.parse(textDecoder.decode(raw)) as GcState;
+    return state?.v === 1 && typeof state.head === 'string' ? state : null;
+  } catch {
+    return null; // 不存在或损坏 → 从头开始
+  }
+}
+
+async function saveGcState(fs: WorkerFs, syncFolder: string, state: GcState): Promise<void> {
+  await fs.put(gcStateKey(syncFolder), new TextEncoder().encode(JSON.stringify(state)));
+}
+
+async function deleteGcState(fs: WorkerFs, syncFolder: string): Promise<void> {
+  try {
+    await fs.delete(gcStateKey(syncFolder));
+  } catch {
+    // 已不存在则忽略
+  }
+}
+
+/** 批量删除对象；deleteMany 缺失时逐个删除，单个失败不影响其余。 */
+async function deleteKeys(fs: WorkerFs, keys: string[]): Promise<number> {
+  if (keys.length === 0) return 0;
+  if (fs.deleteMany) return (await fs.deleteMany(keys)).deleted;
+  let deleted = 0;
+  for (const key of keys) {
+    try {
+      await fs.delete(key);
+      deleted++;
+    } catch {
+      // 单个删除失败不影响其余
+    }
+  }
+  return deleted;
+}
+
 export async function gcRepository(input: GcRepositoryInput): Promise<GcRepositoryResult> {
   const { fs, syncFolder, policy } = input;
   const maxCommits = input.maxCommits ?? GC_DEFAULT_MAX_COMMITS;
   const maxDeletes = input.maxDeletes ?? GC_DEFAULT_MAX_DELETES;
   const maxRepoCommits = input.maxRepoCommits ?? 0;
   const head = await readHead(fs, syncFolder);
-  if (!head) return { scanned: 0, deleted: 0, deletedCommits: 0, more: false };
-
-  // 1) 沿提交链收集提交（分批串行，避免超子请求预算）
-  const commits: RepoCommit[] = [];
-  let cursor: string | null = head.commitId;
-  while (cursor && commits.length < maxCommits) {
-    const commit = await readCommitFast(fs, syncFolder, cursor);
-    if (!commit) break; // 提交链断裂（异常数据）：停止遍历，保守不删
-    commits.push(commit);
-    cursor = commit.parentCommitId;
+  if (!head) {
+    await deleteGcState(fs, syncFolder); // 仓库不存在/未初始化：清掉残留进度
+    return { scanned: 0, deleted: 0, deletedCommits: 0, more: false };
   }
-  const moreCommits = cursor !== null;
 
-  // 2) 时间机器式历史裁剪（仅当提交链完整遍历时执行，避免误删未遍历提交引用的对象）
-  //    从最旧端淘汰超出保留策略的提交及其独有的内容对象。
-  let deletedCommits = 0;
-  let keep = commits.length;
-  let boundaryTree: Map<string, RepoFile> | null = null;
-  if (!moreCommits && commits.length > 0 && policy) {
-    const layers = buildRetentionLayers(policy);
-    keep = computeKeepBoundary(commits, layers);
-    if (maxRepoCommits > 0 && keep > maxRepoCommits) keep = maxRepoCommits;
-    // 保留边界对齐到 checkpoint：最旧保留提交必须自带完整树快照，
-    // 否则裁剪后从保留提交 resolveTree 会沿父链访问已删除提交。
-    while (keep < commits.length && commits[keep - 1].checkpointId !== commits[keep - 1].commitId) keep++;
-    deletedCommits = commits.length - keep;
-    // 边界提交的检查点树：裁剪后所有保留提交的完整状态都可由
-    // 「边界检查点树 + 保留提交的增量变更」重建，其引用的 blob 必须全部保留，
-    // 否则长期未修改的文件（blob 只出现在已淘汰提交的变更里）会被误判为孤儿删除。
-    // 边界检查点缺失/损坏时无法证明可达性 → 保守取消裁剪（保留全部）。
-    if (deletedCommits > 0 && keep > 0) {
-      try {
-        boundaryTree = await loadCheckpoint(fs, syncFolder, commits[keep - 1].commitId);
-      } catch {
-        deletedCommits = 0;
-        keep = commits.length;
+  // 恢复或初始化进度。
+  let state = await loadGcState(fs, syncFolder);
+  // prev = 本次调用开始时磁盘上的进度（null = 尚未开始）。注意不能引用后创建的 state，
+  // 否则「全新扫描」会被误判为并发改动而放弃写入。
+  const prev = state;
+  // 已消耗的扫描预算（补扫新提交与续扫旧链共享同一预算）
+  let used = 0;
+  if (state && state.head !== head.commitId) {
+    // HEAD 已推进（如其他设备提交或本次同步产生的提交）：
+    // 不丢弃进度，而是把链头的新提交补扫进进度头部——链是线性的，链尾不变，
+    // 这样长链在多次同步之间也能持续推进到链尾，而不是每次同步都从 HEAD 重扫。
+    const fresh: GcState['commits'] = [];
+    let c: string | null = head.commitId;
+    let broken = false;
+    while (c && c !== state.head && used < maxCommits) {
+      const commit = await readCommitFast(fs, syncFolder, c);
+      if (!commit) {
+        broken = true;
+        break;
       }
+      fresh.push({
+        id: commit.commitId,
+        createdAt: commit.createdAt ?? 0,
+        checkpointId: commit.checkpointId,
+        blobs: commit.changes.map((cc) => cc.blobId).filter((b): b is string => !!b),
+      });
+      c = commit.parentCommitId;
+      used++;
+    }
+    if (broken) {
+      // 链断裂（异常数据）：无法证明裁剪安全 → 丢弃进度，保守不删任何对象，下次重扫
+      await deleteGcState(fs, syncFolder);
+      return { scanned: used, deleted: 0, deletedCommits: 0, more: false };
+    }
+    if (c === state.head) {
+      // 追到旧 head：新提交插到进度头部，继续沿用旧游标向链尾推进
+      state = { ...state, head: head.commitId, commits: [...fresh, ...state.commits] };
+    } else {
+      // 新提交数量超过单轮预算（未追到旧 head）：以新扫的部分重建进度，旧进度作废
+      state = { v: 1, head: head.commitId, commits: fresh, cursor: c, pending: [], deletedCommits: 0 };
+    }
+  } else if (!state) {
+    state = { v: 1, head: head.commitId, commits: [], cursor: head.commitId, pending: [], deletedCommits: 0 };
+  }
+
+  // 1) 续删上轮超出预算的待删对象（幂等；对不存在对象视为已删）
+  if (state.pending.length > 0) {
+    const batch = state.pending.slice(0, maxDeletes);
+    const rest = state.pending.slice(batch.length);
+    const deleted = await deleteKeys(fs, batch);
+    if (rest.length > 0) {
+      state.pending = rest;
+      await saveGcState(fs, syncFolder, state);
+      return { scanned: 0, deleted, deletedCommits: state.deletedCommits, more: true };
+    }
+    await deleteGcState(fs, syncFolder);
+    return { scanned: 0, deleted, deletedCommits: state.deletedCommits, more: false };
+  }
+
+  // 2) 沿提交链继续扫描（新→旧，接续上次进度）。每提交 1 次 get，受 maxCommits 预算限制。
+  const scannedCommits = [...state.commits];
+  let cursor = state.cursor;
+  let scanned = used;
+  while (cursor && scanned < maxCommits) {
+    const commit = await readCommitFast(fs, syncFolder, cursor);
+    if (!commit) {
+      // 提交链断裂（异常数据）：无法证明裁剪安全 → 丢弃进度，保守不删任何对象，下次重扫
+      await deleteGcState(fs, syncFolder);
+      return { scanned, deleted: 0, deletedCommits: 0, more: false };
+    }
+    scannedCommits.push({
+      id: commit.commitId,
+      createdAt: commit.createdAt ?? 0,
+      checkpointId: commit.checkpointId,
+      blobs: commit.changes.map((c) => c.blobId).filter((b): b is string => !!b),
+    });
+    cursor = commit.parentCommitId;
+    scanned++;
+  }
+
+  // 扫描未完成 → 持久化进度，more=true（后续调用从上次位置继续，不再从头扫）。
+  // 写前复查 state 文件是否已被其他调用推进；推进了则放弃本轮写入，避免覆盖丢数据。
+  if (cursor !== null) {
+    const current = await loadGcState(fs, syncFolder);
+    const unchanged =
+      prev === null ? current === null : current !== null && current.head === prev.head && current.commits.length === prev.commits.length && current.cursor === prev.cursor;
+    if (unchanged) {
+      await saveGcState(fs, syncFolder, { ...state, commits: scannedCommits, cursor, pending: [], deletedCommits: state.deletedCommits });
+    }
+    return { scanned, deleted: 0, deletedCommits: 0, more: true };
+  }
+
+  // 3) 完整链已扫描：时间机器式裁剪 + 孤儿清理（只在这里删除，链未遍历完绝不删对象）
+  const commits = scannedCommits;
+  const layers = policy ? buildRetentionLayers(policy) : [];
+  let keep = layers.length > 0 ? computeKeepBoundary(commits, layers) : commits.length;
+  if (maxRepoCommits > 0 && keep > maxRepoCommits) keep = maxRepoCommits;
+  // 保留边界对齐到 checkpoint：最旧保留提交必须自带完整树快照，
+  // 否则裁剪后从保留提交 resolveTree 会沿父链访问已删除提交。
+  while (keep < commits.length && commits[keep - 1].checkpointId !== commits[keep - 1].id) keep++;
+  let deletedCommits = commits.length - keep;
+  // 边界提交的检查点树：裁剪后所有保留提交的完整状态都可由
+  // 「边界检查点树 + 保留提交的增量变更」重建，其引用的 blob 必须全部保留，
+  // 否则长期未修改的文件（blob 只出现在已淘汰提交的变更里）会被误判为孤儿删除。
+  // 边界检查点缺失/损坏时无法证明可达性 → 保守取消裁剪（保留全部）。
+  let boundaryTree: Map<string, RepoFile> | null = null;
+  if (deletedCommits > 0 && keep > 0) {
+    try {
+      boundaryTree = await loadCheckpoint(fs, syncFolder, commits[keep - 1].id);
+    } catch {
+      deletedCommits = 0;
+      keep = commits.length;
     }
   }
 
@@ -915,49 +1057,40 @@ export async function gcRepository(input: GcRepositoryInput): Promise<GcReposito
   // （如 restore 复用历史内容对象），淘汰提交不能带走仍被保留提交引用的对象。
   const keepReferenced = new Set<string>();
   for (let i = 0; i < keep; i++) {
-    for (const change of commits[i].changes) if (change.blobId) keepReferenced.add(change.blobId);
+    for (const blob of commits[i].blobs) keepReferenced.add(blob);
   }
   // 边界检查点树引用的内容对象也必须保留（长期未修改文件只被树引用）
   if (boundaryTree) {
     for (const file of boundaryTree.values()) if (file.blobId) keepReferenced.add(file.blobId);
   }
 
-  // 3) 列出全部内容对象；.synx/（仓库本体 + 保留策略）整体保留，其余按引用清理
+  // 列出全部内容对象；.synx/（仓库本体 + 保留策略 + GC 进度）整体保留，其余按引用清理
   const prefix = `${syncFolder.replace(/\/+$/, '')}/`;
   const allKeys = await fs.list(prefix);
-  const orphanBlobs: string[] = [];
+  const toDelete: string[] = [];
   for (const key of allKeys) {
     const rel = key.slice(prefix.length);
     if (rel.startsWith('.synx')) continue;
-    if (!keepReferenced.has(key)) orphanBlobs.push(key);
+    if (!keepReferenced.has(key)) toDelete.push(key);
+  }
+  // 被淘汰提交的 commit/checkpoint 对象一并删除（幂等）
+  for (let i = keep; i < commits.length; i++) {
+    toDelete.push(commitKey(syncFolder, commits[i].id));
+    toDelete.push(checkpointKey(syncFolder, commits[i].id));
   }
 
-  // 4) 分批删除：内容对象 + 被淘汰提交的 commit/checkpoint 对象。
-  // 提交链未完整遍历（moreCommits）时，未遍历提交可能引用当前判定为孤儿的对象，
-  // 必须保守跳过删除（历史裁剪同理）。
-  const toDelete: string[] = moreCommits ? [] : orphanBlobs.slice(0, maxDeletes);
-  if (!moreCommits && deletedCommits > 0) {
-    for (let i = keep; i < commits.length; i++) {
-      toDelete.push(commitKey(syncFolder, commits[i].commitId));
-      toDelete.push(checkpointKey(syncFolder, commits[i].commitId));
-    }
-  }
+  // 4) 分批删除；超出单次预算的剩余对象持久化到进度，供下次调用续删
   let deleted = 0;
   if (toDelete.length > 0) {
-    if (fs.deleteMany) {
-      deleted = (await fs.deleteMany(toDelete)).deleted;
-    } else {
-      for (const key of toDelete) {
-        try {
-          await fs.delete(key);
-          deleted++;
-        } catch {
-          // 单个删除失败不影响其余
-        }
-      }
+    const batch = toDelete.slice(0, maxDeletes);
+    const rest = toDelete.slice(batch.length);
+    deleted = await deleteKeys(fs, batch);
+    if (rest.length > 0) {
+      // 已进入裁剪阶段，提交元数据不再需要 → 只保留续删清单，状态更小
+      await saveGcState(fs, syncFolder, { ...state, commits: [], cursor: null, pending: rest, deletedCommits });
+      return { scanned: allKeys.length, deleted, deletedCommits, more: true };
     }
   }
-
-  const more = moreCommits || orphanBlobs.length > toDelete.length;
-  return { scanned: allKeys.length, deleted, deletedCommits, more };
+  await deleteGcState(fs, syncFolder);
+  return { scanned: allKeys.length, deleted, deletedCommits, more: false };
 }

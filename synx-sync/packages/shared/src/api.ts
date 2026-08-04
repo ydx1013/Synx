@@ -5,6 +5,7 @@ import type {
   RepoDiffEntry,
   RepoFile,
   RepositoryHead,
+  ImageGallery,
   RetentionPolicy,
   StorageConfig,
   Storage,
@@ -27,6 +28,15 @@ export const API = {
   storageDelete: '/api/storage/:id',
   storagePurge: '/api/storage/:id/purge',
   storageRetention: '/api/storage/:id/retention',
+  // 图片图库
+  imageGalleryList: '/api/image-galleries',
+  imageGalleryCreate: '/api/image-galleries',
+  imageGalleryTest: '/api/image-galleries/test',
+  imageGalleryDetail: '/api/image-galleries/:id',
+  imageGalleryImages: '/api/image-galleries/:id/images',
+  imageGalleryContent: '/api/image-galleries/:id/images/content',
+  imageGalleryOrphanScan: '/api/image-galleries/:id/orphans/scan',
+  imageGalleryOrphanDelete: '/api/image-galleries/:id/orphans/delete',
   // 专用 API Token 与外部添加笔记
   tokenList: '/api/tokens',
   tokenCreate: '/api/tokens',
@@ -42,10 +52,7 @@ export const API = {
   repoRestore: '/api/repository/restore',
   repoTree: '/api/repository/tree',
   repoBlobs: '/api/repository/blobs',
-  repoMultipartStart: '/api/repository/multipart/start',
-  repoMultipartParts: '/api/repository/multipart/parts',
-  repoMultipartComplete: '/api/repository/multipart/complete',
-  repoMultipartAbort: '/api/repository/multipart/abort',
+  repoDirectUpload: '/api/repository/direct-upload/start',
   repoContent: '/api/repository/content',
   repoFileHistory: '/api/repository/file-history',
   repoGc: '/api/repository/gc',
@@ -144,6 +151,57 @@ export interface CreateInboxNoteResponse {
 
 export interface UpdateRetentionPolicyRequest extends Partial<RetentionPolicy> {}
 
+// ===== 图片图库 =====
+
+export interface ImageGalleryListResponse {
+  galleries: ImageGallery[];
+}
+
+export interface SaveImageGalleryRequest {
+  name: string;
+  owner: string;
+  repo: string;
+  branch: string;
+  folder: string;
+  token?: string;
+}
+
+export interface ImageGalleryResponse {
+  gallery: ImageGallery;
+}
+
+export interface ImageUploadResponse {
+  image: {
+    galleryId: string;
+    path: string;
+    visibility: 'public' | 'private';
+    markdownUrl: string;
+  };
+}
+
+export interface OrphanImage {
+  path: string;
+  sha: string;
+  size: number;
+  uploadedAt: number;
+}
+
+export interface OrphanScanRequest {
+  referencedPaths: string[];
+}
+
+export interface OrphanScanResponse {
+  images: OrphanImage[];
+}
+
+export interface OrphanDeleteRequest {
+  images: Pick<OrphanImage, 'path' | 'sha'>[];
+}
+
+export interface OrphanDeleteResponse {
+  deleted: string[];
+}
+
 // ===== Git 式仓库 API =====
 
 /** 仓库读取基线：HEAD + 完整内容树（当前远端文件列表） */
@@ -184,58 +242,20 @@ export interface RepoDiffResponse {
   deleted: number;
 }
 
-export interface MultipartUploadedPart {
-  partNumber: number;
-  etag: string;
-  size: number;
-}
-
-export interface MultipartStartRequest {
+/** 大文件直传：Worker 生成预签名 PUT URL，插件直接上传文件内容到对象存储（不经过 Worker）。 */
+export interface DirectUploadStartRequest {
   path: string;
   size: number;
   hash: string;
   mtime: number;
-  resume?: { blobId: string; uploadId: string };
 }
 
-export interface MultipartSessionResponse {
+export interface DirectUploadSessionResponse {
   blobId: string;
-  uploadId: string;
-  partSize: number;
-  partCount: number;
-  uploadedParts: MultipartUploadedPart[];
-}
-
-export interface MultipartPartsRequest {
-  path: string;
-  blobId: string;
-  uploadId: string;
-  partNumbers: number[];
-}
-
-export interface MultipartPartsResponse {
-  parts: Array<{ partNumber: number; url: string }>;
-}
-
-export interface MultipartCompleteRequest {
-  path: string;
-  blobId: string;
-  uploadId: string;
-  size: number;
-  hash: string;
-  parts: Array<{ partNumber: number; etag: string }>;
-}
-
-export interface MultipartCompleteResponse {
-  blobId: string;
-  size: number;
-  hash: string;
-}
-
-export interface MultipartAbortRequest {
-  path: string;
-  blobId: string;
-  uploadId: string;
+  /** 预签名 PUT URL：插件直接把整个文件内容 PUT 上去 */
+  uploadUrl: string;
+  /** URL 有效期（秒） */
+  expiresIn: number;
 }
 
 /** 原子提交变更集。冲突（HEAD 已被推进）返回 409 HEAD_CONFLICT。 */

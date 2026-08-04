@@ -5,12 +5,6 @@ import { checkConnectivity } from './connectivity.js';
 /** 向后兼容：保留原导出名，内部委托给通用 checkConnectivity */
 export const checkS3Connectivity = checkConnectivity;
 
-export interface S3UploadedPart {
-  partNumber: number;
-  etag: string;
-  size: number;
-}
-
 /**
  * S3 兼容存储适配器（支持 S3 / R2 / MinIO）。
  * 用 aws4fetch 做 AWS SigV4 签名。
@@ -105,53 +99,11 @@ export class S3Fs implements WorkerFs {
     return keys;
   }
 
-  async createMultipartUpload(key: string): Promise<string> {
-    const res = await this.client.fetch(`${this.url(key)}?uploads=`, { method: 'POST' });
-    const xml = await res.text();
-    if (!res.ok) throw new Error(`s3 create multipart failed (${res.status})`);
-    const uploadId = parseXmlValue(xml, 'UploadId');
-    if (!uploadId) throw new Error('s3 create multipart missing UploadId');
-    return uploadId;
-  }
-
-  async listMultipartParts(key: string, uploadId: string): Promise<S3UploadedPart[]> {
-    const parts: S3UploadedPart[] = [];
-    let marker: string | undefined;
-    do {
-      const markerParam = marker ? `&part-number-marker=${encodeURIComponent(marker)}` : '';
-      const res = await this.client.fetch(`${this.url(key)}?uploadId=${encodeURIComponent(uploadId)}${markerParam}`, { method: 'GET' });
-      if (!res.ok) throw new Error(`s3 list multipart parts failed (${res.status})`);
-      const xml = await res.text();
-      parts.push(...parseMultipartParts(xml));
-      marker = /<IsTruncated>true<\/IsTruncated>/.test(xml)
-        ? parseXmlValue(xml, 'NextPartNumberMarker')
-        : undefined;
-    } while (marker);
-    return parts;
-  }
-
-  async presignUploadPart(key: string, uploadId: string, partNumber: number, expiresSeconds: number): Promise<string> {
-    const url = `${this.url(key)}?partNumber=${partNumber}&uploadId=${encodeURIComponent(uploadId)}&X-Amz-Expires=${expiresSeconds}`;
+/** 为整个对象生成预签名 PUT URL（单请求直传大文件用），插件直接把文件内容 PUT 上去。 */
+  async presignPut(key: string, expiresSeconds: number): Promise<string> {
+    const url = `${this.url(key)}?X-Amz-Expires=${expiresSeconds}`;
     const request = await this.client.sign(new Request(url, { method: 'PUT' }), { aws: { signQuery: true } });
     return request.url;
-  }
-
-  async completeMultipartUpload(key: string, uploadId: string, parts: S3UploadedPart[]): Promise<void> {
-    const ordered = [...parts].sort((a, b) => a.partNumber - b.partNumber);
-    const body = `<CompleteMultipartUpload>${ordered.map((part) => `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${escapeXml(part.etag)}</ETag></Part>`).join('')}</CompleteMultipartUpload>`;
-    const res = await this.client.fetch(`${this.url(key)}?uploadId=${encodeURIComponent(uploadId)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/xml' },
-      body,
-    });
-    const xml = await res.text();
-    const errorCode = parseXmlValue(xml, 'Code');
-    if (!res.ok || errorCode) throw new Error(`s3 complete multipart failed (${errorCode ?? res.status})`);
-  }
-
-  async abortMultipartUpload(key: string, uploadId: string): Promise<void> {
-    const res = await this.client.fetch(`${this.url(key)}?uploadId=${encodeURIComponent(uploadId)}`, { method: 'DELETE' });
-    if (!res.ok && res.status !== 404) throw new Error(`s3 abort multipart failed (${res.status})`);
   }
 
   async deleteMany(keys: string[]): Promise<{ deleted: number; failed: number }> {
@@ -196,21 +148,6 @@ function escapeXml(s: string): string {
  */
 function encodeS3Prefix(prefix: string): string {
   return encodeURIComponent(prefix).replace(/%25[0-9A-Fa-f]{2}/g, (m) => `%${m.slice(3)}`);
-}
-
-function parseMultipartParts(xml: string): S3UploadedPart[] {
-  const parts: S3UploadedPart[] = [];
-  const re = /<Part>([\s\S]*?)<\/Part>/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(xml)) !== null) {
-    const partNumber = Number(parseXmlValue(match[1], 'PartNumber'));
-    const etag = parseXmlValue(match[1], 'ETag');
-    const size = Number(parseXmlValue(match[1], 'Size'));
-    if (Number.isInteger(partNumber) && partNumber > 0 && etag && Number.isFinite(size) && size >= 0) {
-      parts.push({ partNumber, etag, size });
-    }
-  }
-  return parts;
 }
 
 function parseListValues(xml: string, tag: string): string[] {

@@ -14,13 +14,11 @@ import {
   type RepoFile,
   type RepoFileHistoryResponse,
   type RepoGcResponse,
-  type MultipartStartRequest,
-  type MultipartSessionResponse,
-  type MultipartPartsRequest,
-  type MultipartPartsResponse,
-  type MultipartCompleteRequest,
-  type MultipartCompleteResponse,
-  type MultipartAbortRequest,
+  type DirectUploadStartRequest,
+  type DirectUploadSessionResponse,
+  type ImageGallery,
+  type ImageGalleryListResponse,
+  type ImageUploadResponse,
 } from '@synx/shared';
 
 /**
@@ -121,28 +119,15 @@ export class WorkerClient {
     return data.blobId;
   }
 
-  async startMultipart(input: MultipartStartRequest): Promise<MultipartSessionResponse> {
-    return this.request<MultipartSessionResponse>('POST', API.repoMultipartStart, input);
+  /** 大文件直传：向 Worker 申请预签名 PUT URL（服务端生成 blobId） */
+  async startDirectUpload(input: DirectUploadStartRequest): Promise<DirectUploadSessionResponse> {
+    return this.request<DirectUploadSessionResponse>('POST', API.repoDirectUpload, input);
   }
 
-  async getMultipartPartUrls(input: MultipartPartsRequest): Promise<MultipartPartsResponse> {
-    return this.request<MultipartPartsResponse>('POST', API.repoMultipartParts, input);
-  }
-
-  async uploadMultipartPart(url: string, content: ArrayBuffer | Uint8Array): Promise<string> {
+  /** 把整个文件内容直接 PUT 到对象存储（不带 Worker 的 JWT/仓库头），由 finalize 时校验 blob 存在 */
+  async uploadDirect(url: string, content: ArrayBuffer | Uint8Array): Promise<void> {
     const res = await this.fetchImpl(url, { method: 'PUT', body: content as BodyInit });
     if (!res.ok) throw new WorkerApiError(res.status, await safeErrorText(res));
-    const etag = res.headers.get('etag');
-    if (!etag) throw new Error('对象存储响应缺少 ETag，请检查 CORS ExposeHeaders 配置');
-    return etag;
-  }
-
-  async completeMultipart(input: MultipartCompleteRequest): Promise<MultipartCompleteResponse> {
-    return this.request<MultipartCompleteResponse>('POST', API.repoMultipartComplete, input);
-  }
-
-  async abortMultipart(input: MultipartAbortRequest): Promise<void> {
-    await this.request<{ ok: true }>('POST', API.repoMultipartAbort, input);
   }
 
   /** 原子提交变更集（CAS）。HEAD 已被推进时抛 WorkerApiError(409) */
@@ -204,6 +189,24 @@ export class WorkerClient {
     return data.storages;
   }
 
+  static async listImageGalleries(
+    serverUrl: string,
+    jwt: string,
+    fetchImpl: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args),
+  ): Promise<ImageGallery[]> {
+    const res = await fetchImpl(joinUrl(normalizeServerUrl(serverUrl), API.imageGalleryList), {
+      headers: { [HEADERS.authorization]: `Bearer ${jwt}` },
+    });
+    if (!res.ok) throw new WorkerApiError(res.status, await safeErrorText(res));
+    return ((await res.json()) as ImageGalleryListResponse).galleries;
+  }
+
+  async uploadGalleryImage(galleryId: string, content: ArrayBuffer | Uint8Array, mimeType: string): Promise<ImageUploadResponse['image']> {
+    const path = API.imageGalleryImages.replace(':id', encodeURIComponent(galleryId));
+    const res = await this.requestResponse('POST', path, content, true, mimeType);
+    return ((await res.json()) as ImageUploadResponse).image;
+  }
+
   /** 读取当前 storage 的保留策略（未配置时返回服务端默认） */
   async getRetentionPolicy(): Promise<RetentionPolicy> {
     const storageId = this.opts.storageId;
@@ -230,7 +233,7 @@ export class WorkerClient {
    * @param body 普通对象（JSON）或 ArrayBuffer/Uint8Array（二进制直传）
    * @param isBinary body 为二进制时置 true（Content-Type 用 octet-stream）
    */
-  private async requestResponse(method: string, path: string, body?: unknown, isBinary = false): Promise<Response> {
+  private async requestResponse(method: string, path: string, body?: unknown, isBinary = false, binaryContentType = 'application/octet-stream'): Promise<Response> {
     let lastErr: unknown;
     const url = joinUrl(this.opts.serverUrl, path);
     const isUpload = method === 'POST' && body !== undefined;
@@ -241,7 +244,7 @@ export class WorkerClient {
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       const startedAt = Date.now();
       try {
-        const headers = this.headers(body !== undefined, isBinary);
+        const headers = this.headers(body !== undefined, isBinary, binaryContentType);
         const bodyData = body !== undefined && !isBinary ? JSON.stringify(body) : body;
         const bodyLen = typeof bodyData === 'string' ? bodyData.length : bodyData instanceof ArrayBuffer ? bodyData.byteLength : 0;
         console.log('synx request', { method, url, attempt: attempt + 1, bodyLen, timeoutMs });
@@ -307,13 +310,13 @@ export class WorkerClient {
     throw lastErr ?? new Error('request failed');
   }
 
-  private headers(hasBody: boolean, isBinary = false): Record<string, string> {
+  private headers(hasBody: boolean, isBinary = false, binaryContentType = 'application/octet-stream'): Record<string, string> {
     const h: Record<string, string> = {
       [HEADERS.authorization]: `Bearer ${this.opts.jwt}`,
       [HEADERS.storageId]: this.opts.storageId,
       [HEADERS.syncFolder]: this.opts.syncFolder,
     };
-    if (hasBody) h[HEADERS.contentType] = isBinary ? 'application/octet-stream' : 'application/json';
+    if (hasBody) h[HEADERS.contentType] = isBinary ? binaryContentType : 'application/json';
     return h;
   }
 }

@@ -12,6 +12,10 @@ export interface SynxPluginSettings {
   storageName: string | null;
   /** 备份存储 ID 列表：主存储同步完成后，本地内容会以仅 push 方式镜像到这些存储 */
   backupStorageIds: string[];
+  /** 是否把新粘贴/拖入的图片上传到所选图库 */
+  imageHostingEnabled: boolean;
+  imageGalleryId: string;
+  imageGalleryName: string;
   syncFolder: string;
   deviceName: string;
   periodicSyncEnabled: boolean;
@@ -57,6 +61,9 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   storageId: null,
   storageName: null,
   backupStorageIds: [],
+  imageHostingEnabled: false,
+  imageGalleryId: '',
+  imageGalleryName: '',
   syncFolder: 'my-vault/',
   deviceName,
   periodicSyncEnabled: true,
@@ -116,6 +123,9 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     storageId: nullableString(source.storageId),
     storageName: nullableString(source.storageName),
     backupStorageIds: normalizeStorageIds(source.backupStorageIds),
+    imageHostingEnabled: booleanValue(source.imageHostingEnabled, defaults.imageHostingEnabled),
+    imageGalleryId: stringValue(source.imageGalleryId, defaults.imageGalleryId),
+    imageGalleryName: stringValue(source.imageGalleryName, defaults.imageGalleryName),
     syncFolder: stringValue(source.syncFolder, defaults.syncFolder),
     deviceName: stringValue(source.deviceName, defaults.deviceName),
     periodicSyncEnabled: booleanValue(source.periodicSyncEnabled, legacyInterval > 0),

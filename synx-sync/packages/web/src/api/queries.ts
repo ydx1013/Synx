@@ -3,6 +3,7 @@ import type {
   FileMeta, MeResponse, RepoChange, RepoCommitsResponse, RepoDiffResponse, RepoFileHistoryResponse, RepoFinalizeRequest,
   RepoFinalizeResponse, RepoGcResponse, RepoHeadResponse, RepoRestoreRequest, RepoRestoreResponse, RepositoryHead,
   PreferencesResponse, StorageListResponse, StorageSummary, UpdatePreferencesRequest,
+  ImageGalleryListResponse, ImageGalleryResponse, SaveImageGalleryRequest,
 } from '@synx/shared';
 import { ApiError, api, clearSession } from './client';
 
@@ -29,6 +30,14 @@ export const storageApi = {
   test: (body: unknown) => api<{ ok: boolean; message?: string }>('/api/storage/test', { method: 'POST', body: JSON.stringify(body) }),
   remove: (id: string) => api<{ ok: true; remoteFilesPreserved: true }>(`/api/storage/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   purge: (id: string) => api<{ total: number; deleted: number; failed: number }>(`/api/storage/${encodeURIComponent(id)}/purge`, { method: 'POST' }),
+};
+
+export const galleryApi = {
+  list: () => api<ImageGalleryListResponse>('/api/image-galleries'),
+  get: (id: string) => api<ImageGalleryResponse>(`/api/image-galleries/${encodeURIComponent(id)}`),
+  save: (id: string | undefined, body: SaveImageGalleryRequest) => api<ImageGalleryResponse>(id ? `/api/image-galleries/${encodeURIComponent(id)}` : '/api/image-galleries', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) }),
+  test: (body: SaveImageGalleryRequest) => api<{ isPrivate: boolean }>('/api/image-galleries/test', { method: 'POST', body: JSON.stringify(body) }),
+  remove: (id: string) => api<{ ok: true; remoteImagesPreserved: true }>(`/api/image-galleries/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 };
 
 export const tokenApi = {

@@ -20,7 +20,10 @@ export class SynxSettingTab extends PluginSettingTab {
     containerEl.addClass('synx-settings');
     this.renderServer(containerEl, settings);
     this.renderAccount(containerEl, settings);
-    if (settings.jwt) this.renderStorage(containerEl, settings);
+    if (settings.jwt) {
+      this.renderStorage(containerEl, settings);
+      this.renderImageHosting(containerEl, settings);
+    }
     this.renderAutomatic(containerEl, settings);
     this.renderFiltering(containerEl, settings);
     this.renderPerformance(containerEl, settings);
@@ -87,6 +90,26 @@ export class SynxSettingTab extends PluginSettingTab {
     new Setting(container).setName('同步文件夹').setDesc('存储内的根路径').addText((text) => text.setValue(settings.syncFolder).onChange(async (value) => this.applyPatch({ syncFolder: value.trim() })));
     new Setting(container).setName('设备名').setDesc('用于冲突副本和版本历史').addText((text) => text.setValue(settings.deviceName).onChange(async (value) => this.applyPatch({ deviceName: value.trim() })));
     this.renderBackupStorages(container, settings);
+  }
+
+  private renderImageHosting(container: HTMLElement, settings: SynxPluginSettings): void {
+    container.createEl('h3', { text: '图片图床' });
+    new Setting(container).setName('自动上传粘贴/拖入图片').setDesc('关闭时完全使用 Obsidian 原有本地附件行为').addToggle((toggle) => toggle.setValue(settings.imageHostingEnabled).onChange(async (value) => this.applyPatch({ imageHostingEnabled: value })));
+    new Setting(container).setName('默认图库').setDesc(settings.imageGalleryName || '未选择').addDropdown(async (dropdown) => {
+      dropdown.addOption('', '请选择图库');
+      try {
+        const galleries = await WorkerClient.listImageGalleries(settings.serverUrl, settings.jwt);
+        for (const gallery of galleries) dropdown.addOption(gallery.id, `${gallery.name} (${gallery.isPrivate ? '私有' : '公开'})`);
+        dropdown.setValue(settings.imageGalleryId);
+        dropdown.onChange(async (id) => {
+          const gallery = galleries.find((item) => item.id === id);
+          await this.applyPatch({ imageGalleryId: id, imageGalleryName: gallery?.name ?? '' });
+          this.display();
+        });
+      } catch (error) {
+        this.showError('拉取图库列表失败', error);
+      }
+    });
   }
 
   /** 备份存储多选：主存储同步完成后，本地内容以仅 push 方式镜像到这些存储 */

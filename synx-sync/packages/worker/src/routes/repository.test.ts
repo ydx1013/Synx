@@ -41,31 +41,38 @@ function headers(extras: Record<string, string> = {}) {
   };
 }
 
-describe('POST /api/repository/multipart/start', () => {
+describe('POST /api/repository/direct-upload/start', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => {
       const request = input instanceof Request ? input : new Request(input);
       if (request.url.includes('retention.json')) return Promise.resolve(new Response('', { status: 404 }));
-      if (request.url.includes('uploads=')) {
-        return Promise.resolve(new Response('<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>', { status: 200 }));
-      }
       return Promise.resolve(new Response('', { status: 200 }));
     }));
   });
 
-  it('创建 S3 Multipart 会话且不接收文件内容', async () => {
+  it('返回预签名 PUT 直传 URL 且不接收文件内容', async () => {
     const env = await makeEnvWithStorage();
-    const res = await app.request('/api/repository/multipart/start', {
+    const res = await app.request('/api/repository/direct-upload/start', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ path: 'large.bin', size: 10 * 1024 * 1024, hash: 'a'.repeat(64), mtime: 1700000000000 }),
     }, env);
     expect(res.status).toBe(201);
-    const data = await res.json() as { blobId: string; uploadId: string; partSize: number; partCount: number };
+    const data = await res.json() as { blobId: string; uploadUrl: string; expiresIn: number };
     expect(data.blobId).toContain('my-vault/large.bin@');
-    expect(data.uploadId).toBe('upload-1');
-    expect(data.partSize).toBe(16 * 1024 * 1024);
-    expect(data.partCount).toBe(1);
+    expect(data.uploadUrl).toContain('large.bin');
+    expect(data.uploadUrl).toContain('X-Amz-Signature');
+    expect(data.expiresIn).toBe(900);
+  });
+
+  it('超过服务端保留策略默认 20MB 时返回 413', async () => {
+    const env = await makeEnvWithStorage();
+    const res = await app.request('/api/repository/direct-upload/start', {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ path: 'big.bin', size: 30 * 1024 * 1024, hash: 'a'.repeat(64), mtime: 1700000000000 }),
+    }, env);
+    expect(res.status).toBe(413);
   });
 });
 
