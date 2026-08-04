@@ -42,6 +42,11 @@ export interface SynxPluginSettings {
 
 export const SYNX_LOGIN_URL = 'https://synx.yueyang.eu.org/login';
 
+/** 同步报告保留上限（份） */
+export const MAX_REPORT_RETENTION = 500;
+/** 同步报告保留默认值：保留足够多的报告，使「同步详情」日志列表能凑够最近 500 条 */
+export const DEFAULT_REPORT_RETENTION = 100;
+
 const deviceName = 'obsidian-' + Math.random().toString(36).slice(2, 8);
 
 export const DEFAULT_SETTINGS: SynxPluginSettings = {
@@ -67,7 +72,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   allowPatterns: [],
   conflictStrategy: 'newer-with-copy',
   showStatusBar: true,
-  reportRetention: 1,
+  reportRetention: DEFAULT_REPORT_RETENTION,
   showMarkdownUuid: false,
   historyStyle: 'cards',
   massDeleteProtectPercent: 50,
@@ -88,6 +93,16 @@ const historyStyles = new Set<HistoryStyle>(['cards', 'timeline']);
 const saveDelays = new Set([0, 5, 10, 30]);
 const concurrencyValues = new Set([1, 2, 3, 5, 10]);
 const fileSizeValues = new Set([0, 1, 5, 10, 20, 50, 100, 200, 500, 1000]);
+
+/** 保留策略单文件上限：UI 以 MB 显示，存储为字节；0 表示不限 */
+export function maxFileSizeMbToBytes(mb: number): number {
+  return mb === 0 ? 0 : mb * 1024 * 1024;
+}
+
+/** 保留策略单文件上限：字节转 MB（供 UI 显示），0 表示不限 */
+export function maxFileSizeBytesToMb(bytes: number): number {
+  return bytes === 0 ? 0 : Math.round(bytes / (1024 * 1024));
+}
 
 export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginSettings {
   const source = isRecord(raw) ? raw : {};
@@ -116,7 +131,7 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     allowPatterns: normalizeRules(source.allowPatterns),
     conflictStrategy: typeof source.conflictStrategy === 'string' && conflictStrategies.has(source.conflictStrategy as ConflictStrategy) ? source.conflictStrategy as ConflictStrategy : defaults.conflictStrategy,
     showStatusBar: booleanValue(source.showStatusBar, defaults.showStatusBar),
-    reportRetention: validPositiveNumber(source.reportRetention) ? Math.min(100, Math.floor(source.reportRetention)) : defaults.reportRetention,
+    reportRetention: validPositiveNumber(source.reportRetention) ? Math.min(MAX_REPORT_RETENTION, Math.floor(source.reportRetention)) : defaults.reportRetention,
     showMarkdownUuid: booleanValue(source.showMarkdownUuid, defaults.showMarkdownUuid),
     historyStyle: typeof source.historyStyle === 'string' && historyStyles.has(source.historyStyle as HistoryStyle) ? source.historyStyle as HistoryStyle : defaults.historyStyle,
     massDeleteProtectPercent: validPercentage(source.massDeleteProtectPercent) ? source.massDeleteProtectPercent : defaults.massDeleteProtectPercent,

@@ -2,6 +2,7 @@ import { App, Modal, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type { RetentionPolicy } from '@synx/shared';
 import type SynxSyncPlugin from './main.js';
 import type { ConflictStrategy, HistoryStyle, SynxPluginSettings } from './settings.js';
+import { DEFAULT_REPORT_RETENTION, MAX_REPORT_RETENTION, maxFileSizeBytesToMb, maxFileSizeMbToBytes } from './settings.js';
 import { WorkerApiError, WorkerClient } from './workerClient.js';
 
 export class SynxSettingTab extends PluginSettingTab {
@@ -230,7 +231,8 @@ export class SynxSettingTab extends PluginSettingTab {
       cls: 'setting-item-description',
     });
 
-    const fields: { key: keyof RetentionPolicy; label: string; desc: string }[] = [
+    const fields: { key: keyof RetentionPolicy; label: string; desc: string; mb?: boolean }[] = [
+      { key: 'maxFileSize', label: '单文件大小上限', desc: '超过该大小（MB）的文件不会同步，0=不限；同时约束插件筛选与服务端保留', mb: true },
       { key: 'hourlyWindowHours', label: '每小时', desc: '保留最近 N 小时内、每小时最新 1 份（例：24 = 最近 24 小时每小时 1 份）' },
       { key: 'dailyWindowDays', label: '每天', desc: '保留最近 N 天内、每天最新 1 份' },
       { key: 'monthlyWindowMonths', label: '每月', desc: '保留最近 N 个月内、每月最新 1 份' },
@@ -240,14 +242,15 @@ export class SynxSettingTab extends PluginSettingTab {
 
     for (const field of fields) {
       new Setting(container).setName(field.label).setDesc(field.desc).addText((text) => {
-        text.setValue(String(settings.retention[field.key]));
+        // 单文件上限以 MB 显示、字节存储；其余字段值直接展示
+        text.setValue(field.mb ? String(maxFileSizeBytesToMb(settings.retention[field.key] as number)) : String(settings.retention[field.key]));
         text.inputEl.type = 'number';
         text.inputEl.min = '0';
         text.inputEl.max = '99999';
         text.onChange(async (value) => {
           const number = Number(value);
           if (!Number.isInteger(number) || number < 0) return;
-          const next = { ...settings.retention, [field.key]: number };
+          const next = { ...settings.retention, [field.key]: field.mb ? maxFileSizeMbToBytes(number) : number };
           await this.applyPatch({ retention: next });
           await this.pushRetentionToRemote(next);
         });
@@ -269,9 +272,9 @@ export class SynxSettingTab extends PluginSettingTab {
   private renderReports(container: HTMLElement, settings: SynxPluginSettings): void {
     container.createEl('h3', { text: '同步报告' });
     this.addToggle(container, '显示状态栏', settings.showStatusBar, async (value) => this.applyPatch({ showStatusBar: value }));
-    new Setting(container).setName('保留报告数').setDesc('1-100，默认仅保留最近 1 份').addText((text) => text.setValue(String(settings.reportRetention)).onChange(async (value) => {
+    new Setting(container).setName('保留报告数').setDesc(`1-${MAX_REPORT_RETENTION}，默认保留最近 ${DEFAULT_REPORT_RETENTION} 份；同步详情日志最多显示最近 500 条`).addText((text) => text.setValue(String(settings.reportRetention)).onChange(async (value) => {
       const number = Number(value);
-      if (Number.isInteger(number) && number >= 1 && number <= 100) await this.applyPatch({ reportRetention: number });
+      if (Number.isInteger(number) && number >= 1 && number <= MAX_REPORT_RETENTION) await this.applyPatch({ reportRetention: number });
     }));
     this.addToggle(container, '显示笔记 UUID', settings.showMarkdownUuid, async (value) => this.applyPatch({ showMarkdownUuid: value }));
     new Setting(container).setName('历史记录样式').addDropdown((dropdown) => {

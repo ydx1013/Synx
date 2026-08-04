@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { loadPluginSettings } from './settings.js';
+import { loadPluginSettings, maxFileSizeMbToBytes, maxFileSizeBytesToMb } from './settings.js';
+
+describe('保留策略单文件上限换算（UI 用 MB，存储用字节；0=不限）', () => {
+  it('MB 转字节：50 -> 52428800', () => {
+    expect(maxFileSizeMbToBytes(50)).toBe(50 * 1024 * 1024);
+  });
+  it('字节转 MB：52428800 -> 50', () => {
+    expect(maxFileSizeBytesToMb(50 * 1024 * 1024)).toBe(50);
+  });
+  it('0 表示不限，双向保持 0', () => {
+    expect(maxFileSizeMbToBytes(0)).toBe(0);
+    expect(maxFileSizeBytesToMb(0)).toBe(0);
+  });
+});
+
 
 describe('loadPluginSettings', () => {
   it('always uses the fixed Synx login URL', () => {
@@ -49,7 +63,7 @@ describe('loadPluginSettings', () => {
     expect(settings.saveSyncDelaySec).toBe(5);
     expect(settings.maxFileSizeMb).toBe(20);
     expect(settings.concurrency).toBe(5);
-    expect(settings.reportRetention).toBe(1);
+    expect(settings.reportRetention).toBe(100);
     expect(settings.conflictStrategy).toBe('newer-with-copy');
   });
 
