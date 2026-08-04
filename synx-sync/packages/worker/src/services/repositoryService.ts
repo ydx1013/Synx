@@ -22,6 +22,7 @@ const REPO_DIR = '.synx/repo';
 const CHECKPOINT_INTERVAL = 10;
 const COMMIT_PAGE_SIZE = 50;
 const FILE_HISTORY_LIMIT = 200;
+const FILE_HISTORY_SCAN_LIMIT = 40;
 const LOCK_TTL_MS = 15_000;
 const LOCK_ACQUIRE_RETRIES = 20;
 const LOCK_RETRY_DELAY_MS = 100;
@@ -636,13 +637,16 @@ export async function fileHistory(
   identity: string,
   limit: number = FILE_HISTORY_LIMIT,
   from?: string,
+  scanLimit: number = FILE_HISTORY_SCAN_LIMIT,
 ): Promise<{ commits: RepoCommitSummary[]; changes: RepoChange[]; nextCursor: string | null }> {
   const commits: RepoCommitSummary[] = [];
   const changes: RepoChange[] = [];
+  let scanned = 0;
   // 游标：首次从头开始；分页时 from 即为下一个待扫描提交（该提交尚未处理）
   let commitId: string | null = from ?? head.commitId;
-  while (commitId && commits.length < limit) {
+  while (commitId && commits.length < limit && scanned < scanLimit) {
     const commit = await readCommit(fs, syncFolder, commitId);
+    scanned++;
     if (!commit) break;
     const matched = commit.changes.filter((c) => c.identity === identity);
     if (matched.length > 0) {

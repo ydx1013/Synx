@@ -87,7 +87,7 @@ export class HistoryPaneView extends ItemView {
     if (!silent) this.renderLoading(path);
     try {
       // 首次加载：从头拉取；分页加载时保留已有版本，只追加更早的历史
-      const append = this.versions.length > 0 && this.nextCursor !== null && !silent;
+      const append = this.nextCursor !== null && !silent;
       const from = append ? this.nextCursor : undefined;
       const fileUuid = await this.plugin.getFileUuid(path);
       // 单文件历史从提交链派生；HEAD 用于标记"当前"版本
@@ -168,7 +168,7 @@ export class HistoryPaneView extends ItemView {
     this.contentEl.empty();
     this.contentEl.createEl('h4', { text: 'Synx 版本历史' });
     this.contentEl.createEl('p', { text: this.currentFile ?? '' });
-    if (this.versions.length === 0) {
+    if (this.versions.length === 0 && !this.nextCursor) {
       this.contentEl.createEl('p', { text: '无版本记录。' });
       return;
     }
