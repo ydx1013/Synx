@@ -80,10 +80,10 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   enableDebugLog: false,
   retention: {
     maxFileSize: 20 * 1024 * 1024,
-    hourlyWindowHours: 60,
-    dailyWindowDays: 24,
-    monthlyWindowMonths: 30,
-    yearlyWindowYears: 3,
+    hourlyWindowHours: 24,
+    dailyWindowDays: 30,
+    monthlyWindowMonths: 12,
+    yearlyWindowYears: 5,
     maxVersionsPerFile: 1000,
   },
 };
