@@ -67,6 +67,8 @@ repository.get('/head', async (c) => {
   try {
     const { fs } = await getFs(c.env, c.get('userId'), storageId);
     const head = await readHead(fs, syncFolder);
+    // 仓库数据只存在用户存储的文本对象中，绝不用 KV/D1 存仓库数据。
+    // 树解析沿提交链回溯到最近 checkpoint，串行读取存储对象。
     const tree = head ? (await readTree(fs, syncFolder, head.commitId)).files : [];
     const res: RepoHeadResponse = { head, tree, storageId, syncFolder };
     return c.json(res);
@@ -287,9 +289,12 @@ repository.get('/file-history', async (c) => {
     const head = await readHead(fs, syncFolder);
     if (!head) throw new RepoNotInitializedError();
     const identity = fileUuid ?? `path:${path}`;
-    const scanLimit = fileUuid ? undefined : 10;
+    // 单文件历史首次加载限制扫描提交数，配合分页游标续扫：每个提交一次存储读
+    // （约 300ms），扫满 30 个就是 ~9s，用户会一直看到"加载中"。降到 15 后
+    // 首屏约 4.5s；"加载更多"用 from 游标继续，不会漏历史。
+    const scanLimit = 15;
     const { commits, changes, nextCursor } = await fileHistory(fs, syncFolder, head, identity, undefined, from, scanLimit);
-    const res: RepoFileHistoryResponse = { identity, commits, changes, nextCursor };
+    const res: RepoFileHistoryResponse = { identity, commits, changes, headCommitId: head.commitId, nextCursor };
     return c.json(res);
   } catch (e) {
     return handleError(c, e);
@@ -342,7 +347,12 @@ function handleError(c: any, e: unknown): Response {
   if (e instanceof CommitNotFoundError) return c.json({ error: e.message, code: 'COMMIT_NOT_FOUND' }, 404);
   if (e instanceof BlobMissingError) return c.json({ error: e.message, code: 'BLOB_MISSING' }, 422);
   if (e instanceof EmptyChangesError) return c.json({ error: e.message, code: 'EMPTY_CHANGES' }, 400);
-  if (e instanceof RepoIntegrityError) return c.json({ error: e.message, code: 'REPO_INTEGRITY' }, 500);
+  if (e instanceof RepoIntegrityError) {
+    // #region debug-point A:repo-integrity
+    logError(c, 'repository_integrity_error', e);
+    // #endregion
+    return c.json({ error: e.message, code: 'REPO_INTEGRITY' }, 500);
+  }
   logError(c, 'repository_route_error', e);
   return c.json({ error: 'internal error' }, 500);
 }

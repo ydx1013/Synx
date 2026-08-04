@@ -305,6 +305,8 @@ export interface RepoFileHistoryResponse {
   identity: string;
   commits: RepoCommitSummary[];
   changes: RepoChange[];
+  /** 当前 HEAD 提交 id：客户端用它标记"当前版本"，避免再请求 /head（整树解析很慢） */
+  headCommitId: string | null;
   /** 有下一页时返回游标（下次请求的 from 提交 id）；没有则为空 */
   nextCursor: string | null;
 }

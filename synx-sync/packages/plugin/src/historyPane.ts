@@ -90,13 +90,11 @@ export class HistoryPaneView extends ItemView {
       const append = this.nextCursor !== null && !silent;
       const from = append ? this.nextCursor : undefined;
       const fileUuid = await this.plugin.getFileUuid(path);
-      // 单文件历史从提交链派生；HEAD 用于标记"当前"版本
-      const [history, head] = await Promise.all([
-        client.repoFileHistory(path, fileUuid, from ?? undefined),
-        client.repoHead(),
-      ]);
+      // 单文件历史从提交链派生，headCommitId 已内联在响应里（标记"当前"版本）。
+      // 不再额外请求 /head：/head 要回溯解析整棵树，会让历史面板一直"加载中"。
+      const history = await client.repoFileHistory(path, fileUuid, from ?? undefined);
       if (requestId !== this.requestId || path !== this.currentFile) return;
-      const headCommitId = head.head?.commitId ?? null;
+      const headCommitId = history.headCommitId ?? null;
       const next: HistoryEntry[] = history.commits
         .map((c, i) => {
           const change = history.changes[i];
