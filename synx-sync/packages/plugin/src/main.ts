@@ -749,7 +749,7 @@ export default class SynxSyncPlugin extends Plugin {
       } catch (writeError) {
         console.warn('synx: failed to write sync failure log', writeError);
       }
-      new Notice(`Synx 同步失败：${normalized.message}${normalized.detail ? `（${normalized.detail}）` : ''}`, 10000);
+      new Notice(`Synx 同步失败：${normalized.message}`, 5000);
       await this.persist();
       this.updateProgress();
     }
@@ -842,9 +842,11 @@ export default class SynxSyncPlugin extends Plugin {
   private finishSyncReport(): SyncReport {
     const report = this.reportStore.finish();
     this.updateProgress();
-    // 全是跳过 / 无实际变更时不弹通知，避免无意义打扰；状态栏仍会更新
-    if (report.stats.success > 0 || report.stats.failed > 0) {
-      new Notice(`Synx 完成：成功 ${report.stats.success}，失败 ${report.stats.failed}，跳过 ${report.stats.skipped}`, 4000);
+    // 同步完成后仅极短提示，状态栏已显示详情
+    if (report.stats.failed > 0) {
+      new Notice(`Synx: ${report.stats.failed} 个文件失败`, 3000);
+    } else if (report.stats.success > 0) {
+      new Notice(`Synx: 同步完成`, 1500);
     }
     return report;
   }
