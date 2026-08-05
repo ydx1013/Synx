@@ -20,7 +20,7 @@ import type { Env } from '../types.js';
 
 const REPO_DIR = '.synx/repo';
 const CHECKPOINT_INTERVAL = 10;
-const COMMIT_PAGE_SIZE = 50;
+const COMMIT_PAGE_SIZE = 40;
 const FILE_HISTORY_LIMIT = 200;
 const LOCK_TTL_MS = 15_000;
 const LOCK_ACQUIRE_RETRIES = 20;
@@ -603,7 +603,7 @@ export async function listCommits(
   const commits: RepoCommitSummary[] = [];
   let commitId: string | null = cursor ?? head.commitId;
   while (commitId && commits.length < pageSize) {
-    const commit = await readCommit(fs, syncFolder, commitId);
+    const commit = await readCommitFast(fs, syncFolder, commitId);
     if (!commit) break;
     commits.push(toSummary(commit));
     commitId = commit.parentCommitId;
@@ -642,7 +642,7 @@ export async function fileHistory(
   // 游标：首次从头开始；分页时 from 即为下一个待扫描提交（该提交尚未处理）
   let commitId: string | null = from ?? head.commitId;
   while (commitId && commits.length < limit) {
-    const commit = await readCommit(fs, syncFolder, commitId);
+    const commit = await readCommitFast(fs, syncFolder, commitId);
     if (!commit) break;
     const matched = commit.changes.filter((c) => c.identity === identity);
     if (matched.length > 0) {

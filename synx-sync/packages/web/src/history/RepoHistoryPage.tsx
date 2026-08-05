@@ -228,6 +228,23 @@ export function RepoHistoryPage() {
     }
   };
 
+  // 重建历史索引
+  const [rebuildStatus, setRebuildStatus] = useState('');
+  const [rebuildLoading, setRebuildLoading] = useState(false);
+  const runRebuild = async () => {
+    setRebuildLoading(true);
+    setRebuildStatus('正在重建...');
+    try {
+      const result = await repoApi.rebuildIndex(storageId, syncFolder);
+      setRebuildStatus(`索引重建完成：已索引 ${result.indexed} 个提交`);
+      firstPage.refetch();
+    } catch (e) {
+      setRebuildStatus(e instanceof ApiError ? e.message : '重建失败');
+    } finally {
+      setRebuildLoading(false);
+    }
+  };
+
   if (me.isLoading) return <div className="center-state">正在加载…</div>;
   if (!storageId) return <div className="center-state"><HistoryIcon size={48} /><h1>设置默认存储</h1><p>需要先在设置中配置默认存储，才能查看提交历史。</p></div>;
 
@@ -235,8 +252,12 @@ export function RepoHistoryPage() {
     <header className="repo-history-header">
       <Link className="repo-history-back" to="/notes"><ArrowLeft size={17} />返回笔记</Link>
       <div><h1>提交历史</h1><small>{syncFolder} · {allCommits.length} 个提交{firstPage.isLoading ? '（加载中…）' : ''}</small></div>
-      <button className="danger-button" onClick={runGc} disabled={gcRunning}><Loader2 size={15} className={gcRunning ? 'spin' : undefined} />清理未引用对象</button>
+      <div className="repo-history-actions">
+        <button className="secondary-button" onClick={runRebuild} disabled={rebuildLoading}><Loader2 size={15} className={rebuildLoading ? 'spin' : undefined} />重建索引</button>
+        <button className="danger-button" onClick={runGc} disabled={gcRunning}><Loader2 size={15} className={gcRunning ? 'spin' : undefined} />清理未引用对象</button>
+      </div>
     </header>
+    {rebuildStatus ? <div className="repo-history-banner">{rebuildStatus}</div> : null}
     {gcError ? <div className="repo-history-banner error">{gcError}</div> : null}
     {gcResult ? <div className="repo-history-banner">
       {`清理完成：删除内容对象 ${gcResult.deleted}${gcResult.deletedCommits > 0 ? `，裁剪历史提交 ${gcResult.deletedCommits}` : ''}${gcResult.more ? '（尚未处理完，可再次清理）' : ''}`}

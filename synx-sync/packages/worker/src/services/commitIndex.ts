@@ -79,7 +79,8 @@ function rowToSummary(row: CommitIndexRow): RepoCommitSummary {
 /**
  * 从 D1 查询提交列表（分页）。
  * cursor 是上一页最后一条的 commit_id；首次不传。
- * 返回 null 表示 D1 不可用或索引为空，调用方应降级到链表扫描。
+ * 返回 null 表示 D1 查询出错（调用方应降级到链表扫描）；
+ * 返回 { commits: [], cursor: null } 表示 D1 可用但无数据（不需要降级）。
  */
 export async function listCommitsViaD1(
   db: D1Database,
@@ -109,7 +110,7 @@ export async function listCommitsViaD1(
       binds = [userId, storageId, syncFolder, pageSize];
     }
     const result = await db.prepare(query).bind(...binds).all<CommitIndexRow>();
-    if (!result.results || result.results.length === 0) return null;
+    if (!result.results || result.results.length === 0) return { commits: [], cursor: null };
 
     const commits = result.results.map(rowToSummary);
     const nextCursor = commits.length === pageSize ? commits[commits.length - 1].commitId : null;
@@ -126,7 +127,8 @@ interface FileHistoryRow extends CommitIndexRow {
 /**
  * 从 D1 查询单文件历史（分页）。
  * cursor 是上一页最后一条的 commit_id；首次不传。
- * 返回 null 表示 D1 不可用或索引为空，调用方应降级到链表扫描。
+ * 返回 null 表示 D1 查询出错（调用方应降级到链表扫描）；
+ * 返回 { commits: [], changes: [], nextCursor: null } 表示 D1 可用但该文件无历史（不需要降级）。
  */
 export async function fileHistoryViaD1(
   db: D1Database,
@@ -161,7 +163,7 @@ export async function fileHistoryViaD1(
       binds = [userId, storageId, syncFolder, identity, limit];
     }
     const result = await db.prepare(query).bind(...binds).all<FileHistoryRow>();
-    if (!result.results || result.results.length === 0) return null;
+    if (!result.results || result.results.length === 0) return { commits: [], changes: [], nextCursor: null };
 
     const commits: RepoCommitSummary[] = [];
     const changes: RepoChange[] = [];
