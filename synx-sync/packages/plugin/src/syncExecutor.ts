@@ -1,7 +1,9 @@
+import type { LocalVersionSnapshot } from './syncAlgo.js';
 import { normalizeSyncError, type SyncErrorInfo } from './syncReport.js';
 
 export type ExecutableSyncAction =
-  | { type: 'push' | 'pull' | 'delete-remote' | 'delete-local'; path: string; reason: string; fileUuid?: string }
+  | { type: 'push' | 'delete-remote' | 'delete-local'; path: string; reason: string; fileUuid?: string }
+  | { type: 'pull'; path: string; reason: string; fileUuid?: string; expectedLocal?: LocalVersionSnapshot }
   | { type: 'skip'; path: string; reason: string; size?: number; rule?: string };
 
 export interface SyncExecutionResult {

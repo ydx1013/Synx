@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type RemoteEntity } from './syncAlgo.js';
+import { isLocalFileUnchangedFromPrev, isLocalVersionUnchanged, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type RemoteEntity } from './syncAlgo.js';
 
 function localFile(path: string, mtime: number, hash?: string): LocalFile {
   return { path, mtime, size: 10, hash };
@@ -30,11 +30,27 @@ describe('planSync - basic decisions', () => {
     expect(plan.stats.push).toBe(1);
   });
 
-  it('pulls remote-only files', () => {
+  it('pulls remote-only files and records that local did not exist', () => {
     const plan = planSync([], [remoteEntity('b.md', 100)]);
     expect(plan.actions).toHaveLength(1);
-    expect(plan.actions[0]).toMatchObject({ type: 'pull', path: 'b.md', reason: 'remote-only' });
+    expect(plan.actions[0]).toMatchObject({
+      type: 'pull',
+      path: 'b.md',
+      reason: 'remote-only',
+      expectedLocal: { exists: false },
+    });
     expect(plan.stats.pull).toBe(1);
+  });
+
+  it('records the planned local version on pull', () => {
+    const plan = planSync(
+      [{ path: 'a.md', mtime: 1000, size: 10, hash: 'local' }],
+      [remoteEntity('a.md', 5000, 'remote')],
+    );
+    expect(plan.actions[0]).toMatchObject({
+      type: 'pull',
+      expectedLocal: { exists: true, mtime: 1000, size: 10, hash: 'local' },
+    });
   });
 
   it('skips when mtime same and hash same', () => {
@@ -297,6 +313,32 @@ describe('shouldProtectAgainstMassLocalDeletion', () => {
     expect(shouldProtectAgainstMassLocalDeletion(40, 500, 90)).toBe(false);  // 8% ≤ 10%，不触发
     expect(shouldProtectAgainstMassLocalDeletion(60, 500, 90)).toBe(true);   // 12% > 10%
     expect(shouldProtectAgainstMassLocalDeletion(226, 450, 50)).toBe(true);  // 50.2% > 50%
+  });
+});
+
+describe('isLocalVersionUnchanged（pull 覆盖保护）', () => {
+  const expected = { exists: true as const, mtime: 1000, size: 10, hash: 'h1' };
+
+  it('hash 变化时判定已变化', () => {
+    expect(isLocalVersionUnchanged(expected, { exists: true, mtime: 1000, size: 10, hash: 'h2' })).toBe(false);
+  });
+
+  it('计划时不存在、执行时新建则判定已变化', () => {
+    expect(isLocalVersionUnchanged({ exists: false }, { exists: true, mtime: 1000, size: 10, hash: 'h1' })).toBe(false);
+  });
+
+  it('计划时存在、执行时删除则判定已变化', () => {
+    expect(isLocalVersionUnchanged(expected, { exists: false })).toBe(false);
+  });
+
+  it('hash、mtime、size 均未变化时保持一致', () => {
+    expect(isLocalVersionUnchanged(expected, { exists: true, mtime: 1000, size: 10, hash: 'h1' })).toBe(true);
+  });
+
+  it('mtime 或 size 变化时即使 hash 缺失也拒绝覆盖', () => {
+    const withoutHash = { exists: true as const, mtime: 1000, size: 10 };
+    expect(isLocalVersionUnchanged(withoutHash, { exists: true, mtime: 1001, size: 10 })).toBe(false);
+    expect(isLocalVersionUnchanged(withoutHash, { exists: true, mtime: 1000, size: 11 })).toBe(false);
   });
 });
 

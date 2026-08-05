@@ -18,9 +18,13 @@ import type { Entity } from '@synx/shared';
  * 同步算法不直接 I/O，只产出 SyncPlan，由调用方执行。
  */
 
+export type LocalVersionSnapshot =
+  | { exists: false }
+  | { exists: true; mtime: number; size: number; hash?: string };
+
 export type SyncAction =
   | { type: 'push'; path: string; reason: 'local-only' | 'local-newer' | 'conflict-keep-local' }
-  | { type: 'pull'; path: string; reason: 'remote-only' | 'remote-newer'; fileUuid?: string }
+  | { type: 'pull'; path: string; reason: 'remote-only' | 'remote-newer'; fileUuid?: string; expectedLocal: LocalVersionSnapshot }
   | { type: 'delete-remote'; path: string; reason: 'local-deleted'; fileUuid?: string }
   | { type: 'delete-local'; path: string; reason: 'remote-deleted'; fileUuid?: string }
   | { type: 'skip'; path: string; reason: 'in-sync' | 'same-mtime-diff-hash-skipped' };
@@ -159,7 +163,13 @@ export function planSync(
       }
       if (localEqualPrev && !remoteEqualPrev) {
         // 远端改了 → pull
-        actions.push({ type: 'pull', path: l.path, reason: 'remote-newer', fileUuid: r.fileUuid ?? undefined });
+        actions.push({
+          type: 'pull',
+          path: l.path,
+          reason: 'remote-newer',
+          fileUuid: r.fileUuid ?? undefined,
+          expectedLocal: { exists: true, mtime: l.mtime, size: l.size, hash: l.hash },
+        });
         stats.pull++;
         continue;
       }
@@ -206,7 +216,13 @@ export function planSync(
       stats.push++;
     } else {
       // 远端更新 → pull
-      actions.push({ type: 'pull', path: l.path, reason: 'remote-newer', fileUuid: r.fileUuid ?? undefined });
+      actions.push({
+        type: 'pull',
+        path: l.path,
+        reason: 'remote-newer',
+        fileUuid: r.fileUuid ?? undefined,
+        expectedLocal: { exists: true, mtime: l.mtime, size: l.size, hash: l.hash },
+      });
       stats.pull++;
     }
   }
@@ -220,7 +236,7 @@ export function planSync(
       actions.push({ type: 'delete-remote', path, reason: 'local-deleted', fileUuid: r.fileUuid ?? undefined });
       continue;
     }
-    actions.push({ type: 'pull', path, reason: 'remote-only', fileUuid: r.fileUuid ?? undefined });
+    actions.push({ type: 'pull', path, reason: 'remote-only', fileUuid: r.fileUuid ?? undefined, expectedLocal: { exists: false } });
     stats.pull++;
   }
 
@@ -264,6 +280,14 @@ export function shouldProtectAgainstMassLocalDeletion(
 ): boolean {
   if (prevSyncCount <= 0) return false;
   return (deleteLocalCount / prevSyncCount) * 100 > 100 - protectPercent;
+}
+
+/** pull 下载完成后，本地文件是否仍与计划阶段观察到的版本一致。 */
+export function isLocalVersionUnchanged(expected: LocalVersionSnapshot, actual: LocalVersionSnapshot): boolean {
+  if (expected.exists !== actual.exists) return false;
+  if (!expected.exists || !actual.exists) return true;
+  if (expected.mtime !== actual.mtime || expected.size !== actual.size) return false;
+  return !expected.hash || !actual.hash || expected.hash === actual.hash;
 }
 
 /**

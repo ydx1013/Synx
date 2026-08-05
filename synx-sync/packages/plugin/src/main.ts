@@ -10,7 +10,7 @@ import { hideMarkdownUuidExtension } from './markdownUuidEditor.js';
 import { listObsConfigFiles } from './obsConfigLister.js';
 import { loadPluginSettings, DEFAULT_REPORT_RETENTION, type SynxPluginSettings } from './settings.js';
 import { SynxSettingTab } from './settingsTab.js';
-import { hashContent, isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
+import { hashContent, isLocalFileUnchangedFromPrev, isLocalVersionUnchanged, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type LocalVersionSnapshot, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
 import { enqueueDeletion, pendingForTarget, type PendingDeletion } from './deletionQueue.js';
 import { SyncDetailsView, SYNC_DETAILS_VIEW_TYPE } from './syncDetailsView.js';
 import { SyncExecutor, type ExecutableSyncAction, type SyncExecutionResult } from './syncExecutor.js';
@@ -663,11 +663,17 @@ export default class SynxSyncPlugin extends Plugin {
     if (!this.client || !this.settings.storageId) return;
     const target = { storageId: this.settings.storageId, syncFolder: this.settings.syncFolder };
     for (const entry of pendingForTarget(this.pendingDeletions, target)) {
-      // git 模型下删除 = 提交中的 delete 变更（原子），不再单独 deleteFile
+      // 提交成功前只暂存删除，避免 CAS 409 重试时丢失持久化队列。
       this.repoDeletes.set(entry.path, entry.fileUuid ?? `path:${entry.path}`);
-      this.pendingDeletions = this.pendingDeletions.filter((item) => item !== entry);
     }
-    await this.persist();
+  }
+
+  private acknowledgePendingDeletions(paths: Set<string>): void {
+    const storageId = this.settings.storageId;
+    const syncFolder = this.settings.syncFolder;
+    this.pendingDeletions = this.pendingDeletions.filter((entry) =>
+      entry.storageId !== storageId || entry.syncFolder !== syncFolder || !paths.has(entry.path),
+    );
   }
 
   private handleUnauthorized(): void {
@@ -681,7 +687,7 @@ export default class SynxSyncPlugin extends Plugin {
     this.updateProgress();
     try {
       const prevSyncMap = this.getPrevSyncMap();
-      const { files, skipped } = await this.enumerateLocalFiles(prevSyncMap);
+      let { files, skipped } = await this.enumerateLocalFiles(prevSyncMap);
 
       // 拉取仓库基线：HEAD + 当前树。仓库未初始化时先 init（把现有远端收进 initial 提交）。
       let repo = await this.ensureRepoBase();
@@ -690,6 +696,7 @@ export default class SynxSyncPlugin extends Plugin {
       let skippedRemote: ExecutableSyncAction[] = [];
       let attempt = 0;
       for (; attempt < 2; attempt++) {
+        if (attempt > 0) ({ files, skipped } = await this.enumerateLocalFiles(prevSyncMap));
         this.repoUploads.clear();
         this.repoDeletes.clear();
         this.repoTree = repo.tree;
@@ -764,7 +771,7 @@ export default class SynxSyncPlugin extends Plugin {
           guardedActions = plan.actions.map((a) => {
             if (a.type !== 'delete-remote') return a;
             guardedDeletes++;
-            return { type: 'pull', path: a.path, reason: 'remote-only', fileUuid: a.fileUuid };
+            return { type: 'pull', path: a.path, reason: 'remote-only', fileUuid: a.fileUuid, expectedLocal: { exists: false } };
           });
         }
         // delete-local 方向：远端可能整体丢失（清空/配置错配/仓库损坏）时，
@@ -816,8 +823,14 @@ export default class SynxSyncPlugin extends Plugin {
             message: `同步 ${changes.length} 个文件`,
             changes,
           });
+          // 使用本次提交的精确树，避免把其他设备随后推进但本地尚未应用的内容误记为已同步。
+          const committedTree = await this.client.repoTree(result.head.commitId);
+          this.repoTree = committedTree;
           this.repoHeadCommitId = result.head.commitId;
           this.repoHeadGeneration = result.head.generation;
+          const { remote } = this.filterRemoteEntities(repoTreeToRemote(committedTree));
+          this.remoteEntities = remote;
+          this.acknowledgePendingDeletions(new Set(this.repoDeletes.keys()));
           break;
         } catch (error) {
           if (error instanceof WorkerApiError && error.status === 409) {
@@ -1092,7 +1105,7 @@ export default class SynxSyncPlugin extends Plugin {
       if (original.reason === 'conflict-keep-local') await this.executeOrdinaryConflict(action.path);
       else await this.executePush(action.path);
     } else if (action.type === 'pull') {
-      await this.executePull(action.path, action.fileUuid);
+      await this.executePull(action.path, action.fileUuid, action.expectedLocal);
     } else if (action.type === 'delete-remote') {
       // git 模型下删除 = 提交中的 delete 变更（原子，不再单独 deleteFile）
       this.repoDeletes.set(action.path, action.fileUuid ?? `path:${action.path}`);
@@ -1235,7 +1248,15 @@ export default class SynxSyncPlugin extends Plugin {
         } else {
           fileUuid = result.uuid;
         }
-        if (finalText !== text) await this.app.vault.modify(file, finalText);
+        if (finalText !== text) {
+          const replacementUuid = fileUuid;
+          finalText = await this.app.vault.process(file, (current) => {
+            const latest = ensureMarkdownUuid(current);
+            if (duplicate && latest.uuid === result.uuid) return replaceMarkdownUuid(latest.text, replacementUuid);
+            fileUuid = latest.uuid;
+            return latest.text;
+          });
+        }
         content = new TextEncoder().encode(finalText).buffer;
         console.log('synx push markdown', { path, uuid: fileUuid, size: content.byteLength });
       } else {
@@ -1296,12 +1317,30 @@ export default class SynxSyncPlugin extends Plugin {
   /** .obsidian 写入后回读的实际 mtime（诊断 iOS 写 mtime 是否生效） */
   private obsWriteBackMtimes: Record<string, { expected: number; actual: number | null }> = {};
 
-  private async executePull(path: string, _fileUuid?: string): Promise<void> {
+  private async inspectLocalVersion(path: string): Promise<LocalVersionSnapshot> {
+    if (path.startsWith('.obsidian/')) {
+      const stat = await this.app.vault.adapter.stat(path);
+      if (!stat || stat.type !== 'file') return { exists: false };
+      const content = await this.app.vault.adapter.readBinary(path);
+      return { exists: true, mtime: stat.mtime > 0 ? stat.mtime : stat.ctime, size: content.byteLength, hash: await hashContent(content) };
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return { exists: false };
+    const content = await this.app.vault.readBinary(file);
+    return { exists: true, mtime: file.stat.mtime, size: content.byteLength, hash: await hashContent(content) };
+  }
+
+  private async executePull(path: string, _fileUuid?: string, expectedLocal?: LocalVersionSnapshot): Promise<void> {
     if (!this.client) return;
     if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
+    const plannedLocal = expectedLocal ?? await this.inspectLocalVersion(path);
     const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
     // 从仓库当前提交读取内容（git 模型下内容对象不可变，路径解引用）
     const content = await this.client.repoContent(this.repoHeadCommitId, path);
+    const currentLocal = await this.inspectLocalVersion(path);
+    if (!isLocalVersionUnchanged(plannedLocal, currentLocal)) {
+      throw new Error('下载期间本地文件已被修改，为避免覆盖已取消拉取；下次同步将重新处理');
+    }
     // .obsidian/ 内的文件用 adapter 写入
     if (path.startsWith('.obsidian/')) {
       // 显式设置 mtime（模仿 remotely-save 的 adapter.writeBinary(key, content, { mtime, ctime })）。
