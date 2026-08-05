@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Platform, Plugin, requestUrl, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { App, FuzzySuggestModal, MarkdownView, Notice, Platform, Plugin, requestUrl, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
 import type { RepoChange, RepoFile } from '@synx/shared';
@@ -21,10 +21,29 @@ import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient, WorkerApiError } from './workerClient.js';
 import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 import { uploadImageWithRetry } from './imageUpload.js';
-import { applyImageReplacements, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl, type ImageCandidate } from './imageMigration.js';
+import { applyImageReplacements, buildFolderMigrationPlan, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl, type ImageCandidate } from './imageMigration.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
 import { parsePrivateImageUrl } from './privateImage.js';
 import { ConfirmModal } from './settingsTab.js';
+
+class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
+  constructor(app: App, private readonly folders: TFolder[], private readonly select: (folder: TFolder) => void) {
+    super(app);
+    this.setPlaceholder('选择要迁移图片的文件夹');
+  }
+
+  getItems(): TFolder[] {
+    return this.folders;
+  }
+
+  getItemText(folder: TFolder): string {
+    return folder.path || '/';
+  }
+
+  onChooseItem(folder: TFolder): void {
+    this.select(folder);
+  }
+}
 
 interface PersistedPluginData {
   /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
@@ -95,6 +114,8 @@ export default class SynxSyncPlugin extends Plugin {
   private prevSync: PrevSyncState | null = null;
   private pendingImageUploads: PendingImageUpload[] = [];
   private internalDeletes = new Set<string>();
+  private folderImageMigrationRunning = false;
+  private folderImageMigrationPreparing = false;
 
   // Git 式仓库同步状态（本次同步内累积，runSync 结束/失败时清理）
   private repoUploads = new Map<string, RepoUploadedFile>();
@@ -126,6 +147,7 @@ export default class SynxSyncPlugin extends Plugin {
     this.addCommand({ id: 'synx-open-history', name: '打开版本历史', icon: 'history', callback: () => void this.activateHistoryPane() });
     this.addCommand({ id: 'synx-open-sync-details', name: '打开同步详情', icon: 'activity', callback: () => void this.activateSyncDetails() });
     this.addCommand({ id: 'synx-migrate-current-note-images', name: '将当前笔记图片迁移到 Synx 图库', icon: 'images', callback: () => void this.previewCurrentNoteImageMigration() });
+    this.addCommand({ id: 'synx-migrate-folder-note-images', name: '迁移文件夹内笔记图片到 Synx 图库', icon: 'folder-up', callback: () => this.selectImageMigrationFolder() });
     this.registerDomEvent(document, 'paste', (event) => void this.handleImagePaste(event), true);
     this.registerDomEvent(document, 'drop', (event) => void this.handleImageDrop(event), true);
     this.app.workspace.onLayoutReady(() => {
@@ -185,6 +207,145 @@ export default class SynxSyncPlugin extends Plugin {
 
   private imageUploadReady(): boolean {
     return Boolean(this.settings.imageHostingEnabled && this.settings.imageGalleryId && this.settings.jwt && this.client);
+  }
+
+  private selectImageMigrationFolder(): void {
+    if (this.folderImageMigrationRunning || this.folderImageMigrationPreparing) {
+      new Notice('已有文件夹图片迁移任务正在准备或运行');
+      return;
+    }
+    if (!this.imageUploadReady()) {
+      new Notice('请先启用图片托管并选择默认图库');
+      return;
+    }
+    new FolderSuggestModal(this.app, this.app.vault.getAllLoadedFiles().filter((file): file is TFolder => file instanceof TFolder), (folder) => {
+      void this.previewFolderImageMigration(folder);
+    }).open();
+  }
+
+  private async previewFolderImageMigration(folder: TFolder): Promise<void> {
+    if (this.folderImageMigrationPreparing || this.folderImageMigrationRunning) return;
+    this.folderImageMigrationPreparing = true;
+    try {
+      const gallery = (await WorkerClient.listImageGalleries(this.settings.serverUrl, this.settings.jwt))
+        .find((item) => item.id === this.settings.imageGalleryId);
+      if (!gallery) throw new Error('默认图库不存在，请重新选择');
+      const prefix = folder.path ? `${folder.path}/` : '';
+      const files = this.app.vault.getMarkdownFiles().filter((file) => !folder.path || file.path.startsWith(prefix));
+      const notes = await Promise.all(files.map(async (file) => ({ path: file.path, content: await this.app.vault.cachedRead(file) })));
+      const plan = buildFolderMigrationPlan(notes, this.settings.serverUrl, gallery, (source, notePath) => {
+        const linked = this.app.metadataCache.getFirstLinkpathDest(this.safeDecodeImageSource(source), notePath);
+        return linked instanceof TFile ? linked.path : null;
+      });
+      const total = plan.externalSources.size + plan.localSources.size;
+      if (total === 0) {
+        new Notice(plan.skippedGalleryImages ? `文件夹中的 ${plan.skippedGalleryImages} 张图片已属于 Synx 图库` : '文件夹内没有可迁移的图片');
+        return;
+      }
+      new ConfirmModal(this.app, `扫描完成：共 ${files.length} 篇笔记，${plan.notesWithImages} 篇含图片；唯一外链 ${plan.externalSources.size} 张，本地附件 ${plan.localSources.size} 张，已在当前图库 ${plan.skippedGalleryImages} 张。确认迁移 ${total} 张图片？`, () => {
+        this.folderImageMigrationPreparing = false;
+        void this.migrateFolderImages(notes, plan);
+      }, () => {
+        this.folderImageMigrationPreparing = false;
+      }).open();
+      return;
+    } catch (error) {
+      this.folderImageMigrationPreparing = false;
+      new Notice(`扫描文件夹失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+    }
+  }
+
+  private async migrateFolderImages(notes: Array<{ path: string; content: string }>, plan: ReturnType<typeof buildFolderMigrationPlan>): Promise<void> {
+    const client = this.client;
+    if (!client || this.folderImageMigrationRunning) return;
+    this.folderImageMigrationRunning = true;
+    const uploadedUrls = new Map<string, string>();
+    const migratedLocalFiles: TFile[] = [];
+    let uploaded = 0;
+    let failed = 0;
+    try {
+      new Notice('正在迁移文件夹内笔记图片…');
+      for (const url of plan.externalSources) {
+        try {
+          const source = await this.readImageCandidate({ raw: '', source: url, alt: '', kind: 'external' }, this.app.vault.getMarkdownFiles()[0]);
+          if (source.bytes.byteLength > 20 * 1024 * 1024) throw new Error('图片超过 20 MiB');
+          const image = await uploadImageWithRetry(() => client.uploadGalleryImage(this.settings.imageGalleryId, source.bytes, source.mimeType));
+          uploadedUrls.set(`external:${url}`, image.markdownUrl);
+          uploaded++;
+        } catch (error) {
+          failed++;
+          console.warn('synx: folder external image migration failed', { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      for (const path of plan.localSources) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) {
+          failed++;
+          continue;
+        }
+        try {
+          const mimeType = this.mimeTypeForExtension(file.extension);
+          this.assertSupportedImageType(mimeType);
+          const bytes = await this.app.vault.readBinary(file);
+          if (bytes.byteLength > 20 * 1024 * 1024) throw new Error('图片超过 20 MiB');
+          const image = await uploadImageWithRetry(() => client.uploadGalleryImage(this.settings.imageGalleryId, bytes, mimeType));
+          uploadedUrls.set(`local:${path}`, image.markdownUrl);
+          migratedLocalFiles.push(file);
+          uploaded++;
+        } catch (error) {
+          failed++;
+          console.warn('synx: folder local image migration failed', { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      let modifiedNotes = 0;
+      let writeFailures = 0;
+      for (const note of notes) {
+        const mappings = plan.notes.get(note.path);
+        if (!mappings) continue;
+        const replacements = new Map<string, string>();
+        for (const [source, key] of mappings) {
+          const url = uploadedUrls.get(key);
+          if (url) replacements.set(source, url);
+        }
+        const file = this.app.vault.getAbstractFileByPath(note.path);
+        if (!(file instanceof TFile)) continue;
+        try {
+          const currentContent = await this.app.vault.cachedRead(file);
+          const updated = applyImageReplacements(currentContent, replacements);
+          if (updated === currentContent) continue;
+          await this.app.vault.modify(file, updated);
+          modifiedNotes++;
+        } catch (error) {
+          writeFailures++;
+          console.warn('synx: folder note rewrite failed', { path: note.path, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      failed += writeFailures;
+      new Notice(`文件夹图片迁移完成：成功 ${uploaded} 张，失败 ${failed} 张，修改 ${modifiedNotes} 篇笔记`, 10000);
+      if (migratedLocalFiles.length > 0) await this.confirmFolderAttachmentCleanup(migratedLocalFiles);
+    } finally {
+      this.folderImageMigrationRunning = false;
+    }
+  }
+
+  private async confirmFolderAttachmentCleanup(files: TFile[]): Promise<void> {
+    const deletable: TFile[] = [];
+    for (const file of files) {
+      if (!(await this.isAttachmentReferenced(file.path))) deletable.push(file);
+    }
+    if (deletable.length === 0) return;
+    new ConfirmModal(this.app, `发现 ${deletable.length} 个已无任何笔记引用的本地附件，确认删除？`, () => {
+      void this.deleteMigratedAttachments(deletable);
+    }).open();
+  }
+
+  private safeDecodeImageSource(source: string): string {
+    try {
+      return decodeURIComponent(source);
+    } catch {
+      return source;
+    }
   }
 
   private async previewCurrentNoteImageMigration(): Promise<void> {

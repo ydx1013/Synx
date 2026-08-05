@@ -330,7 +330,9 @@ export class SynxSettingTab extends PluginSettingTab {
 }
 
 export class ConfirmModal extends Modal {
-  constructor(app: App, private message: string, private confirm: () => void) {
+  private confirmed = false;
+
+  constructor(app: App, private message: string, private confirm: () => void, private cancel?: () => void) {
     super(app);
   }
 
@@ -342,12 +344,14 @@ export class ConfirmModal extends Modal {
     const ok = buttons.createEl('button', { text: '确认' });
     ok.addClass('mod-cta');
     ok.onclick = () => {
+      this.confirmed = true;
       this.confirm();
       this.close();
     };
   }
 
   onClose(): void {
+    if (!this.confirmed) this.cancel?.();
     this.contentEl.empty();
   }
 }

@@ -4,6 +4,7 @@ export interface ImageCandidate {
   alt: string;
   kind: 'external' | 'local';
   dimensions?: string;
+  index?: number;
 }
 
 export interface GalleryIdentity {
@@ -31,6 +32,7 @@ export function findImageCandidates(content: string): ImageCandidate[] {
       source,
       alt: match[1] ?? match[3] ?? '',
       kind: /^https?:\/\//i.test(source) ? 'external' : 'local',
+      index: match.index,
     });
   }
 
@@ -41,9 +43,56 @@ export function findImageCandidates(content: string): ImageCandidate[] {
     if (!source || IGNORED_SCHEMES.test(source)) continue;
     const label = match[2]?.trim() ?? '';
     const dimensions = /^\d+(?:x\d+)?$/.test(label) ? label : undefined;
-    candidates.push({ raw: match[0], source, alt: dimensions ? '' : label, kind: 'local', dimensions });
+    candidates.push({ raw: match[0], source, alt: dimensions ? '' : label, kind: 'local', dimensions, index: match.index });
   }
-  return candidates.sort((a, b) => content.indexOf(a.raw) - content.indexOf(b.raw));
+  return candidates.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+}
+
+export interface FolderMigrationPlan {
+  notes: Map<string, Map<string, string>>;
+  externalSources: Set<string>;
+  localSources: Set<string>;
+  notesWithImages: number;
+  skippedGalleryImages: number;
+}
+
+export function buildFolderMigrationPlan(
+  notes: Array<{ path: string; content: string }>,
+  serverUrl: string,
+  gallery: GalleryIdentity,
+  resolveLocalPath: (source: string, notePath: string) => string | null,
+): FolderMigrationPlan {
+  const plan: FolderMigrationPlan = {
+    notes: new Map(),
+    externalSources: new Set(),
+    localSources: new Set(),
+    notesWithImages: 0,
+    skippedGalleryImages: 0,
+  };
+  const skipped = new Set<string>();
+  for (const note of notes) {
+    const mappings = new Map<string, string>();
+    const candidates = findImageCandidates(note.content);
+    if (candidates.length > 0) plan.notesWithImages++;
+    for (const candidate of candidates) {
+      if (candidate.kind === 'external') {
+        if (isCurrentGalleryUrl(candidate.source, serverUrl, gallery)) {
+          skipped.add(candidate.source);
+          continue;
+        }
+        plan.externalSources.add(candidate.source);
+        mappings.set(candidate.source, `external:${candidate.source}`);
+        continue;
+      }
+      const path = resolveLocalPath(candidate.source, note.path);
+      if (!path) continue;
+      plan.localSources.add(path);
+      mappings.set(candidate.source, `local:${path}`);
+    }
+    if (mappings.size > 0) plan.notes.set(note.path, mappings);
+  }
+  plan.skippedGalleryImages = skipped.size;
+  return plan;
 }
 
 export function isCurrentGalleryUrl(url: string, serverUrl: string, gallery: GalleryIdentity): boolean {
@@ -86,11 +135,12 @@ export function containsAttachmentReference(content: string, attachmentPath: str
 
 export function applyImageReplacements(content: string, replacements: ReadonlyMap<string, string>): string {
   let updated = content;
-  for (const candidate of findImageCandidates(content)) {
-    const replacement = replacements.get(candidate.source);
-    if (!replacement) continue;
+  const candidates = findImageCandidates(content).filter((candidate) => replacements.has(candidate.source)).reverse();
+  for (const candidate of candidates) {
+    if (candidate.index === undefined) continue;
+    const replacement = replacements.get(candidate.source)!;
     const alt = candidate.dimensions ? `|${candidate.dimensions}` : candidate.alt;
-    updated = updated.split(candidate.raw).join(`![${alt}](${replacement})`);
+    updated = `${updated.slice(0, candidate.index)}![${alt}](${replacement})${updated.slice(candidate.index + candidate.raw.length)}`;
   }
   return updated;
 }

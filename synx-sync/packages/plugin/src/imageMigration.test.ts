@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyImageReplacements, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl } from './imageMigration.js';
+import { applyImageReplacements, buildFolderMigrationPlan, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl } from './imageMigration.js';
 
 describe('image migration', () => {
   it('finds external and local Markdown and wiki image embeds', () => {
@@ -10,7 +10,7 @@ describe('image migration', () => {
       '[普通链接](https://example.com/page)',
     ].join('\n');
 
-    expect(findImageCandidates(content)).toEqual([
+    expect(findImageCandidates(content).map(({ index: _, ...candidate }) => candidate)).toEqual([
       { raw: '![外链](https://example.com/a.png)', source: 'https://example.com/a.png', alt: '外链', kind: 'external' },
       { raw: '![本地](attachments/b.jpg)', source: 'attachments/b.jpg', alt: '本地', kind: 'local' },
       { raw: '![[images/c.webp|封面]]', source: 'images/c.webp', alt: '封面', kind: 'local' },
@@ -67,10 +67,32 @@ describe('image migration', () => {
     expect(containsAttachmentReference('unrelated text', 'assets/a.png')).toBe(false);
   });
 
-  it('replaces every occurrence while preserving alt text', () => {
+  it('builds a cross-note plan deduplicated by external URL and resolved attachment path', () => {
+    const gallery = { id: 'gallery-1', owner: 'alice', repo: 'images', branch: 'main', folder: 'uploads' };
+    const plan = buildFolderMigrationPlan([
+      { path: 'notes/a.md', content: '![](https://example.com/a.png)\n![[../assets/shared.png]]' },
+      { path: 'notes/sub/b.md', content: '![](https://example.com/a.png)\n![](../../assets/shared.png)\n![](https://raw.githubusercontent.com/alice/images/main/uploads/old.png)' },
+    ], 'https://synx.example', gallery, (source) => source.includes('shared.png') ? 'assets/shared.png' : null);
+
+    expect(plan.notesWithImages).toBe(2);
+    expect(plan.skippedGalleryImages).toBe(1);
+    expect([...plan.externalSources]).toEqual(['https://example.com/a.png']);
+    expect([...plan.localSources]).toEqual(['assets/shared.png']);
+    expect(plan.notes.get('notes/a.md')?.get('../assets/shared.png')).toBe('local:assets/shared.png');
+    expect(plan.notes.get('notes/sub/b.md')?.get('../../assets/shared.png')).toBe('local:assets/shared.png');
+  });
+
+  it('replaces every actual embed while preserving alt text', () => {
     const content = '![A](https://example.com/a.png) and ![A](https://example.com/a.png)';
     expect(applyImageReplacements(content, new Map([['https://example.com/a.png', 'https://gallery/a.png']]))).toBe(
       '![A](https://gallery/a.png) and ![A](https://gallery/a.png)',
+    );
+  });
+
+  it('does not replace identical image syntax inside ignored ranges', () => {
+    const content = '![](https://example.com/a.png)\n`![](https://example.com/a.png)`\n```md\n![](https://example.com/a.png)\n```';
+    expect(applyImageReplacements(content, new Map([['https://example.com/a.png', 'https://gallery/a.png']]))).toBe(
+      '![](https://gallery/a.png)\n`![](https://example.com/a.png)`\n```md\n![](https://example.com/a.png)\n```',
     );
   });
 });
