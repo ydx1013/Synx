@@ -126,7 +126,6 @@ export default class SynxSyncPlugin extends Plugin {
     this.registerDomEvent(document, 'paste', (event) => void this.handleImagePaste(event), true);
     this.registerDomEvent(document, 'drop', (event) => void this.handleImageDrop(event), true);
     this.app.workspace.onLayoutReady(() => {
-      void this.ensureHistoryPane();
       void this.retryPendingImageUploads();
     });
     for (const event of ['modify', 'create', 'rename'] as const) {
@@ -165,41 +164,19 @@ export default class SynxSyncPlugin extends Plugin {
     this.scheduler?.dispose();
   }
 
-  /** 把 synx-image://galleryId/path 转换为带 token 的 HTTPS URL，让 Obsidian 直接渲染 <img src> */
-  private resolvePrivateImageUrl(galleryId: string, path: string): string {
-    const base = this.settings.serverUrl.replace(/\/+$/, '');
-    const endpoint = `/api/image-galleries/${encodeURIComponent(galleryId)}/images/content`;
-    const params = new URLSearchParams({ path, token: this.settings.jwt });
-    return `${base}${endpoint}?${params.toString()}`;
-  }
-
-  /** 上传成功后，把 Worker 返回的 markdownUrl 转成可直接写入 Markdown 的 URL。
-   *  私有图库返回 synx-image://，这里转成 HTTPS URL（含 JWT），Obsidian 原生支持。 */
-  private resolveMarkdownUrl(markdownUrl: string): string {
-    if (!markdownUrl.startsWith('synx-image://')) return markdownUrl;
-    const reference = parsePrivateImageUrl(markdownUrl);
-    if (!reference) return markdownUrl;
-    return this.resolvePrivateImageUrl(reference.galleryId, reference.path);
-  }
-
   private renderPrivateImages(element: HTMLElement): void {
-    if (!this.settings.jwt) return;
-    // 处理 img 标签（Obsidian 可能保留 synx-image:// src）
+    // 旧笔记中可能存在 synx-image:// 链接，用 access_token 转换为永久 HTTPS URL
+    const token = this.settings.imageGalleryAccessToken;
+    const galleryId = this.settings.imageGalleryId;
+    if (!token || !galleryId) return;
+    const base = this.settings.serverUrl.replace(/\/+$/, '');
     for (const img of Array.from(element.querySelectorAll('img'))) {
       const src = img.getAttribute('src') ?? '';
+      if (!src.startsWith('synx-image://')) continue;
       const reference = parsePrivateImageUrl(src);
-      if (!reference) continue;
-      img.src = this.resolvePrivateImageUrl(reference.galleryId, reference.path);
-    }
-    // 处理 a 标签（Obsidian sanitizer 可能把它解析为链接）
-    for (const link of Array.from(element.querySelectorAll('a'))) {
-      const href = link.getAttribute('href') ?? '';
-      const reference = parsePrivateImageUrl(href);
-      if (!reference) continue;
-      const img = document.createElement('img');
-      img.src = this.resolvePrivateImageUrl(reference.galleryId, reference.path);
-      img.alt = link.textContent ?? '';
-      link.replaceWith(img);
+      if (!reference || reference.galleryId !== galleryId) continue;
+      const encodedPath = reference.path.split('/').map(encodeURIComponent).join('/');
+      img.src = `${base}/api/image-galleries/${encodeURIComponent(galleryId)}/images/content?path=${encodedPath}&key=${token}`;
     }
   }
 
@@ -237,8 +214,7 @@ export default class SynxSyncPlugin extends Plugin {
     try {
       const bytes = await file.arrayBuffer();
       const image = await uploadImageWithRetry(() => client.uploadGalleryImage(this.settings.imageGalleryId, bytes, file.type));
-      const url = this.resolveMarkdownUrl(image.markdownUrl);
-      this.replaceEditorText(view, placeholder, `![](${url})`);
+      this.replaceEditorText(view, placeholder, `![](${image.markdownUrl})`);
     } catch (error) {
       await this.saveFailedImageLocally(file, view, placeholder, error);
     }
@@ -275,8 +251,7 @@ export default class SynxSyncPlugin extends Plugin {
         const bytes = await this.app.vault.readBinary(local);
         const image = await uploadImageWithRetry(() => this.client!.uploadGalleryImage(item.galleryId, bytes, item.mimeType));
         const content = await this.app.vault.read(note);
-        const url = this.resolveMarkdownUrl(image.markdownUrl);
-        const updated = replaceExactEmbed(content, item.originalEmbed, `![](${url})`);
+        const updated = replaceExactEmbed(content, item.originalEmbed, `![](${image.markdownUrl})`);
         if (updated === null) continue;
         await this.app.vault.modify(note, updated);
         const referencedElsewhere = await this.localImageReferenced(item.localPath, note.path);
@@ -736,7 +711,6 @@ export default class SynxSyncPlugin extends Plugin {
       // 让当前笔记的历史记录立即反映最新版本（含本次 pull 下来的内容）
       this.refreshHistoryPanes(true);
       const report = this.finishSyncReport();
-      if (report && report.stats.push === 0 && report.stats.pull === 0 && report.stats.failed === 0) new Notice('Synx: 已是最新，无需同步');
       // 写 .obsidian 同步诊断日志（移动端排查用）
       if (plan) await this.writeObsSyncDebug(files, skipped, skippedRemote, plan, report);
       // 主存储同步完成后，把本地内容镜像到备份存储（仅 push，不 pull）
@@ -868,7 +842,10 @@ export default class SynxSyncPlugin extends Plugin {
   private finishSyncReport(): SyncReport {
     const report = this.reportStore.finish();
     this.updateProgress();
-    new Notice(`Synx 完成：成功 ${report.stats.success}，失败 ${report.stats.failed}，跳过 ${report.stats.skipped}`, 4000);
+    // 全是跳过 / 无实际变更时不弹通知，避免无意义打扰；状态栏仍会更新
+    if (report.stats.success > 0 || report.stats.failed > 0) {
+      new Notice(`Synx 完成：成功 ${report.stats.success}，失败 ${report.stats.failed}，跳过 ${report.stats.skipped}`, 4000);
+    }
     return report;
   }
 
@@ -1458,15 +1435,6 @@ export default class SynxSyncPlugin extends Plugin {
       const view = leaf.view;
       if (view instanceof SyncDetailsView) view.render();
     }
-  }
-
-  private async ensureHistoryPane(): Promise<void> {
-    const { workspace } = this.app;
-    for (const leaf of workspace.getLeavesOfType(HISTORY_VIEW_TYPE)) leaf.detach();
-    const leaf = workspace.getRightLeaf(false);
-    if (!leaf) return;
-    await leaf.setViewState({ type: HISTORY_VIEW_TYPE, active: true });
-    workspace.revealLeaf(leaf);
   }
 
   private async activateView(viewType: string): Promise<void> {
