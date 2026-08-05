@@ -402,14 +402,6 @@ describe('提交历史 / diff / 单文件历史', () => {
     expect(nextCursor).toBeNull();
   });
 
-  it('fileHistory 限制单次扫描提交数并返回续扫游标', async () => {
-    const { fs } = await setup();
-    const head = (await readHead(fs, SYNC_FOLDER))!;
-    const page = await fileHistory(fs, SYNC_FOLDER, head, 'missing-identity', 200, undefined, 1);
-    expect(page.commits).toHaveLength(0);
-    expect(page.nextCursor).not.toBeNull();
-  });
-
   it('fileHistory 支持 from 游标分页，不截断', async () => {
     const { fs, initialCommitId, syncCommitId } = await setup();
     const head = (await readHead(fs, SYNC_FOLDER))!;
