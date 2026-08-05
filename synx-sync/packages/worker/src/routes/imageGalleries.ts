@@ -12,6 +12,7 @@ interface GalleryRow {
   provider: 'github';
   config: string;
   is_private: number;
+  access_token: string;
   created_at: number;
   updated_at: number;
 }
@@ -27,7 +28,11 @@ const IMAGE_TYPES: Record<string, string> = {
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024;
 
 export const imageGalleries = new Hono<{ Bindings: Env; Variables: AppVars }>();
-imageGalleries.use('*', authMiddleware);
+// 图片代理端点不需要 JWT，用 access_token 鉴权
+imageGalleries.use('*', async (c, next) => {
+  if (c.req.method === 'GET' && c.req.path.includes('/images/content')) return next();
+  return authMiddleware(c, next);
+});
 
 function normalizeFolder(value: string): string {
   return value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
@@ -59,6 +64,7 @@ function toGallery(row: GalleryRow, config: GitHubGalleryConfig): ImageGallery {
     ...publicConfig(config),
     isPrivate: row.is_private === 1,
     hasToken: true,
+    accessToken: row.access_token,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -107,9 +113,9 @@ imageGalleries.post('/', async (c) => {
   try {
     const check = await checkGitHubGallery(config);
     const now = Date.now();
-    const row: GalleryRow = { id: crypto.randomUUID(), user_id: c.get('userId'), name: body.name.trim(), provider: 'github', config: await encryptString(JSON.stringify(config), c.env.ENCRYPTION_KEY), is_private: check.isPrivate ? 1 : 0, created_at: now, updated_at: now };
-    await c.env.DB.prepare('INSERT INTO image_galleries (id, user_id, name, provider, config, is_private, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(row.id, row.user_id, row.name, row.provider, row.config, row.is_private, row.created_at, row.updated_at).run();
+    const row: GalleryRow = { id: crypto.randomUUID(), user_id: c.get('userId'), name: body.name.trim(), provider: 'github', config: await encryptString(JSON.stringify(config), c.env.ENCRYPTION_KEY), is_private: check.isPrivate ? 1 : 0, access_token: crypto.randomUUID(), created_at: now, updated_at: now };
+    await c.env.DB.prepare('INSERT INTO image_galleries (id, user_id, name, provider, config, is_private, access_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(row.id, row.user_id, row.name, row.provider, row.config, row.is_private, row.access_token, row.created_at, row.updated_at).run();
     return c.json({ gallery: toGallery(row, config) }, 201);
   } catch (err) {
     return githubError(c, err);
@@ -163,9 +169,10 @@ imageGalleries.post('/:id/images', async (c) => {
   try {
     await uploadGitHubImage(gallery.config, path, content);
     const isPrivate = gallery.row.is_private === 1;
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
     const markdownUrl = isPrivate
-      ? `synx-image://${gallery.row.id}/${path.split('/').map(encodeURIComponent).join('/')}`
-      : `https://raw.githubusercontent.com/${encodeURIComponent(gallery.config.owner)}/${encodeURIComponent(gallery.config.repo)}/${encodeURIComponent(gallery.config.branch)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+      ? `${new URL(c.req.url).origin}/api/image-galleries/${encodeURIComponent(gallery.row.id)}/images/content?path=${encodedPath}&key=${gallery.row.access_token}`
+      : `https://raw.githubusercontent.com/${encodeURIComponent(gallery.config.owner)}/${encodeURIComponent(gallery.config.repo)}/${encodeURIComponent(gallery.config.branch)}/${encodedPath}`;
     return c.json({ image: { galleryId: gallery.row.id, path, visibility: isPrivate ? 'private' : 'public', markdownUrl } }, 201);
   } catch (err) {
     return githubError(c, err);
@@ -205,14 +212,20 @@ imageGalleries.post('/:id/orphans/delete', async (c) => {
   } catch (err) { return githubError(c, err); }
 });
 
+// 图片代理端点：用 access_token 鉴权（永久有效，类似 NotePix 的 ACCESS_KEY）
+// 不走 authMiddleware，直接查 D1 验证 access_token
 imageGalleries.get('/:id/images/content', async (c) => {
-  const gallery = await loadOwnedGallery(c, c.req.param('id'));
-  if (!gallery) return c.json({ error: '图库不存在', code: 'GALLERY_NOT_FOUND' }, 404);
+  const id = c.req.param('id');
+  const key = c.req.query('key') ?? '';
   const path = c.req.query('path') ?? '';
-  if (!path.startsWith(`${gallery.config.folder}/`) || path.split('/').some((part) => part === '..')) return c.json({ error: '图片路径无效', code: 'INVALID_IMAGE_PATH' }, 400);
+  if (!key) return c.json({ error: 'missing access key' }, 401);
+  const row = await c.env.DB.prepare('SELECT config, access_token FROM image_galleries WHERE id = ?').bind(id).first<{ config: string; access_token: string }>();
+  if (!row || row.access_token !== key) return c.json({ error: 'invalid access key' }, 401);
+  const config = JSON.parse(await decryptString(row.config, c.env.ENCRYPTION_KEY)) as GitHubGalleryConfig;
+  if (!path.startsWith(`${config.folder}/`) || path.split('/').some((part) => part === '..')) return c.json({ error: '图片路径无效', code: 'INVALID_IMAGE_PATH' }, 400);
   try {
-    const response = await readGitHubImage(gallery.config, path);
-    return new Response(response.body, { status: 200, headers: { 'Content-Type': response.headers.get('Content-Type') ?? 'application/octet-stream', 'Cache-Control': 'private, max-age=300' } });
+    const response = await readGitHubImage(config, path);
+    return new Response(response.body, { status: 200, headers: { 'Content-Type': response.headers.get('Content-Type') ?? 'application/octet-stream', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' } });
   } catch (err) {
     return githubError(c, err);
   }

@@ -16,6 +16,8 @@ export interface SynxPluginSettings {
   imageHostingEnabled: boolean;
   imageGalleryId: string;
   imageGalleryName: string;
+  /** 图库永久访问令牌：用于将旧笔记中的 synx-image:// 链接转换为永久 HTTPS URL */
+  imageGalleryAccessToken: string;
   syncFolder: string;
   deviceName: string;
   periodicSyncEnabled: boolean;
@@ -64,6 +66,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   imageHostingEnabled: false,
   imageGalleryId: '',
   imageGalleryName: '',
+  imageGalleryAccessToken: '',
   syncFolder: 'my-vault/',
   deviceName,
   periodicSyncEnabled: true,
@@ -126,6 +129,7 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     imageHostingEnabled: booleanValue(source.imageHostingEnabled, defaults.imageHostingEnabled),
     imageGalleryId: stringValue(source.imageGalleryId, defaults.imageGalleryId),
     imageGalleryName: stringValue(source.imageGalleryName, defaults.imageGalleryName),
+    imageGalleryAccessToken: stringValue(source.imageGalleryAccessToken, defaults.imageGalleryAccessToken),
     syncFolder: stringValue(source.syncFolder, defaults.syncFolder),
     deviceName: stringValue(source.deviceName, defaults.deviceName),
     periodicSyncEnabled: booleanValue(source.periodicSyncEnabled, legacyInterval > 0),

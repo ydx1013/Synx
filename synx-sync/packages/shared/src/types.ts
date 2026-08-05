@@ -95,6 +95,8 @@ export interface ImageGallery {
   folder: string;
   isPrivate: boolean;
   hasToken: boolean;
+  /** 永久访问令牌：用于图片代理端点鉴权（仅返回给已认证的图库所有者） */
+  accessToken: string;
   createdAt: number;
   updatedAt: number;
 }

@@ -103,7 +103,7 @@ export class SynxSettingTab extends PluginSettingTab {
         dropdown.setValue(settings.imageGalleryId);
         dropdown.onChange(async (id) => {
           const gallery = galleries.find((item) => item.id === id);
-          await this.applyPatch({ imageGalleryId: id, imageGalleryName: gallery?.name ?? '' });
+          await this.applyPatch({ imageGalleryId: id, imageGalleryName: gallery?.name ?? '', imageGalleryAccessToken: gallery?.accessToken ?? '' });
           this.display();
         });
       } catch (error) {
