@@ -80,12 +80,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # 质量门禁全部通过后才写回版本、提交并打 tag。
-          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' \
-            synx-sync/packages/plugin/manifest.json > /tmp/manifest.json
-          mv /tmp/manifest.json synx-sync/packages/plugin/manifest.json
-          git add synx-sync/packages/plugin/manifest.json
-          git commit -m "chore(plugin): bump manifest version to ${{ steps.version.outputs.version }}"
-          git push origin main
+          # 如果 manifest 已高于低于计算版本则不覆盖（手工 commit 已 bump 过）。
+          CURRENT=$(jq -r .version synx-sync/packages/plugin/manifest.json)
+          DESIRED="${{ steps.version.outputs.version }}"
+          if [ "$CURRENT" != "$DESIRED" ]; then
+            jq --arg v "$DESIRED" '.version = $v' \
+              synx-sync/packages/plugin/manifest.json > /tmp/manifest.json
+            mv /tmp/manifest.json synx-sync/packages/plugin/manifest.json
+            git add synx-sync/packages/plugin/manifest.json
+            git commit -m "chore(plugin): bump manifest version to $DESIRED"
+            git push origin main
+          fi
           git tag "${{ steps.version.outputs.release_tag }}"
           git push origin "${{ steps.version.outputs.release_tag }}"
 
