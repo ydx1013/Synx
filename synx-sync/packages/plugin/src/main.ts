@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { MarkdownView, Notice, Platform, Plugin, requestUrl, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
 import type { RepoChange, RepoFile } from '@synx/shared';
@@ -21,8 +21,10 @@ import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient, WorkerApiError } from './workerClient.js';
 import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 import { uploadImageWithRetry } from './imageUpload.js';
+import { applyImageReplacements, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl, type ImageCandidate } from './imageMigration.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
 import { parsePrivateImageUrl } from './privateImage.js';
+import { ConfirmModal } from './settingsTab.js';
 
 interface PersistedPluginData {
   /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
@@ -123,6 +125,7 @@ export default class SynxSyncPlugin extends Plugin {
     this.addCommand({ id: 'synx-sync-now', name: '立即同步', icon: 'refresh-cw', callback: () => void this.triggerSync() });
     this.addCommand({ id: 'synx-open-history', name: '打开版本历史', icon: 'history', callback: () => void this.activateHistoryPane() });
     this.addCommand({ id: 'synx-open-sync-details', name: '打开同步详情', icon: 'activity', callback: () => void this.activateSyncDetails() });
+    this.addCommand({ id: 'synx-migrate-current-note-images', name: '将当前笔记图片迁移到 Synx 图库', icon: 'images', callback: () => void this.previewCurrentNoteImageMigration() });
     this.registerDomEvent(document, 'paste', (event) => void this.handleImagePaste(event), true);
     this.registerDomEvent(document, 'drop', (event) => void this.handleImageDrop(event), true);
     this.app.workspace.onLayoutReady(() => {
@@ -182,6 +185,140 @@ export default class SynxSyncPlugin extends Plugin {
 
   private imageUploadReady(): boolean {
     return Boolean(this.settings.imageHostingEnabled && this.settings.imageGalleryId && this.settings.jwt && this.client);
+  }
+
+  private async previewCurrentNoteImageMigration(): Promise<void> {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const note = view?.file;
+    if (!view || !note) {
+      new Notice('请先打开一篇 Markdown 笔记');
+      return;
+    }
+    if (!this.imageUploadReady()) {
+      new Notice('请先启用图片托管并选择默认图库');
+      return;
+    }
+    try {
+      const gallery = (await WorkerClient.listImageGalleries(this.settings.serverUrl, this.settings.jwt))
+        .find((item) => item.id === this.settings.imageGalleryId);
+      if (!gallery) throw new Error('默认图库不存在，请重新选择');
+      const candidates = findImageCandidates(view.editor.getValue());
+      const skipped = candidates.filter((item) => item.kind === 'external' && isCurrentGalleryUrl(item.source, this.settings.serverUrl, gallery));
+      const pending = candidates.filter((item) => !skipped.includes(item));
+      const skippedCount = new Set(skipped.map((item) => item.source)).size;
+      const unique = new Set(pending.map((item) => item.source)).size;
+      if (unique === 0) {
+        new Notice(skippedCount ? `当前笔记中的 ${skippedCount} 张图片已属于 Synx 图库` : '当前笔记中没有可迁移的图片');
+        return;
+      }
+      const external = new Set(pending.filter((item) => item.kind === 'external').map((item) => item.source)).size;
+      const local = new Set(pending.filter((item) => item.kind === 'local').map((item) => item.source)).size;
+      new ConfirmModal(this.app, `扫描完成：外链图片 ${external} 张，本地附件 ${local} 张，已在当前图库 ${skippedCount} 张。确认迁移 ${unique} 张图片？`, () => {
+        void this.migrateCurrentNoteImages(view, note, pending);
+      }).open();
+    } catch (error) {
+      new Notice(`扫描图片失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+    }
+  }
+
+  private async migrateCurrentNoteImages(view: MarkdownView, note: TFile, candidates: ImageCandidate[]): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    if (view.file?.path !== note.path) {
+      new Notice('当前笔记已切换，已取消图片迁移');
+      return;
+    }
+    const replacements = new Map<string, string>();
+    const uploadedLocalFiles = new Map<string, TFile>();
+    let failed = 0;
+    let uploaded = 0;
+    new Notice('正在迁移当前笔记中的图片…');
+    for (const candidate of new Map(candidates.map((item) => [item.source, item])).values()) {
+      try {
+        const source = await this.readImageCandidate(candidate, note);
+        if (source.bytes.byteLength > 20 * 1024 * 1024) throw new Error('图片超过 20 MiB');
+        const image = await uploadImageWithRetry(() => client.uploadGalleryImage(this.settings.imageGalleryId, source.bytes, source.mimeType));
+        replacements.set(candidate.source, image.markdownUrl);
+        if (source.localFile) uploadedLocalFiles.set(source.localFile.path, source.localFile);
+        uploaded++;
+      } catch (error) {
+        failed++;
+        console.warn('synx: image migration failed', { kind: candidate.kind, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (view.file?.path !== note.path) {
+      new Notice(`图片已上传 ${uploaded} 张，但当前笔记已切换，未替换任何链接`, 10000);
+      return;
+    }
+    const originalContent = view.editor.getValue();
+    const updated = applyImageReplacements(originalContent, replacements);
+    if (updated !== originalContent) view.editor.setValue(updated);
+    new Notice(`图片迁移完成：成功 ${uploaded} 张，失败 ${failed} 张`, 10000);
+    if (uploadedLocalFiles.size === 0) return;
+
+    const deletable: TFile[] = [];
+    for (const file of uploadedLocalFiles.values()) {
+      if (!(await this.isAttachmentReferenced(file.path, note.path, updated))) deletable.push(file);
+    }
+    if (deletable.length === 0) return;
+    new ConfirmModal(this.app, `发现 ${deletable.length} 个已无任何笔记引用的本地附件，确认删除？`, () => {
+      void this.deleteMigratedAttachments(deletable);
+    }).open();
+  }
+
+  private async readImageCandidate(candidate: ImageCandidate, note: TFile): Promise<{ bytes: ArrayBuffer; mimeType: string; localFile?: TFile }> {
+    if (candidate.kind === 'external') {
+      if (!isSafeExternalImageUrl(candidate.source)) throw new Error('出于安全原因，不下载本机或局域网地址');
+      const response = await requestUrl({ url: candidate.source, method: 'GET', throw: false });
+      if (response.status < 200 || response.status >= 300) throw new Error(`下载失败：HTTP ${response.status}`);
+      const contentLength = Number(response.headers['content-length'] ?? 0);
+      if (contentLength > 20 * 1024 * 1024) throw new Error('图片超过 20 MiB');
+      const mimeType = (response.headers['content-type'] ?? '').split(';')[0].toLowerCase();
+      this.assertSupportedImageType(mimeType);
+      return { bytes: response.arrayBuffer, mimeType };
+    }
+    const decodedSource = decodeURIComponent(candidate.source);
+    const file = this.app.metadataCache.getFirstLinkpathDest(decodedSource, note.path);
+    if (!(file instanceof TFile)) throw new Error('找不到本地附件');
+    const mimeType = this.mimeTypeForExtension(file.extension);
+    this.assertSupportedImageType(mimeType);
+    return { bytes: await this.app.vault.readBinary(file), mimeType, localFile: file };
+  }
+
+  private assertSupportedImageType(mimeType: string): void {
+    if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml', 'image/avif'].includes(mimeType)) {
+      throw new Error(`不支持的图片类型：${mimeType || '未知'}`);
+    }
+  }
+
+  private mimeTypeForExtension(extension: string): string {
+    return ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', avif: 'image/avif' } as Record<string, string>)[extension.toLowerCase()] ?? '';
+  }
+
+  private async isAttachmentReferenced(attachmentPath: string, currentNotePath?: string, currentContent?: string): Promise<boolean> {
+    const referenceFiles = this.app.vault.getFiles().filter((file) => file.extension === 'md' || file.extension === 'canvas');
+    for (const note of referenceFiles) {
+      const content = note.path === currentNotePath && currentContent !== undefined
+        ? currentContent
+        : await this.app.vault.cachedRead(note);
+      if (containsAttachmentReference(content, attachmentPath)) return true;
+      for (const candidate of findImageCandidates(content)) {
+        if (candidate.kind !== 'local') continue;
+        const linked = this.app.metadataCache.getFirstLinkpathDest(decodeURIComponent(candidate.source), note.path);
+        if (linked?.path === attachmentPath) return true;
+      }
+    }
+    return false;
+  }
+
+  private async deleteMigratedAttachments(files: TFile[]): Promise<void> {
+    let deleted = 0;
+    for (const file of files) {
+      if (await this.isAttachmentReferenced(file.path)) continue;
+      await this.app.vault.trash(file, true);
+      deleted++;
+    }
+    new Notice(`已删除 ${deleted} 个未被引用的本地附件`);
   }
 
   private async handleImagePaste(event: ClipboardEvent): Promise<void> {
