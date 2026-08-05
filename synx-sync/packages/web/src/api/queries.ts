@@ -224,4 +224,8 @@ export const repoApi = {
   /** 垃圾回收：清理未引用内容对象与旧版本记录元数据 */
   gc: (storageId: string, folder: string) =>
     api<RepoGcResponse>('/api/repository/gc', { method: 'POST', headers: noteHeaders(storageId, folder), body: JSON.stringify({}) }),
+
+  /** 重建历史索引：从用户存储重新构建 D1 提交索引 */
+  rebuildIndex: (storageId: string, folder: string) =>
+    api<{ ok: boolean; indexed: number; headCommitId: string }>('/api/repository/rebuild-index', { method: 'POST', headers: noteHeaders(storageId, folder), body: JSON.stringify({}) }),
 };

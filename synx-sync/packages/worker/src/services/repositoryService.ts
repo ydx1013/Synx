@@ -20,9 +20,8 @@ import type { Env } from '../types.js';
 
 const REPO_DIR = '.synx/repo';
 const CHECKPOINT_INTERVAL = 10;
-const COMMIT_PAGE_SIZE = 40;
+const COMMIT_PAGE_SIZE = 50;
 const FILE_HISTORY_LIMIT = 200;
-const FILE_HISTORY_SCAN_LIMIT = 30;
 const LOCK_TTL_MS = 15_000;
 const LOCK_ACQUIRE_RETRIES = 20;
 const LOCK_RETRY_DELAY_MS = 100;
@@ -331,10 +330,8 @@ export async function resolveTree(fs: WorkerFs, syncFolder: string, commit: Repo
   let cursor: RepoCommit | null = commit;
   while (cursor && !cursor.checkpointId) {
     chain.push(cursor);
-    // 单次读取（fs.get）：提交链由 HEAD 保证存在，缺失即视为链尾。
-    // readCommit 的 fs.head+fs.get 让回溯阶段子请求翻倍，/head 每次整树解析会变慢。
     const parent: RepoCommit | null = cursor.parentCommitId
-      ? await readCommitFast(fs, syncFolder, cursor.parentCommitId)
+      ? await readCommit(fs, syncFolder, cursor.parentCommitId)
       : null;
     if (!parent) throw new RepoIntegrityError(`parent commit missing for ${cursor.commitId}`);
     cursor = parent;
@@ -606,10 +603,7 @@ export async function listCommits(
   const commits: RepoCommitSummary[] = [];
   let commitId: string | null = cursor ?? head.commitId;
   while (commitId && commits.length < pageSize) {
-    // 单次读取（fs.get）：提交链由 HEAD 保证存在，缺失即视为链尾。
-    // readCommit 的 fs.head+fs.get 会让每页 40 个提交消耗 80 次子请求，
-    // 超过 Workers 免费版单请求 50 次上限，导致 /commits 稳定返回 500。
-    const commit = await readCommitFast(fs, syncFolder, commitId);
+    const commit = await readCommit(fs, syncFolder, commitId);
     if (!commit) break;
     commits.push(toSummary(commit));
     commitId = commit.parentCommitId;
@@ -642,19 +636,13 @@ export async function fileHistory(
   identity: string,
   limit: number = FILE_HISTORY_LIMIT,
   from?: string,
-  scanLimit: number = FILE_HISTORY_SCAN_LIMIT,
 ): Promise<{ commits: RepoCommitSummary[]; changes: RepoChange[]; nextCursor: string | null }> {
   const commits: RepoCommitSummary[] = [];
   const changes: RepoChange[] = [];
-  let scanned = 0;
   // 游标：首次从头开始；分页时 from 即为下一个待扫描提交（该提交尚未处理）
   let commitId: string | null = from ?? head.commitId;
-  while (commitId && commits.length < limit && scanned < scanLimit) {
-    // 用单次读取（fs.get）遍历提交链：readCommit 会先 fs.head 再 fs.get，
-    // 每个提交消耗 2 次子请求，超出 Workers 免费版单请求 50 次上限时平台直接中断。
-    // 提交链由 HEAD 保证存在，缺失即视为链尾。
-    const commit = await readCommitFast(fs, syncFolder, commitId);
-    scanned++;
+  while (commitId && commits.length < limit) {
+    const commit = await readCommit(fs, syncFolder, commitId);
     if (!commit) break;
     const matched = commit.changes.filter((c) => c.identity === identity);
     if (matched.length > 0) {

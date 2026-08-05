@@ -41,6 +41,13 @@ import {
   readTree,
   restoreRepository,
 } from '../services/repositoryService.js';
+import {
+  fileHistoryViaD1,
+  isIndexReady,
+  listCommitsViaD1,
+  rebuildCommitIndex,
+  writeCommitIndex,
+} from '../services/commitIndex.js';
 import type { AppVars, Env } from '../types.js';
 import { logError } from '../logger.js';
 
@@ -101,11 +108,19 @@ repository.post('/init', async (c) => {
 // GET /api/repository/commits?cursor=
 repository.get('/commits', async (c) => {
   const { storageId, syncFolder } = repoScope(c);
+  const userId = c.get('userId');
   try {
-    const { fs } = await getFs(c.env, c.get('userId'), storageId);
+    const { fs } = await getFs(c.env, userId, storageId);
     const head = await readHead(fs, syncFolder);
     if (!head) throw new RepoNotInitializedError();
     const cursor = c.req.query('cursor') || undefined;
+    // 优先走 D1 索引（<50ms），降级到链表扫描
+    const fromD1 = await listCommitsViaD1(c.env.DB, userId, storageId, syncFolder, cursor, 40);
+    if (fromD1) {
+      const res: RepoCommitsResponse = { commits: fromD1.commits, cursor: fromD1.cursor };
+      return c.json(res);
+    }
+    // 降级：链表扫描（D1 不可用或索引为空）
     const { commits, cursor: next } = await listCommits(fs, syncFolder, head, cursor);
     const res: RepoCommitsResponse = { commits, cursor: next };
     return c.json(res);
@@ -133,6 +148,8 @@ repository.post('/commits/finalize', async (c) => {
       message: body.message,
       changes: body.changes,
     });
+    // 同步写 D1 索引（失败不影响提交结果，下次读会触发降级/重建）
+    await writeCommitIndex(c.env.DB, c.get('userId'), storageId, syncFolder, commit).catch(() => {});
     const res: RepoFinalizeResponse = { commit, head };
     return c.json(res, 201);
   } catch (e) {
@@ -280,20 +297,24 @@ repository.get('/content', async (c) => {
 // GET /api/repository/file-history?path=&fileUuid=&from=
 repository.get('/file-history', async (c) => {
   const { storageId, syncFolder } = repoScope(c);
+  const userId = c.get('userId');
   const path = c.req.query('path');
   const fileUuid = c.req.query('fileUuid') || undefined;
   const from = c.req.query('from') || undefined;
   if (!path) throw new StorageError(400, 'missing path');
   try {
-    const { fs } = await getFs(c.env, c.get('userId'), storageId);
+    const { fs } = await getFs(c.env, userId, storageId);
     const head = await readHead(fs, syncFolder);
     if (!head) throw new RepoNotInitializedError();
     const identity = fileUuid ?? `path:${path}`;
-    // 单文件历史首次加载限制扫描提交数，配合分页游标续扫：每个提交一次存储读
-    // （约 300ms），扫满 30 个就是 ~9s，用户会一直看到"加载中"。降到 15 后
-    // 首屏约 4.5s；"加载更多"用 from 游标继续，不会漏历史。
-    const scanLimit = 15;
-    const { commits, changes, nextCursor } = await fileHistory(fs, syncFolder, head, identity, undefined, from, scanLimit);
+    // 优先走 D1 索引（<50ms），降级到链表扫描
+    const fromD1 = await fileHistoryViaD1(c.env.DB, userId, storageId, syncFolder, identity, from, 20);
+    if (fromD1) {
+      const res: RepoFileHistoryResponse = { identity, commits: fromD1.commits, changes: fromD1.changes, headCommitId: head.commitId, nextCursor: fromD1.nextCursor };
+      return c.json(res);
+    }
+    // 降级：链表扫描
+    const { commits, changes, nextCursor } = await fileHistory(fs, syncFolder, head, identity, 15, from);
     const res: RepoFileHistoryResponse = { identity, commits, changes, headCommitId: head.commitId, nextCursor };
     return c.json(res);
   } catch (e) {
@@ -321,6 +342,22 @@ repository.post('/gc', async (c) => {
     });
     const res: RepoGcResponse = result;
     return c.json(res);
+  } catch (e) {
+    return handleError(c, e);
+  }
+});
+
+// POST /api/repository/rebuild-index
+// 从用户存储重建 D1 提交索引。D1 丢失或索引不一致时手动调用。
+repository.post('/rebuild-index', async (c) => {
+  const { storageId, syncFolder } = repoScope(c);
+  const userId = c.get('userId');
+  try {
+    const { fs } = await getFs(c.env, userId, storageId);
+    const head = await readHead(fs, syncFolder);
+    if (!head) throw new RepoNotInitializedError();
+    const result = await rebuildCommitIndex(fs, c.env.DB, userId, storageId, syncFolder);
+    return c.json({ ok: true, indexed: result.indexed, headCommitId: head.commitId });
   } catch (e) {
     return handleError(c, e);
   }
