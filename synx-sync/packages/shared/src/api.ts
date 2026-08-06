@@ -6,10 +6,13 @@ import type {
   RepoFile,
   RepositoryHead,
   ImageGallery,
+  OnedriveConfig,
   RetentionPolicy,
+  S3Config,
   StorageConfig,
   Storage,
   StorageType,
+  WebdavConfig,
   User,
   UserPreferences,
 } from './types.js';
@@ -26,6 +29,7 @@ export const API = {
   storageCreate: '/api/storage',
   storageTest: '/api/storage/test',
   storageDelete: '/api/storage/:id',
+  storageCredentials: '/api/storage/:id/credentials',
   storagePurge: '/api/storage/:id/purge',
   storageRetention: '/api/storage/:id/retention',
   // 图片图库
@@ -56,6 +60,7 @@ export const API = {
   repoContent: '/api/repository/content',
   repoFileHistory: '/api/repository/file-history',
   repoGc: '/api/repository/gc',
+  repoLockClear: '/api/repository/lock/clear',
 } as const;
 
 // ===== 认证请求/响应 =====
@@ -107,6 +112,11 @@ export interface StorageSummary extends Omit<Storage, 'config'> {
 export interface StorageListResponse {
   storages: StorageSummary[];
 }
+
+export type StorageCredentialsResponse =
+  | { storageId: string; type: 's3'; config: S3Config }
+  | { storageId: string; type: 'webdav'; config: WebdavConfig }
+  | { storageId: string; type: 'onedrive'; config: OnedriveConfig };
 
 export interface RetentionPolicyResponse {
   policy: RetentionPolicy;
@@ -317,6 +327,17 @@ export interface RepoGcResponse {
   deleted: number;
   deletedCommits: number;
   more: boolean;
+}
+
+export interface RepoLockClearRequest {
+  force: true;
+  confirm: string;
+}
+
+export interface RepoLockClearResponse {
+  cleared: boolean;
+  storageId: string;
+  syncFolder: string;
 }
 
 // ===== 错误响应 =====

@@ -22,7 +22,9 @@ async function makeInboxDb(options: { collision?: boolean; lastUsedFails?: boole
       });
       const statementRun = sql.includes('UPDATE api_tokens') && options.lastUsedFails
         ? vi.fn(async () => { throw new Error('D1 unavailable'); })
-        : run;
+        : sql.includes('repository_locks')
+          ? vi.fn(async () => ({ success: true, meta: { changes: 1 } }))
+          : run;
       const statement: any = { first, run: statementRun, all: vi.fn(async () => ({ results: [] })) };
       statement.bind = vi.fn(() => statement);
       return statement;
@@ -108,6 +110,8 @@ describe('POST /api/inbox/notes', () => {
     const preparedSql = (db.prepare as ReturnType<typeof vi.fn>).mock.calls.map(([sql]) => sql as string);
     expect(preparedSql.some(sql => sql.includes('DELETE FROM api_note_paths') && sql.includes('created_at <'))).toBe(true);
     expect(preparedSql.some(sql => sql.includes('DELETE FROM api_note_paths') && !sql.includes('created_at <'))).toBe(true);
+    expect(preparedSql.some(sql => sql.includes('INSERT OR IGNORE INTO repository_locks'))).toBe(true);
+    expect(preparedSql.some(sql => sql.includes('DELETE FROM repository_locks') && sql.includes('owner_token = ?'))).toBe(true);
     const staleLockStatement = (db.prepare as ReturnType<typeof vi.fn>).mock.results
       .map(result => result.value as { bind: ReturnType<typeof vi.fn> })
       .find((_, index) => preparedSql[index].includes('created_at <'));

@@ -10,11 +10,15 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@synx/shared": "*"
+    "@synx/repo-core": "*",
+    "@synx/shared": "*",
+    "@synx/storage-core": "*",
+    "dexie": "^4.0.11"
   },
   "devDependencies": {
     "builtin-modules": "^4.0.0",
     "esbuild": "^0.28.1",
+    "fake-indexeddb": "^6.0.0",
     "obsidian": "^1.4.16",
     "tslib": "^2.7.0",
     "vitest": "^3.2.7"

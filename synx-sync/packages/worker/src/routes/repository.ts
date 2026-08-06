@@ -15,6 +15,8 @@ import type {
   RepoTreeResponse,
   DirectUploadStartRequest,
   DirectUploadSessionResponse,
+  RepoLockClearRequest,
+  RepoLockClearResponse,
 } from '@synx/shared';
 import { makeStorageKey } from '@synx/shared';
 import { authMiddleware } from '../middleware/auth.js';
@@ -50,6 +52,8 @@ import {
 } from '../services/commitIndex.js';
 import type { AppVars, Env } from '../types.js';
 import { logError } from '../logger.js';
+import { forceClearRepositoryLock, normalizeRepositoryScope, RepositoryLockConflictError, RepositoryLockReleaseError, withRepositoryLock } from '../services/repositoryLock.js';
+import { mapStorageHttpError } from './storageError.js';
 
 export const repository = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
@@ -90,14 +94,12 @@ repository.post('/init', async (c) => {
   const body = await c.req.json<RepoInitRequest>().catch(() => ({} as RepoInitRequest));
   try {
     const { fs } = await getFs(c.env, c.get('userId'), storageId);
-    const { head, commit } = await initRepository({
-      env: c.env,
-      userId: c.get('userId'),
-      storageId,
-      syncFolder,
-      fs,
-      author: body.author,
-    });
+    const { head, commit } = await withRepositoryLock(
+      c.env.DB,
+      { userId: c.get('userId'), storageId, syncFolder },
+      'init',
+      () => initRepository({ storageId, syncFolder, fs, author: body.author, externalLock: true }),
+    );
     const res: RepoInitResponse = { head, commit };
     return c.json(res, 201);
   } catch (e) {
@@ -136,18 +138,19 @@ repository.post('/commits/finalize', async (c) => {
   if (!Array.isArray(body.changes)) throw new StorageError(400, 'missing changes');
   try {
     const { fs } = await getFs(c.env, c.get('userId'), storageId);
-    const { commit, head } = await finalizeCommit({
-      env: c.env,
-      userId: c.get('userId'),
-      storageId,
-      syncFolder,
-      fs,
-      baseCommitId: body.baseCommitId,
-      baseGeneration: body.baseGeneration,
-      author: body.author,
-      message: body.message,
-      changes: body.changes,
-    });
+    const { commit, head } = await withRepositoryLock(
+      c.env.DB,
+      { userId: c.get('userId'), storageId, syncFolder },
+      'finalize',
+      () => finalizeCommit({
+        storageId, syncFolder, fs, externalLock: true,
+        baseCommitId: body.baseCommitId,
+        baseGeneration: body.baseGeneration,
+        author: body.author,
+        message: body.message,
+        changes: body.changes,
+      }),
+    );
     // 同步写 D1 索引（失败不影响提交结果，下次读会触发降级/重建）
     await writeCommitIndex(c.env.DB, c.get('userId'), storageId, syncFolder, commit).catch(() => {});
     const res: RepoFinalizeResponse = { commit, head };
@@ -199,16 +202,16 @@ repository.post('/restore', async (c) => {
   if (!body.toCommitId) throw new StorageError(400, 'missing toCommitId');
   try {
     const { fs } = await getFs(c.env, c.get('userId'), storageId);
-    const result = await restoreRepository({
-      env: c.env,
-      userId: c.get('userId'),
-      storageId,
-      syncFolder,
-      fs,
+    const restore = () => restoreRepository({
+      storageId, syncFolder, fs,
       toCommitId: body.toCommitId,
       dryRun: body.dryRun === true,
       author: body.author,
+      externalLock: body.dryRun === true ? undefined : true,
     });
+    const result = body.dryRun === true
+      ? await restore()
+      : await withRepositoryLock(c.env.DB, { userId: c.get('userId'), storageId, syncFolder }, 'restore', restore);
     const res: RepoRestoreResponse = { preview: result.preview, commit: result.commit, head: result.head };
     return c.json(res, result.commit ? 201 : 200);
   } catch (e) {
@@ -332,18 +335,41 @@ repository.post('/gc', async (c) => {
   try {
     const { fs } = await getFs(c.env, c.get('userId'), storageId);
     const policy = await getRetentionPolicy(c.env, storageId, fs);
-    const result = await gcRepository({
-      fs,
-      syncFolder,
-      maxCommits: body.maxCommits,
-      maxDeletes: body.maxDeletes,
-      maxRepoCommits: body.maxRepoCommits,
-      policy,
-    });
+    const result = await withRepositoryLock(
+      c.env.DB,
+      { userId: c.get('userId'), storageId, syncFolder },
+      'gc',
+      () => gcRepository({
+        fs, syncFolder,
+        maxCommits: body.maxCommits,
+        maxDeletes: body.maxDeletes,
+        maxRepoCommits: body.maxRepoCommits,
+        policy,
+      }),
+    );
     const res: RepoGcResponse = result;
     return c.json(res);
   } catch (e) {
     return handleError(c, e);
+  }
+});
+
+repository.post('/lock/clear', async (c) => {
+  const { storageId, syncFolder } = repoScope(c);
+  const body = await c.req.json<RepoLockClearRequest>().catch(() => null);
+  const normalized = normalizeRepositoryScope(syncFolder);
+  if (!body || body.force !== true || body.confirm !== `CLEAR ${storageId}/${normalized}`) {
+    return c.json({ error: 'explicit force confirmation required', code: 'CONFIRMATION_REQUIRED' }, 400);
+  }
+  try {
+    await getFs(c.env, c.get('userId'), storageId);
+    const cleared = await forceClearRepositoryLock(c.env.DB, {
+      userId: c.get('userId'), storageId, syncFolder: normalized,
+    });
+    const response: RepoLockClearResponse = { cleared, storageId, syncFolder: normalized };
+    return c.json(response);
+  } catch (error) {
+    return handleError(c, error);
   }
 });
 
@@ -376,8 +402,11 @@ function validateDirectUploadFile(path: string, size: number, hash: string, mtim
 }
 
 function handleError(c: any, e: unknown): Response {
-  if (e instanceof StorageError) return c.json({ error: e.message }, e.status);
+  const storageError = mapStorageHttpError(e);
+  if (storageError) return c.json(storageError.body, storageError.status);
   if (e instanceof FileTooLarge) return c.json({ error: e.message, code: 'FILE_TOO_LARGE' }, 413);
+  if (e instanceof RepositoryLockConflictError) return c.json({ error: e.message, code: 'REPOSITORY_LOCKED' }, 409);
+  if (e instanceof RepositoryLockReleaseError) return c.json({ error: e.message, code: 'REPOSITORY_LOCK_RELEASE_FAILED' }, 503);
   if (e instanceof HeadConflictError) return c.json({ error: e.message, code: 'HEAD_CONFLICT' }, 409);
   if (e instanceof RepoExistsError) return c.json({ error: e.message, code: 'REPO_EXISTS' }, 409);
   if (e instanceof RepoNotInitializedError) return c.json({ error: e.message, code: 'REPO_NOT_INITIALIZED' }, 404);

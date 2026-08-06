@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { StorageRequestError } from '@synx/storage-core';
 import { SyncExecutor, type ExecutableSyncAction } from './syncExecutor.js';
 
 function deferred() {
@@ -64,5 +65,25 @@ describe('SyncExecutor', () => {
     expect(calls).toBe(0);
     expect(results[0]).toMatchObject({ status: 'skipped', path: 'large.bin', rule: 'size>20MB' });
     expect(events).toEqual(['skipped']);
+  });
+
+  it('keeps a structured storage error internally after converting a file failure to a result', async () => {
+    const original = new StorageRequestError(403, 's3 get failed (403) accessKey=do-not-report');
+    const results = await new SyncExecutor(1, async () => { throw original; }).execute([
+      { type: 'pull', path: 'secret.md', reason: 'remote-newer' },
+    ]);
+
+    expect(results[0].cause).toBe(original);
+    expect(results[0].error).toMatchObject({ status: 403, category: 'permission' });
+    expect(JSON.stringify(results[0].error)).not.toContain('do-not-report');
+  });
+
+  it('reports protected writes without counting them as successful actions', async () => {
+    const events: string[] = [];
+    const executor = new SyncExecutor(1, async () => 'protected', (event) => events.push(event.type));
+    const results = await executor.execute([{ type: 'delete-local', path: 'edited.md', reason: 'remote-deleted' }]);
+
+    expect(results[0]).toMatchObject({ status: 'protected', operation: 'delete-local', path: 'edited.md' });
+    expect(events).toEqual(['started', 'protected']);
   });
 });

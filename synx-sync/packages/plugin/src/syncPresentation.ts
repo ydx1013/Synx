@@ -16,7 +16,8 @@ export function formatStatusBar(connected: boolean, report: SyncReport | null): 
   }
   if (report.phase === 'failed') return 'Synx 同步失败';
   const deletions = report.stats.deleteLocal + report.stats.deleteRemote;
-  const base = `Synx 完成：成功 ${report.stats.success}，失败 ${report.stats.failed}，跳过 ${report.stats.skipped}${deletions > 0 ? `，删除 ${deletions}` : ''}`;
+  const protectedCount = report.stats.protected ?? 0;
+  const base = `Synx 完成：成功 ${report.stats.success}，失败 ${report.stats.failed}，跳过 ${report.stats.skipped}${protectedCount > 0 ? `，保护 ${protectedCount}` : ''}${deletions > 0 ? `，删除 ${deletions}` : ''}`;
   return appendBackupStatus(base, report.backups);
 }
 

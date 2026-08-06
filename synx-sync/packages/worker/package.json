@@ -11,8 +11,9 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@synx/repo-core": "*",
     "@synx/shared": "*",
-    "aws4fetch": "^1.0.20",
+    "@synx/storage-core": "*",
     "bcryptjs": "^3.0.3",
     "hono": "^4.13.0"
   },

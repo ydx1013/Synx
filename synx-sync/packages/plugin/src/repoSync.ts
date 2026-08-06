@@ -1,4 +1,4 @@
-import type { RepoChange, RepoFile } from '@synx/shared';
+import type { RepoChange, RepoCommit, RepoFile } from '@synx/shared';
 import type { RemoteEntity } from './syncAlgo.js';
 
 /**
@@ -21,6 +21,29 @@ export interface RepoUploadedFile {
 
 /** 待删除的远端文件（path → identity） */
 export type RepoDelete = { path: string; identity: string };
+
+interface CommitResult {
+  commit: RepoCommit;
+  head: { commitId: string };
+}
+
+interface CommitIndexWriter {
+  putCommits(commits: RepoCommit[], headCommitId: string): Promise<void>;
+}
+
+/** 主仓库操作成功后即时更新本地索引；索引故障不能反向破坏已成功的远端提交。 */
+export async function commitAndIndex<T extends CommitResult>(
+  operation: () => Promise<T>,
+  index: CommitIndexWriter,
+): Promise<T> {
+  const result = await operation();
+  try {
+    await index.putCommits([result.commit], result.head.commitId);
+  } catch (error) {
+    console.warn('synx: failed to update local history index', error);
+  }
+  return result;
+}
 
 /** 仓库树 → planSync 使用的远端实体列表（key 带前导 /，hash 同时放 hash/etag） */
 export function repoTreeToRemote(tree: RepoFile[]): RemoteEntity[] {

@@ -5,7 +5,7 @@ import type { BackupSyncStats, SyncReport } from './syncReport.js';
 function report(phase: SyncReport['phase'], stats: Partial<SyncReport['stats']> = {}, backups: BackupSyncStats[] = []): SyncReport {
   return {
     id: '1', trigger: 'manual', startedAt: 1, phase, items: [],
-    stats: { success: 0, failed: 0, skipped: 0, conflicts: 0, push: 0, pull: 0, deleteLocal: 0, deleteRemote: 0, ...stats },
+    stats: { success: 0, failed: 0, skipped: 0, protected: 0, conflicts: 0, push: 0, pull: 0, deleteLocal: 0, deleteRemote: 0, ...stats },
     backups,
   };
 }
@@ -23,7 +23,7 @@ describe('formatStatusBar', () => {
   });
 
   it('shows completion summaries', () => {
-    expect(formatStatusBar(true, report('completed', { success: 14, skipped: 3 }))).toBe('Synx 完成：成功 14，失败 0，跳过 3');
+    expect(formatStatusBar(true, report('completed', { success: 14, skipped: 3, protected: 2 }))).toBe('Synx 完成：成功 14，失败 0，跳过 3，保护 2');
     expect(formatStatusBar(true, report('partial-failure', { success: 14, failed: 2, skipped: 3 }))).toBe('Synx 完成：成功 14，失败 2，跳过 3');
     expect(formatStatusBar(true, report('failed'))).toBe('Synx 同步失败');
   });

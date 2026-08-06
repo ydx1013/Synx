@@ -1,8 +1,9 @@
+import { StorageRequestError } from '@synx/storage-core';
 import { WorkerApiError } from './workerClient.js';
 
 export type SyncTrigger = 'manual' | 'timer' | 'startup' | 'save' | 'retry';
 export type SyncOperation = 'push' | 'pull' | 'delete-remote' | 'delete-local' | 'skip' | 'conflict';
-export type SyncItemStatus = 'success' | 'failed' | 'skipped' | 'conflict';
+export type SyncItemStatus = 'success' | 'failed' | 'skipped' | 'protected' | 'conflict';
 export type SyncPhase = 'scanning' | 'planning' | 'syncing' | 'completed' | 'partial-failure' | 'failed';
 export type SyncErrorCategory = 'auth' | 'permission' | 'not-found' | 'conflict' | 'too-large' | 'rate-limit' | 'server' | 'network' | 'timeout' | 'local-read' | 'local-write' | 'local-missing' | 'local-permission' | 'unknown';
 
@@ -48,7 +49,7 @@ export interface SyncReport {
   endedAt?: number;
   phase: SyncPhase;
   items: SyncReportItem[];
-  stats: { success: number; failed: number; skipped: number; conflicts: number; push: number; pull: number; deleteLocal: number; deleteRemote: number };
+  stats: { success: number; failed: number; skipped: number; protected: number; conflicts: number; push: number; pull: number; deleteLocal: number; deleteRemote: number };
   /** 备份存储镜像结果（主存储同步完成后填充） */
   backups: BackupSyncStats[];
 }
@@ -77,7 +78,7 @@ export class SyncReportStore {
       startedAt,
       phase: 'scanning',
       items: [],
-      stats: { success: 0, failed: 0, skipped: 0, conflicts: 0, push: 0, pull: 0, deleteLocal: 0, deleteRemote: 0 },
+      stats: { success: 0, failed: 0, skipped: 0, protected: 0, conflicts: 0, push: 0, pull: 0, deleteLocal: 0, deleteRemote: 0 },
       backups: [],
     };
     return this.active;
@@ -107,6 +108,7 @@ export class SyncReportStore {
     if (sanitized.status === 'success') this.active.stats.success++;
     if (sanitized.status === 'failed') this.active.stats.failed++;
     if (sanitized.status === 'skipped') this.active.stats.skipped++;
+    if (sanitized.status === 'protected') this.active.stats.protected = (this.active.stats.protected ?? 0) + 1;
     if (sanitized.status === 'conflict') this.active.stats.conflicts++;
     if (sanitized.status === 'success' && sanitized.operation === 'delete-local') this.active.stats.deleteLocal++;
     if (sanitized.status === 'success' && sanitized.operation === 'delete-remote') this.active.stats.deleteRemote++;
@@ -144,6 +146,10 @@ export function labelSyncReason(reason: string): string {
 }
 
 export function normalizeSyncError(error: unknown): SyncErrorInfo {
+  if (error instanceof StorageRequestError) {
+    const category = httpCategory(error.status);
+    return { category, message: categoryMessage(category), status: error.status, attempts: 1 };
+  }
   if (error instanceof WorkerApiError) {
     const category = httpCategory(error.status);
     return { category, message: categoryMessage(category), detail: sanitizeDetail(error.message), status: error.status, attempts: error.attempts };

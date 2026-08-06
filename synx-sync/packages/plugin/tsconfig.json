@@ -10,8 +10,10 @@
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "paths": {
+      "@synx/repo-core": ["../repo-core/src"],
       "@synx/shared": ["../shared/src"],
-      "@synx/shared/*": ["../shared/src/*"]
+      "@synx/shared/*": ["../shared/src/*"],
+      "@synx/storage-core": ["../storage-core/src"]
     }
   },
   "include": ["src/**/*.ts"]

@@ -67,6 +67,16 @@ describe('SyncReportStore', () => {
     expect(store.current?.stats.deleteRemote).toBe(1);
   });
 
+  it('counts protected writes separately without success, failure, or deletion completion', () => {
+    const store = new SyncReportStore([], 20);
+    store.start('retry', 1);
+    store.addItem({ path: 'edited.md', operation: 'delete-local', status: 'protected', startedAt: 1, endedAt: 2, attempts: 1 });
+    const report = store.finish(2);
+
+    expect(report.phase).toBe('completed');
+    expect(report.stats).toMatchObject({ success: 0, failed: 0, protected: 1, deleteLocal: 0 });
+  });
+
   it('records backup storage results and replaces duplicates', () => {
     const store = new SyncReportStore([], 20);
     store.start('manual', 1);

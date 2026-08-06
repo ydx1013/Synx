@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { S3Fs } from './s3Fs.js';
+import { StorageRequestError } from './storageRequestError.js';
 
 const config = {
   endpoint: 'https://s3.example.com',
@@ -122,6 +123,97 @@ describe('S3Fs', () => {
     fetchMock.mockResolvedValue(mockResponse({ status: 200, text: xml }));
     const fs = new S3Fs(config);
     expect(await fs.list('a')).toEqual(['a&b']);
+  });
+
+  it.each([
+    ['put', (fs: S3Fs) => fs.put('k', new Uint8Array()), 401],
+    ['putIfMatch', (fs: S3Fs) => fs.putIfMatch('k', new Uint8Array(), 'etag'), 403],
+    ['putIfNoneMatch', (fs: S3Fs) => fs.putIfNoneMatch('k', new Uint8Array()), 401],
+    ['putIfNoneMatch', (fs: S3Fs) => fs.putIfNoneMatch('k', new Uint8Array()), 403],
+    ['getEtag', (fs: S3Fs) => fs.getEtag('k'), 401],
+    ['get', (fs: S3Fs) => fs.get('k'), 403],
+    ['delete', (fs: S3Fs) => fs.delete('k'), 401],
+    ['deleteMany', (fs: S3Fs) => fs.deleteMany(['k']), 403],
+  ] as const)('preserves auth status for %s', async (_name, operation, status) => {
+    fetchMock.mockResolvedValue(mockResponse({ status }));
+    const error = await operation(new S3Fs(config)).catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(status);
+  });
+
+  it.each([
+    ['put', (fs: S3Fs) => fs.put('k', new Uint8Array())],
+    ['putIfMatch', (fs: S3Fs) => fs.putIfMatch('k', new Uint8Array(), 'etag')],
+    ['putIfNoneMatch', (fs: S3Fs) => fs.putIfNoneMatch('k', new Uint8Array())],
+    ['getEtag', (fs: S3Fs) => fs.getEtag('k')],
+    ['get', (fs: S3Fs) => fs.get('k')],
+    ['delete', (fs: S3Fs) => fs.delete('k')],
+    ['head', (fs: S3Fs) => fs.head('k')],
+    ['list', (fs: S3Fs) => fs.list('k')],
+    ['deleteMany', (fs: S3Fs) => fs.deleteMany(['k'])],
+  ] as const)('retries a network failure for %s', async (_name, operation) => {
+    fetchMock
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(mockResponse({ status: 200, text: '<ListBucketResult></ListBucketResult>' }));
+
+    await operation(new S3Fs(config, async () => {}));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a 503 response and succeeds', async () => {
+    const buf = new TextEncoder().encode('ok').buffer as ArrayBuffer;
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ status: 503 }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, arrayBuffer: buf }));
+
+    const out = await new S3Fs(config, async () => {}).get('k');
+    expect(new TextDecoder().decode(out)).toBe('ok');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a 401 response', async () => {
+    fetchMock.mockResolvedValue(mockResponse({ status: 401 }));
+
+    const error = await new S3Fs(config, async () => {}).get('k').catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry a 412 conditional write and returns false', async () => {
+    fetchMock.mockResolvedValue(mockResponse({ status: 412 }));
+
+    await expect(new S3Fs(config, async () => {}).putIfMatch('k', new Uint8Array(), 'etag')).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the original network error after three attempts', async () => {
+    const networkError = new TypeError('network failed');
+    fetchMock.mockRejectedValue(networkError);
+
+    await expect(new S3Fs(config, async () => {}).get('k')).rejects.toBe(networkError);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('preserves the final retryable HTTP status after three attempts', async () => {
+    fetchMock.mockResolvedValue(mockResponse({ status: 503 }));
+
+    const error = await new S3Fs(config, async () => {}).get('k').catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries only the current list page without duplicating completed pages', async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ status: 200, text: '<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken><Contents><Key>a</Key></Contents></ListBucketResult>' }))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(mockResponse({ status: 200, text: '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>b</Key></Contents></ListBucketResult>' }));
+
+    await expect(new S3Fs(config, async () => {}).list('x')).resolves.toEqual(['a', 'b']);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(callArgs(1).url).toBe(callArgs(2).url);
+    expect(callArgs(1).url).toContain('continuation-token=next');
   });
 });
 

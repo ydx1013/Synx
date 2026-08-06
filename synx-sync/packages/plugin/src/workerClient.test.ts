@@ -64,6 +64,23 @@ describe('WorkerClient headers', () => {
   });
 });
 
+describe('getStorageCredentials', () => {
+  it('GETs the encoded current storage URL and returns credentials', async () => {
+    const credentials = { storageId: 'storage/one', type: 'webdav', config: { address: 'https://dav.example.com', username: 'alice', password: 'secret', authType: 'basic' } };
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes(credentials));
+    const client = makeClient(fetchMock, { storageId: 'storage/one' });
+    await expect(client.getStorageCredentials()).resolves.toEqual(credentials);
+    expect(fetchMock.mock.calls[0][0]).toBe(`${SERVER}/api/storage/storage%2Fone/credentials`);
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe('GET');
+  });
+
+  it('rejects an invalid response instead of trusting the generic request cast', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ storageId: 'wrong', type: 's3', config: {} }));
+    const client = makeClient(fetchMock, { storageId: 'storage/one' });
+    await expect(client.getStorageCredentials()).rejects.toThrow('storageId');
+  });
+});
+
 describe('repoHead', () => {
   it('returns head + tree', async () => {
     const head = { commitId: 'c1', generation: 1, createdAt: 1, author: 'dev', message: 'init' };
@@ -74,6 +91,20 @@ describe('repoHead', () => {
     expect(res.head?.commitId).toBe('c1');
     expect(res.tree.length).toBe(1);
     expect(fetchMock.mock.calls[0][0]).toContain('/api/repository/head');
+  });
+});
+
+describe('repoCommit', () => {
+  it('按 commitId 读取完整提交', async () => {
+    const commit = {
+      commitId: 'c1', parentCommitId: null, generation: 1, createdAt: 1,
+      author: null, message: 'Initial snapshot', kind: 'initial',
+      changeCount: 0, checkpointId: 'c1', changes: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ commit }));
+    const client = makeClient(fetchMock);
+    expect((await client.repoCommit('c1')).commitId).toBe('c1');
+    expect(String(fetchMock.mock.calls[0][0])).toBe(`${SERVER}/api/repository/commits/c1`);
   });
 });
 
@@ -147,12 +178,22 @@ describe('error handling', () => {
     await expect(client.repoHead()).rejects.toMatchObject({ status: 403 });
   });
 
-  it('triggers onUnauthorized on 401', async () => {
+  it('triggers onUnauthorized and compatible auth failure callback on 401', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"unauthorized"}', { status: 401 }));
     const onUnauthorized = vi.fn();
-    const client = makeClient(fetchMock, { onUnauthorized });
+    const onAuthFailure = vi.fn();
+    const client = makeClient(fetchMock, { onUnauthorized, onAuthFailure });
     await expect(client.repoHead()).rejects.toMatchObject({ status: 401 });
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(onAuthFailure).toHaveBeenCalledWith(401, STORAGE_ID);
+  });
+
+  it('triggers auth failure callback with current storage on 403', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"error":"forbidden"}', { status: 403 }));
+    const onAuthFailure = vi.fn();
+    const client = makeClient(fetchMock, { onAuthFailure });
+    await expect(client.repoHead()).rejects.toMatchObject({ status: 403 });
+    expect(onAuthFailure).toHaveBeenCalledWith(403, STORAGE_ID);
   });
 
   it('retries on 5xx with exponential backoff', async () => {

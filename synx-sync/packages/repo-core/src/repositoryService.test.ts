@@ -1,16 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   makeStorageKey,
   type RepoChange,
   type RepoCommit,
   type WorkerFs,
 } from '@synx/shared';
-import { makeEnv } from '../test/helpers.js';
 import {
   BlobMissingError,
   EmptyChangesError,
+  ExternalRepositoryLockRequiredError,
   HeadConflictError,
   RepoExistsError,
+  RepoIntegrityError,
   canonicalJson,
   diffCommits,
   diffTrees,
@@ -91,8 +92,6 @@ class MemFs implements WorkerFs {
   }
 }
 
-const env = makeEnv();
-
 interface FileSeed {
   path: string;
   fileUuid?: string;
@@ -104,7 +103,7 @@ interface FileSeed {
 /** 建仓：init 空提交后，把给定文件作为首个同步提交加入（真实流程：init → 首次同步 add 全部）。 */
 async function createRepoWithFiles(files: FileSeed[], supportsConditional = true): Promise<MemFs> {
   const fs = new MemFs(supportsConditional);
-  const { head } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+  const { head } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
   const changes: RepoChange[] = files.map((f) => {
     const blobId = makeStorageKey(SYNC_FOLDER, f.path, f.versionId);
     fs.putText(blobId, f.content);
@@ -119,7 +118,7 @@ async function createRepoWithFiles(files: FileSeed[], supportsConditional = true
     };
   });
   await finalizeCommit({
-    env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+    storageId: 's1', syncFolder: SYNC_FOLDER, fs,
     baseCommitId: head.commitId, baseGeneration: head.generation, changes,
   });
   return fs;
@@ -154,10 +153,55 @@ describe('canonicalJson / normalizeChanges', () => {
   });
 });
 
+describe('readHead', () => {
+  it.each([401, 403])('fs.get 的认证状态 %i 原样传播', async (status) => {
+    const fs = new MemFs();
+    await fs.putText('Vault/.synx/repo/HEAD.json', '{}');
+    const authError = Object.assign(new Error('credential rejected'), { status });
+    fs.get = vi.fn().mockRejectedValue(authError);
+
+    await expect(readHead(fs, SYNC_FOLDER)).rejects.toBe(authError);
+  });
+
+  it('fs.get 的原始 TypeError 原样传播', async () => {
+    const fs = new MemFs();
+    await fs.putText('Vault/.synx/repo/HEAD.json', '{}');
+    const networkError = new TypeError('ConnectTimeout');
+    fs.get = vi.fn().mockRejectedValue(networkError);
+
+    await expect(readHead(fs, SYNC_FOLDER)).rejects.toBe(networkError);
+  });
+
+  it('GET 成功但 JSON 损坏时转为 RepoIntegrityError', async () => {
+    const fs = new MemFs();
+    await fs.putText('Vault/.synx/repo/HEAD.json', '{broken');
+
+    await expect(readHead(fs, SYNC_FOLDER)).rejects.toBeInstanceOf(RepoIntegrityError);
+  });
+});
+
 describe('initRepository', () => {
+  it('resolveTree 读取检查点时 fs.get 的网络异常原样传播', async () => {
+    const fs = new MemFs();
+    const { commit } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const networkError = new TypeError('ConnectTimeout');
+    const originalGet = fs.get.bind(fs);
+    fs.get = async (key) => key.includes('/checkpoints/') ? Promise.reject(networkError) : originalGet(key);
+
+    await expect(resolveTree(fs, SYNC_FOLDER, commit)).rejects.toBe(networkError);
+  });
+
+  it('resolveTree 读取到损坏检查点 JSON 时转为 RepoIntegrityError', async () => {
+    const fs = new MemFs();
+    const { commit } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    await fs.putText(`Vault/.synx/repo/checkpoints/${commit.commitId}.json`, '{broken');
+
+    await expect(resolveTree(fs, SYNC_FOLDER, commit)).rejects.toBeInstanceOf(RepoIntegrityError);
+  });
+
   it('创建空初始提交（含检查点与 HEAD），重复 init 报 REPO_EXISTS', async () => {
     const fs = new MemFs();
-    const { head, commit } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const { head, commit } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
 
     expect(head.generation).toBe(1);
     expect(commit.kind).toBe('initial');
@@ -175,13 +219,24 @@ describe('initRepository', () => {
     expect(tree.size).toBe(0);
 
     // 重复 init 报 REPO_EXISTS
-    await expect(initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs })).rejects.toThrow(RepoExistsError);
+    await expect(initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs })).rejects.toThrow(RepoExistsError);
   });
 
-  it('无条件写后端（WebDAV 降级）也能完成初始化', async () => {
+  it('无条件写后端必须由调用方显式证明已有外部串行化', async () => {
     const fs = new MemFs(false);
-    const { head, commit } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    await expect(initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs }))
+      .rejects.toThrow(ExternalRepositoryLockRequiredError);
+
+    const { head, commit } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true });
     expect(head.commitId).toBe(commit.commitId);
+  });
+
+  it('首次条件创建 HEAD 的认证错误原样传播', async () => {
+    const fs = new MemFs();
+    const authError = Object.assign(new Error('unauthorized'), { status: 401 as const });
+    fs.putIfNoneMatch = vi.fn().mockRejectedValue(authError);
+
+    await expect(initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs })).rejects.toBe(authError);
   });
 });
 
@@ -202,8 +257,6 @@ describe('finalizeCommit（原子提交）', () => {
     await fs.putText(addBlob, 'new-content');
 
     const { commit, head } = await finalizeCommit({
-      env,
-      userId: 'u1',
       storageId: 's1',
       syncFolder: SYNC_FOLDER,
       fs,
@@ -242,8 +295,6 @@ describe('finalizeCommit（原子提交）', () => {
     }
 
     const { commit, head } = await finalizeCommit({
-      env,
-      userId: 'u1',
       storageId: 's1',
       syncFolder: SYNC_FOLDER,
       fs,
@@ -262,15 +313,81 @@ describe('finalizeCommit（原子提交）', () => {
     expect(tree.get('bulk/59.md')!.blobId).toBe(makeStorageKey(SYNC_FOLDER, 'bulk/59.md', 'v59'));
   });
 
+  it.each([
+    ['getEtag', 401, (fs: MemFs, error: Error) => { fs.getEtag = vi.fn().mockRejectedValue(error); }],
+    ['putIfMatch', 403, (fs: MemFs, error: Error) => { fs.putIfMatch = vi.fn().mockRejectedValue(error); }],
+  ] as const)('%s 的认证错误在 finalize 中原样传播', async (_operation, status, inject) => {
+    const fs = new MemFs();
+    const { head } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const blobId = makeStorageKey(SYNC_FOLDER, 'note.md', 'auth');
+    await fs.putText(blobId, 'content');
+    const authError = Object.assign(new Error('authentication failed'), { status });
+    inject(fs, authError);
+
+    await expect(finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'uuid-note', operation: 'add', path: 'note.md', blobId, hash: 'h', size: 7, mtime: 1 }],
+    })).rejects.toBe(authError);
+  });
+
+  it.each([
+    ['head', 401, (fs: MemFs, error: Error) => {
+      const original = fs.head.bind(fs);
+      fs.head = async (key) => key.endsWith('lock.json') ? Promise.reject(error) : original(key);
+    }],
+    ['head', 403, (fs: MemFs, error: Error) => {
+      const original = fs.head.bind(fs);
+      fs.head = async (key) => key.endsWith('lock.json') ? Promise.reject(error) : original(key);
+    }],
+    ['get', 401, (fs: MemFs, error: Error) => {
+      const originalHead = fs.head.bind(fs);
+      const originalGet = fs.get.bind(fs);
+      fs.head = async (key) => key.endsWith('lock.json') ? true : originalHead(key);
+      fs.get = async (key) => key.endsWith('lock.json') ? Promise.reject(error) : originalGet(key);
+    }],
+    ['get', 403, (fs: MemFs, error: Error) => {
+      const originalHead = fs.head.bind(fs);
+      const originalGet = fs.get.bind(fs);
+      fs.head = async (key) => key.endsWith('lock.json') ? true : originalHead(key);
+      fs.get = async (key) => key.endsWith('lock.json') ? Promise.reject(error) : originalGet(key);
+    }],
+    ['put', 401, (fs: MemFs, error: Error) => {
+      const original = fs.put.bind(fs);
+      fs.putIfNoneMatch = undefined;
+      fs.put = async (key, content) => key.endsWith('lock.json')
+        ? Promise.reject(error)
+        : original(key, content);
+    }],
+    ['put', 403, (fs: MemFs, error: Error) => {
+      const original = fs.put.bind(fs);
+      fs.putIfNoneMatch = undefined;
+      fs.put = async (key, content) => key.endsWith('lock.json')
+        ? Promise.reject(error)
+        : original(key, content);
+    }],
+  ] as const)('锁路径 %s 的认证错误不转为 HeadConflictError', async (_operation, status, inject) => {
+    const fs = new MemFs(true, true);
+    const { head } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const blobId = makeStorageKey(SYNC_FOLDER, 'note.md', 'lock-auth');
+    await fs.putText(blobId, 'content');
+    const authError = Object.assign(new Error('authentication failed'), { status });
+    inject(fs, authError);
+
+    await expect(finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'uuid-note', operation: 'add', path: 'note.md', blobId, hash: 'h', size: 7, mtime: 1 }],
+    })).rejects.toBe(authError);
+  });
+
   it('If-Match 恒失配的后端（假冲突）→ 降级锁路径写入，提交成功', async () => {
     const fs = new MemFs(true, true); // 支持条件写但 putIfMatch 恒返回 false（模拟不稳定的 S3 If-Match）
-    const { head: initialHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const { head: initialHead } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
 
     const blobId = makeStorageKey(SYNC_FOLDER, 'note.md', 'v2');
     await fs.putText(blobId, 'v2-content');
     const { commit, head } = await finalizeCommit({
-      env,
-      userId: 'u1',
       storageId: 's1',
       syncFolder: SYNC_FOLDER,
       fs,
@@ -292,7 +409,7 @@ describe('finalizeCommit（原子提交）', () => {
     await fs.putText(blob, 'v2-content');
 
     const first = await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: initialHead.commitId, baseGeneration: initialHead.generation, changes: [
         { identity: 'uuid-note', operation: 'modify', path: 'note.md', blobId: blob, hash: 'h2', size: 9, mtime: 2000 },
       ],
@@ -301,7 +418,7 @@ describe('finalizeCommit（原子提交）', () => {
     // 两个设备基于同一基线，只有一个能成功
     await expect(
       finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: initialHead.commitId, baseGeneration: initialHead.generation, changes: [
           { identity: 'uuid-note', operation: 'modify', path: 'note.md', blobId: blob, hash: 'h2', size: 9, mtime: 2000 },
         ],
@@ -317,7 +434,7 @@ describe('finalizeCommit（原子提交）', () => {
     const { fs, initialHead } = await setup();
     await expect(
       finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: initialHead.commitId, baseGeneration: initialHead.generation, changes: [
           { identity: 'uuid-note', operation: 'modify', path: 'note.md', blobId: 'Vault/note.md@missing', hash: 'h', size: 1, mtime: 1 },
         ],
@@ -330,20 +447,34 @@ describe('finalizeCommit（原子提交）', () => {
     const { fs, initialHead } = await setup();
     await expect(
       finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: initialHead.commitId, baseGeneration: initialHead.generation, changes: [],
       }),
     ).rejects.toThrow(EmptyChangesError);
   });
 
-  it('无条件写后端（锁对象降级）也能 finalize，过期基线同样冲突', async () => {
-    const fs = await createRepoWithFiles([{ path: 'a.md', fileUuid: 'u1', versionId: 'v1', content: 'a', mtime: 1 }], false);
+  it('无条件写后端没有外部锁时拒绝 finalize，显式外部锁下仍检查基线', async () => {
+    const fs = new MemFs(false);
+    const initial = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true });
+    const initialBlob = makeStorageKey(SYNC_FOLDER, 'a.md', 'v1');
+    await fs.putText(initialBlob, 'a');
+    await finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true,
+      baseCommitId: initial.head.commitId, baseGeneration: initial.head.generation,
+      changes: [{ identity: 'u1', operation: 'add', path: 'a.md', blobId: initialBlob, hash: 'h1', size: 1, mtime: 1 }],
+    });
     const head = (await readHead(fs, SYNC_FOLDER))!;
     const blob = makeStorageKey(SYNC_FOLDER, 'a.md', 'v2');
     await fs.putText(blob, 'b');
 
+    await expect(finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'u1', operation: 'modify', path: 'a.md', blobId: blob, hash: 'h', size: 1, mtime: 2 }],
+    })).rejects.toThrow(ExternalRepositoryLockRequiredError);
+
     const { commit } = await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true,
       baseCommitId: head.commitId, baseGeneration: head.generation,
       changes: [{ identity: 'u1', operation: 'modify', path: 'a.md', blobId: blob, hash: 'h', size: 1, mtime: 2 }],
     });
@@ -351,7 +482,7 @@ describe('finalizeCommit（原子提交）', () => {
 
     await expect(
       finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         changes: [{ identity: 'u1', operation: 'modify', path: 'a.md', blobId: blob, hash: 'h', size: 1, mtime: 2 }],
       }),
@@ -366,7 +497,7 @@ describe('提交历史 / diff / 单文件历史', () => {
     const blob = makeStorageKey(SYNC_FOLDER, 'note.md', 'v2');
     await fs.putText(blob, 'v2-content');
     const { commit } = await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: head.commitId, baseGeneration: head.generation,
       changes: [{ identity: 'uuid-note', operation: 'modify', path: 'note.md', blobId: blob, hash: 'h2', size: 9, mtime: 2000 }],
     });
@@ -381,6 +512,46 @@ describe('提交历史 / diff / 单文件历史', () => {
     expect(page1.commits.map((c) => c.commitId)).toEqual([syncCommitId, initialCommitId, expect.any(String)]);
     expect(page1.commits[2].kind).toBe('initial');
     expect(page1.cursor).toBeNull();
+  });
+
+  it('listCommits 的 fs.get 网络异常原样传播而非伪装链尾', async () => {
+    const { fs } = await setup();
+    const head = (await readHead(fs, SYNC_FOLDER))!;
+    const networkError = new TypeError('ConnectTimeout');
+    fs.get = vi.fn().mockRejectedValue(networkError);
+
+    await expect(listCommits(fs, SYNC_FOLDER, head)).rejects.toBe(networkError);
+  });
+
+  it('listCommits 遇到损坏 JSON 时按现有语义保守停止', async () => {
+    const { fs } = await setup();
+    const head = (await readHead(fs, SYNC_FOLDER))!;
+    await fs.putText(`Vault/.synx/repo/commits/${head.commitId}.json`, '{broken');
+
+    await expect(listCommits(fs, SYNC_FOLDER, head)).resolves.toEqual({ commits: [], cursor: head.commitId });
+  });
+
+  it.each([401, 403])('getCommitDetail 的 fs.get 认证状态 %i 原样传播', async (status) => {
+    const { fs, syncCommitId } = await setup();
+    const authError = Object.assign(new Error('credential rejected'), { status });
+    fs.get = vi.fn().mockRejectedValue(authError);
+
+    await expect(getCommitDetail(fs, SYNC_FOLDER, syncCommitId)).rejects.toBe(authError);
+  });
+
+  it('getCommitDetail 的 fs.get 原始 TypeError 原样传播', async () => {
+    const { fs, syncCommitId } = await setup();
+    const networkError = new TypeError('ConnectTimeout');
+    fs.get = vi.fn().mockRejectedValue(networkError);
+
+    await expect(getCommitDetail(fs, SYNC_FOLDER, syncCommitId)).rejects.toBe(networkError);
+  });
+
+  it('getCommitDetail GET 成功但 JSON 损坏时转为 RepoIntegrityError', async () => {
+    const { fs, syncCommitId } = await setup();
+    await fs.putText(`Vault/.synx/repo/commits/${syncCommitId}.json`, '{broken');
+
+    await expect(getCommitDetail(fs, SYNC_FOLDER, syncCommitId)).rejects.toBeInstanceOf(RepoIntegrityError);
   });
 
   it('diff：初始提交 → 同步提交显示 modify', async () => {
@@ -400,6 +571,15 @@ describe('提交历史 / diff / 单文件历史', () => {
     expect(changes.map((c) => c.operation)).toEqual(['add', 'modify']);
     // 链已扫尽 → 无下一页
     expect(nextCursor).toBeNull();
+  });
+
+  it('fileHistory 的 fs.get 网络异常原样传播而非伪装链尾', async () => {
+    const { fs } = await setup();
+    const head = (await readHead(fs, SYNC_FOLDER))!;
+    const networkError = new TypeError('ConnectTimeout');
+    fs.get = vi.fn().mockRejectedValue(networkError);
+
+    await expect(fileHistory(fs, SYNC_FOLDER, head, 'uuid-note')).rejects.toBe(networkError);
   });
 
   it('fileHistory 支持 from 游标分页，不截断', async () => {
@@ -442,21 +622,21 @@ describe('restoreRepository（全库恢复，revert 语义）', () => {
     const blob = makeStorageKey(SYNC_FOLDER, 'note.md', 'v2');
     await fs.putText(blob, 'v2-content');
     const { commit: syncCommit, head: syncHead } = await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: initHead.commitId, baseGeneration: initHead.generation,
       changes: [{ identity: 'uuid-note', operation: 'modify', path: 'note.md', blobId: blob, hash: 'h2', size: 9, mtime: 2000 }],
     });
 
     // dryRun 预览：应显示把 note.md 改回 v1
     const preview = await restoreRepository({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       toCommitId: initHead.commitId, dryRun: true,
     });
     expect(preview.preview!.modified).toBe(1);
 
     // 应用恢复
     const result = await restoreRepository({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       toCommitId: initHead.commitId, dryRun: false, author: 'device-c',
     });
     const restoreCommit = result.commit!;
@@ -470,7 +650,7 @@ describe('restoreRepository（全库恢复，revert 语义）', () => {
 
     // 可反悔：再恢复回同步后的提交
     const undo = await restoreRepository({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       toCommitId: syncCommit.commitId, dryRun: false,
     });
     const undoTree = await resolveTree(fs, SYNC_FOLDER, undo.commit!);
@@ -479,6 +659,31 @@ describe('restoreRepository（全库恢复，revert 语义）', () => {
 });
 
 describe('gcRepository', () => {
+  it('扫描提交时 fs.get 的网络异常原样传播且不删除对象', async () => {
+    const fs = await createRepoWithFiles([{ path: 'kept.md', versionId: 'kept', content: 'kept', mtime: 1 }]);
+    const orphan = makeStorageKey(SYNC_FOLDER, 'orphan.md', 'v1');
+    await fs.putText(orphan, 'orphan');
+    const networkError = new TypeError('ConnectTimeout');
+    const originalGet = fs.get.bind(fs);
+    fs.get = async (key) => key.includes('/commits/') ? Promise.reject(networkError) : originalGet(key);
+
+    await expect(gcRepository({ fs, syncFolder: SYNC_FOLDER })).rejects.toBe(networkError);
+    expect(fs.map.has(orphan)).toBe(true);
+  });
+
+  it('损坏提交按现有保守语义视为链断裂且不删除对象', async () => {
+    const fs = await createRepoWithFiles([{ path: 'kept.md', versionId: 'kept', content: 'kept', mtime: 1 }]);
+    const head = (await readHead(fs, SYNC_FOLDER))!;
+    const orphan = makeStorageKey(SYNC_FOLDER, 'orphan.md', 'v1');
+    await fs.putText(orphan, 'orphan');
+    await fs.putText(`Vault/.synx/repo/commits/${head.commitId}.json`, '{broken');
+
+    const result = await gcRepository({ fs, syncFolder: SYNC_FOLDER });
+
+    expect(result).toMatchObject({ deleted: 0, deletedCommits: 0, more: false });
+    expect(fs.map.has(orphan)).toBe(true);
+  });
+
   it('删除未引用孤儿对象，保留被提交引用的内容对象', async () => {
     const fs = await createRepoWithFiles([
       { path: 'a.md', fileUuid: 'uuid-a', versionId: 'v1', content: 'aaa', mtime: 1000 },
@@ -504,6 +709,72 @@ describe('gcRepository', () => {
     expect(fs.map.has('Vault/.synx/retention.json')).toBe(true);
   });
 
+  it('逐对象删除失败会保留待删清单，后续调用继续处理', async () => {
+    const fs = await createRepoWithFiles([{ path: 'kept.md', versionId: 'kept', content: 'kept', mtime: 1 }]);
+    Object.defineProperty(fs, 'deleteMany', { value: undefined, configurable: true });
+    const orphan = makeStorageKey(SYNC_FOLDER, 'orphan.md', 'v1');
+    await fs.putText(orphan, 'orphan');
+    const originalDelete = fs.delete.bind(fs);
+    let failOnce = true;
+    fs.delete = async (key) => {
+      if (key === orphan && failOnce) {
+        failOnce = false;
+        throw Object.assign(new Error('temporary failure'), { status: 503 });
+      }
+      await originalDelete(key);
+    };
+
+    const first = await gcRepository({ fs, syncFolder: SYNC_FOLDER });
+    expect(first.more).toBe(true);
+    expect(fs.map.has(orphan)).toBe(true);
+    expect(JSON.parse(await fs.getText('Vault/.synx/gc-state.json')).pending).toContain(orphan);
+
+    const second = await gcRepository({ fs, syncFolder: SYNC_FOLDER });
+    expect(second.more).toBe(false);
+    expect(fs.map.has(orphan)).toBe(false);
+  });
+
+  it.each([401, 403])('逐对象删除遇到认证状态 %i 时重抛且不清 GC state', async (status) => {
+    const fs = await createRepoWithFiles([{ path: 'kept.md', versionId: 'kept', content: 'kept', mtime: 1 }]);
+    Object.defineProperty(fs, 'deleteMany', { value: undefined, configurable: true });
+    const orphan = makeStorageKey(SYNC_FOLDER, 'orphan.md', 'v1');
+    await fs.putText(orphan, 'orphan');
+    const originalDelete = fs.delete.bind(fs);
+    fs.delete = async (key) => {
+      if (key === orphan) throw Object.assign(new Error('credential rejected'), { status });
+      await originalDelete(key);
+    };
+
+    await expect(gcRepository({ fs, syncFolder: SYNC_FOLDER })).rejects.toMatchObject({ status });
+    expect(fs.map.has(orphan)).toBe(true);
+  });
+
+  it.each([401, 403])('读取 GC state 遇到认证状态 %i 时原样重抛', async (status) => {
+    const fs = await createRepoWithFiles([{ path: 'kept.md', versionId: 'kept', content: 'kept', mtime: 1 }]);
+    const authError = Object.assign(new Error('credential rejected'), { status });
+    const originalGet = fs.get.bind(fs);
+    fs.get = async (key) => {
+      if (key === 'Vault/.synx/gc-state.json') throw authError;
+      return originalGet(key);
+    };
+
+    await expect(gcRepository({ fs, syncFolder: SYNC_FOLDER })).rejects.toBe(authError);
+  });
+
+  it.each([401, 403])('删除 GC state 遇到认证状态 %i 时原样重抛且不报告完成', async (status) => {
+    const fs = new MemFs();
+    const authError = Object.assign(new Error('credential rejected'), { status });
+    fs.delete = async (key) => {
+      if (key === 'Vault/.synx/gc-state.json') throw authError;
+    };
+    let reported: Awaited<ReturnType<typeof gcRepository>> | undefined;
+
+    await expect(gcRepository({ fs, syncFolder: SYNC_FOLDER }).then((result) => {
+      reported = result;
+    })).rejects.toBe(authError);
+    expect(reported).toBeUndefined();
+  });
+
   it('maxCommits 限制遍历时标记 more=true，且不会误删未遍历提交引用的对象', async () => {
     const fs = await createRepoWithFiles([{ path: 'a.md', fileUuid: 'uuid-a', versionId: 'v1', content: 'aaa', mtime: 1000 }]);
     const head1 = (await readHead(fs, SYNC_FOLDER))!;
@@ -511,7 +782,7 @@ describe('gcRepository', () => {
     const blob2 = makeStorageKey(SYNC_FOLDER, 'a.md', 'v2');
     fs.putText(blob2, 'aaa2');
     const { commit: c2 } = await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: head1.commitId, baseGeneration: head1.generation,
       changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob2, hash: 'h2', size: 4, mtime: 2000 }],
     });
@@ -543,7 +814,7 @@ describe('gcRepository', () => {
       fs.putText(blob, `v${gen}`);
       blobOf.set(gen, blob);
       const { commit, head: nextHead } = await finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         now: base - (20 - gen) * DAY, // gen20 最新，越旧越靠前
         changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
@@ -597,7 +868,7 @@ describe('gcRepository', () => {
     const DAY = 24 * 60 * 60 * 1000;
     const base = Date.now();
     const fs = new MemFs();
-    const { head: initHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const { head: initHead } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
 
     // 第一个同步提交：a.md 与 b.md 都加入（b.md 此后不再变动）
     const a1 = makeStorageKey(SYNC_FOLDER, 'a.md', 'a1');
@@ -606,7 +877,7 @@ describe('gcRepository', () => {
     fs.putText(b1, 'b1');
     let head = initHead;
     await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: head.commitId, baseGeneration: head.generation,
       now: base - 18 * DAY,
       changes: [
@@ -621,7 +892,7 @@ describe('gcRepository', () => {
       const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `a${gen}`);
       fs.putText(blob, `a${gen}`);
       ({ head } = await finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         now: base - (12 - gen) * DAY,
         changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `ha${gen}`, size: 2, mtime: 1000 * gen }],
@@ -648,7 +919,7 @@ describe('gcRepository', () => {
     const base = Date.now();
     const N = 65; // init(gen1) + gen2..gen65 = 65 个提交，超过默认单次遍历上限 40
     const fs = new MemFs();
-    const { head: initHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const { head: initHead } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
     const idOf = new Map<number, string>();
     const commitOf = new Map<number, RepoCommit>();
     const blobOf = new Map<number, string>();
@@ -659,7 +930,7 @@ describe('gcRepository', () => {
       fs.putText(blob, `v${gen}`);
       blobOf.set(gen, blob);
       const { commit, head: nextHead } = await finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         now: base - (N - gen) * DAY, // gen65 最新，越旧越靠前
         changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
@@ -719,7 +990,7 @@ describe('gcRepository', () => {
       const blob = makeStorageKey(SYNC_FOLDER, 'a.md', `v${gen}`);
       fs.putText(blob, `v${gen}`);
       ({ head } = await finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
       }));
@@ -737,7 +1008,7 @@ describe('gcRepository', () => {
     const v6 = makeStorageKey(SYNC_FOLDER, 'a.md', 'v6');
     fs.putText(v6, 'v6');
     const { commit: gen6Commit, head: gen6Head } = await finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: head.commitId, baseGeneration: head.generation,
       changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: v6, hash: 'h6', size: 2, mtime: 6000 }],
     });
@@ -773,7 +1044,7 @@ describe('gcRepository', () => {
     const RET_POLICY = { maxFileSize: 0, hourlyWindowHours: 0, dailyWindowDays: 3, monthlyWindowMonths: 0, yearlyWindowYears: 0, maxVersionsPerFile: 0 };
     const N_A = 351; // init(gen1) + gen2..gen351 = 351 个提交，超过单次同步预算 320
     const fs = new MemFs();
-    const { head: initHead } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const { head: initHead } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
     const idOf = new Map<number, string>();
     const blobOf = new Map<number, string>();
     idOf.set(1, initHead.commitId);
@@ -784,7 +1055,7 @@ describe('gcRepository', () => {
       fs.putText(blob, `v${gen}`);
       blobOf.set(gen, blob);
       const { commit, head: nextHead } = await finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         now: base - (N_A - gen) * SIX_HOURS, // gen351 最新，越旧越靠前
         changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
@@ -812,7 +1083,7 @@ describe('gcRepository', () => {
       fs.putText(blob, `v${gen}`);
       blobOf.set(gen, blob);
       const { commit, head: nextHead } = await finalizeCommit({
-        env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+        storageId: 's1', syncFolder: SYNC_FOLDER, fs,
         baseCommitId: head.commitId, baseGeneration: head.generation,
         now: base + (gen - N_A) * 1000,
         changes: [{ identity: 'uuid-a', operation: 'modify', path: 'a.md', blobId: blob, hash: `h${gen}`, size: 2, mtime: 1000 * gen }],
@@ -859,6 +1130,45 @@ describe('gcRepository', () => {
 });
 
 describe('withRepoLock（原子建锁）', () => {
+  it.each([401, 403])('任务成功后删除自己的锁遇到认证状态 %i 时原样传播', async (status) => {
+    const fs = new MemFs(true, true);
+    const { head } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const blob = makeStorageKey(SYNC_FOLDER, 'a.md', 'delete-lock-auth');
+    await fs.putText(blob, 'content');
+    const authError = Object.assign(new Error('credential rejected'), { status });
+    const originalDelete = fs.delete.bind(fs);
+    fs.delete = async (key) => {
+      if (key.endsWith('lock.json')) throw authError;
+      await originalDelete(key);
+    };
+
+    await expect(finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'uuid-a', operation: 'add', path: 'a.md', blobId: blob, hash: 'h1', size: 7, mtime: 1000 }],
+    })).rejects.toBe(authError);
+  });
+
+  it.each([401, 403])('清理过期锁遇到认证状态 %i 时原样传播而非 HeadConflictError', async (status) => {
+    const fs = new MemFs(true, true);
+    const { head } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const blob = makeStorageKey(SYNC_FOLDER, 'a.md', 'expired-lock-auth');
+    await fs.putText(blob, 'content');
+    await fs.putText('Vault/.synx/repo/lock.json', JSON.stringify({ token: 'expired', expiresAt: Date.now() - 1 }));
+    const authError = Object.assign(new Error('credential rejected'), { status });
+    const originalDelete = fs.delete.bind(fs);
+    fs.delete = async (key) => {
+      if (key.endsWith('lock.json')) throw authError;
+      await originalDelete(key);
+    };
+
+    await expect(finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      baseCommitId: head.commitId, baseGeneration: head.generation,
+      changes: [{ identity: 'uuid-a', operation: 'add', path: 'a.md', blobId: blob, hash: 'h1', size: 7, mtime: 1000 }],
+    })).rejects.toBe(authError);
+  });
+
   it('读锁后建锁窗口内被他人抢占时不再并发进入，提交抛 HeadConflictError', async () => {
     // 模拟：另一 Worker 在我们读锁之后、写锁之前抢先写入了锁对象。
     // 旧实现用无条件 put 覆盖他人锁 → 两个任务同时持锁进入（同一 generation、不同
@@ -876,12 +1186,12 @@ describe('withRepoLock（原子建锁）', () => {
       return originalPutIfNoneMatch(key, content);
     };
 
-    const { head } = await initRepository({ env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs });
+    const { head } = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs });
     const blob = makeStorageKey(SYNC_FOLDER, 'a.md', 'v1');
     fs.putText(blob, 'content');
     // 锁被他人持有时绝不应推进 HEAD（否则并发提交会互相覆盖）
     await expect(finalizeCommit({
-      env, userId: 'u1', storageId: 's1', syncFolder: SYNC_FOLDER, fs,
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs,
       baseCommitId: head.commitId, baseGeneration: head.generation,
       changes: [{ identity: 'uuid-a', operation: 'add', path: 'a.md', blobId: blob, hash: 'h1', size: 7, mtime: 1000 }],
     })).rejects.toThrow(HeadConflictError);

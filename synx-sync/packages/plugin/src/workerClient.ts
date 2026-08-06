@@ -4,10 +4,13 @@ import {
   type AuthResponse,
   type StorageSummary,
   type StorageListResponse,
+  type StorageCredentialsResponse,
   type RetentionPolicy,
   type RetentionPolicyResponse,
   type RepoHeadResponse,
   type RepoInitResponse,
+  type RepoCommit,
+  type RepoCommitResponse,
   type RepoTreeResponse,
   type RepoFinalizeRequest,
   type RepoFinalizeResponse,
@@ -20,7 +23,9 @@ import {
   type ImageGalleryListResponse,
   type ImageUploadResponse,
   type OrphanScanResponse,
+  type RepoLockClearResponse,
 } from '@synx/shared';
+import { parseStorageCredentialsResponse } from './credentialCache.js';
 
 /**
  * WorkerClient：插件端通过 HTTP 调 Workers API 的传输层。
@@ -35,6 +40,8 @@ export interface WorkerClientOptions {
   syncFolder: string;
   /** 401 时回调（由 UI 层提示重登录） */
   onUnauthorized?: () => void;
+  /** 401/403 时回调；用于按状态清理凭证缓存 */
+  onAuthFailure?: (status: 401 | 403, storageId: string) => void;
   /** fetch 实现（默认全局 fetch；测试时可注入） */
   fetchImpl?: typeof fetch;
   /** 最大重试次数（默认 3） */
@@ -106,6 +113,12 @@ export class WorkerClient {
     return this.request<RepoInitResponse>('POST', API.repoInit, { author });
   }
 
+  /** 按 commitId 读取完整提交（本地历史索引增量补齐用）。 */
+  async repoCommit(commitId: string): Promise<RepoCommit> {
+    const res = await this.request<RepoCommitResponse>('GET', `${API.repoCommits}/${encodeURIComponent(commitId)}`);
+    return res.commit;
+  }
+
   /** 读取某提交下的文件树 */
   async repoTree(commitId: string): Promise<RepoFile[]> {
     const res = await this.request<RepoTreeResponse>('GET', `${API.repoTree}?commitId=${encodeURIComponent(commitId)}`);
@@ -154,6 +167,10 @@ export class WorkerClient {
   /** 垃圾回收：清理孤儿内容对象 + 按保留策略裁剪历史提交（静默调用，失败不影响同步） */
   async repoGc(): Promise<RepoGcResponse> {
     return this.request<RepoGcResponse>('POST', API.repoGc, {});
+  }
+
+  async forceClearRepositoryLock(confirm: string): Promise<RepoLockClearResponse> {
+    return this.request<RepoLockClearResponse>('POST', API.repoLockClear, { force: true, confirm });
   }
 
   // ===== 静态方法：登录、列出存储（不依赖 storageId/syncFolder） =====
@@ -219,6 +236,13 @@ export class WorkerClient {
     return (await this.request<OrphanScanResponse>('POST', endpoint, { referencedPaths })).images;
   }
 
+  /** 读取当前 storage 的直连凭证（调用方仅可在内存中使用或加密缓存） */
+  async getStorageCredentials(): Promise<StorageCredentialsResponse> {
+    const storageId = this.opts.storageId;
+    const path = API.storageCredentials.replace(':id', encodeURIComponent(storageId));
+    return parseStorageCredentialsResponse(await this.request<unknown>('GET', path), storageId);
+  }
+
   /** 读取当前 storage 的保留策略（未配置时返回服务端默认） */
   async getRetentionPolicy(): Promise<RetentionPolicy> {
     const storageId = this.opts.storageId;
@@ -269,9 +293,11 @@ export class WorkerClient {
         const elapsed = Date.now() - startedAt;
         console.log('synx response', { status: res.status, attempt: attempt + 1, elapsedMs: elapsed });
         if (res.status === 401) {
+          this.opts.onAuthFailure?.(401, this.opts.storageId);
           this.opts.onUnauthorized?.();
           throw new WorkerApiError(401, 'unauthorized', attempt + 1);
         }
+        if (res.status === 403) this.opts.onAuthFailure?.(403, this.opts.storageId);
         if (res.status === 413) {
           const errBody = await safeErrorText(res);
           throw new WorkerApiError(413, errBody || 'file too large', attempt + 1);

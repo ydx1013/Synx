@@ -1,15 +1,17 @@
 import { Hono } from 'hono';
-import { type CreateStorageRequest, type OnedriveConfig, type RetentionPolicy, type StorageSummary, type S3Config, type StorageConfig, type StorageType, type WebdavConfig, type WorkerFs } from '@synx/shared';
+import { type CreateStorageRequest, type OnedriveConfig, type RetentionPolicy, type StorageCredentialsResponse, type StorageSummary, type S3Config, type StorageConfig, type StorageType, type WebdavConfig, type WorkerFs } from '@synx/shared';
 import { authMiddleware } from '../middleware/auth.js';
 import { decryptString, encryptString } from '../auth/crypto.js';
 import { ConnectivityError, checkConnectivity } from '../storage/connectivity.js';
-import { getFs, invalidateStorageRowCache, StorageError } from '../storage/factory.js';
+import { decryptStorageConfig, getFs, getStorageRow, invalidateStorageRowCache, StorageError } from '../storage/factory.js';
 import { getRetentionPolicy, normalizePolicy, saveRetentionPolicy } from '../services/retention.js';
 import { OneDriveFs } from '../storage/onedriveFs.js';
 import { S3Fs } from '../storage/s3Fs.js';
 import { WebDAVFs } from '../storage/webdavFs.js';
 import type { Env, AppVars } from '../types.js';
 import { logError } from '../logger.js';
+import { checkRateLimit } from '../middleware/rateLimit.js';
+import { mapStorageHttpError } from './storageError.js';
 
 interface StorageRow {
   id: string;
@@ -264,8 +266,9 @@ storage.get('/', async (c) => {
 function sanitizeCustomHeaders(raw?: string): string | undefined {
   if (!raw) return undefined;
   const sanitized = raw.split('\n').filter((line) => {
-    const name = line.slice(0, line.indexOf(':')).trim().toLowerCase();
-    return name !== 'authorization' && name !== 'proxy-authorization' && name !== 'cookie' && name !== 'set-cookie';
+    const separator = line.indexOf(':');
+    if (separator < 1) return true;
+    return !FORBIDDEN_CUSTOM_HEADERS.has(line.slice(0, separator).trim().toLowerCase());
   }).join('\n').trim();
   return sanitized || undefined;
 }
@@ -288,6 +291,31 @@ function redactConfig(type: StorageType, config: StorageConfig): Record<string, 
   const onedrive = config as OnedriveConfig;
   return { clientId: onedrive.clientId, authority: onedrive.authority, remoteBaseDir: onedrive.remoteBaseDir, username: onedrive.username };
 }
+
+storage.get('/:id/credentials', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const { allowed } = await checkRateLimit(c.env.KV, `storage:credentials:${userId}`, 30, 60);
+    if (!allowed) return c.json({ error: 'too many requests', code: 'RATE_LIMITED' }, 429);
+    const storageId = c.req.param('id');
+    const row = await getStorageRow(c.env, c.get('userId'), storageId);
+    if (row.type !== 's3' && row.type !== 'webdav' && row.type !== 'onedrive') {
+      return c.json({ error: `unsupported storage type: ${row.type}` }, 400);
+    }
+    const config = await decryptStorageConfig(row, c.env.ENCRYPTION_KEY);
+    if (row.type === 'webdav') {
+      const webdav = config as WebdavConfig;
+      webdav.customHeaders = sanitizeCustomHeaders(webdav.customHeaders);
+    }
+    const response = { storageId, type: row.type, config } as StorageCredentialsResponse;
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json(response);
+  } catch (error) {
+    if (error instanceof StorageError) return c.json({ error: error.message }, error.status as 400 | 403 | 404);
+    throw error;
+  }
+});
 
 storage.get('/:id', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM storages WHERE id = ?')
@@ -330,7 +358,8 @@ storage.get('/:id/retention', async (c) => {
     const policy = await getRetentionPolicy(c.env, storageId, fs);
     return c.json({ policy });
   } catch (e) {
-    if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
+    const storageError = mapStorageHttpError(e);
+    if (storageError) return c.json(storageError.body, storageError.status);
     logError(c, 'storage_retention_get_failed', e);
     return c.json({ error: 'internal error' }, 500);
   }
@@ -346,7 +375,8 @@ storage.put('/:id/retention', async (c) => {
     await saveRetentionPolicy(c.env, storageId, fs, policy);
     return c.json({ policy });
   } catch (e) {
-    if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
+    const storageError = mapStorageHttpError(e);
+    if (storageError) return c.json(storageError.body, storageError.status);
     logError(c, 'storage_retention_save_failed', e);
     return c.json({ error: 'failed to save retention policy to storage' }, 500);
   }
@@ -393,7 +423,8 @@ storage.post('/:id/purge', async (c) => {
     }
     return c.json({ ok: true, total: keys.length, deleted, failed });
   } catch (e) {
-    if (e instanceof StorageError) return c.json({ error: e.message }, e.status as 400 | 403 | 404);
+    const storageError = mapStorageHttpError(e);
+    if (storageError) return c.json(storageError.body, storageError.status);
     logError(c, 'storage_purge_failed', e);
     return c.json({ error: 'internal error' }, 500);
   }

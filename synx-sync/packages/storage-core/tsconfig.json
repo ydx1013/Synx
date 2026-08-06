@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "moduleResolution": "Bundler",
+    "paths": {
+      "@synx/shared": ["../shared/src"],
+      "@synx/shared/*": ["../shared/src/*"]
+    }
+  },
+  "include": ["src"]
+}

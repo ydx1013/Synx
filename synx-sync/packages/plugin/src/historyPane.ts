@@ -1,24 +1,13 @@
-import { ItemView, Notice, TFile, WorkspaceLeaf } from 'obsidian';
+import { ItemView, Notice, WorkspaceLeaf } from 'obsidian';
 import type SynxSyncPlugin from './main.js';
 import { HistoryPreviewPopover, type HistoryPreviewMode } from './historyPreviewPopover.js';
+import { mapHistoryEntries, type HistoryEntry } from './historyMapping.js';
 import { WorkerApiError } from './workerClient.js';
-import { hashContent } from './syncAlgo.js';
 
 export const HISTORY_VIEW_TYPE = 'synx-history-view';
 const MAX_PRECACHE_VERSIONS = 3;
 const MAX_PRECACHE_BYTES = 1024 * 1024;
 const TEXT_EXTENSIONS = new Set(['md', 'markdown', 'txt', 'json', 'yaml', 'yml', 'css', 'js', 'ts', 'tsx', 'jsx', 'html', 'xml', 'csv']);
-
-/** 历史版本条目：以提交为单位，由提交链按 identity 派生 */
-interface HistoryEntry {
-  commitId: string;
-  createdAt: number;
-  author: string | null;
-  message: string;
-  size: number;
-  isCurrent: boolean;
-  deleted: boolean;
-}
 
 /** 两个版本列表是否由同一组 commitId 构成（顺序无关）。用于 silent 刷新时判断是否需要重建 DOM。 */
 function sameVersionSet(a: HistoryEntry[], b: HistoryEntry[]): boolean {
@@ -76,9 +65,13 @@ export class HistoryPaneView extends ItemView {
 
   async refresh(silent = false) {
     const path = this.currentFile;
-    const client = this.plugin.getWorkerClient();
     const requestId = ++this.requestId;
-    if (!path || !client) {
+    if (!path || !this.plugin.getRepositoryClient()) {
+      if (!silent) this.renderEmpty();
+      return;
+    }
+    const client = await this.plugin.getRepositoryClientAsync();
+    if (!client) {
       if (!silent) this.renderEmpty();
       return;
     }
@@ -86,35 +79,22 @@ export class HistoryPaneView extends ItemView {
     // 首次打开文件才显示"加载中"反馈
     if (!silent) this.renderLoading(path);
     try {
-      // 首次加载：从头拉取；分页加载时保留已有版本，只追加更早的历史
-      const append = this.versions.length > 0 && this.nextCursor !== null && !silent;
-      const from = append ? this.nextCursor : undefined;
       const fileUuid = await this.plugin.getFileUuid(path);
-      // 单文件历史从提交链派生；HEAD 用于标记"当前"版本
-      const [history, head] = await Promise.all([
-        client.repoFileHistory(path, fileUuid, from ?? undefined),
-        client.repoHead(),
-      ]);
+      const identity = fileUuid ?? `path:${path}`;
+      let history = await this.plugin.getHistoryIndex().getFileHistory(identity);
+      // 后台索引尚未写入首批数据时走 Worker 回退，历史功能始终可用。
+      if (history.headCommitId === null) {
+        const remote = await client.repoFileHistory(path, fileUuid);
+        history = {
+          commits: remote.commits,
+          changes: remote.changes,
+          headCommitId: remote.headCommitId,
+        };
+      }
       if (requestId !== this.requestId || path !== this.currentFile) return;
-      const headCommitId = head.head?.commitId ?? null;
-      const next: HistoryEntry[] = history.commits
-        .map((c, i) => {
-          const change = history.changes[i];
-          return {
-            commitId: c.commitId,
-            createdAt: c.createdAt,
-            author: c.author,
-            message: c.message,
-            size: change?.size ?? 0,
-            isCurrent: c.commitId === headCommitId,
-            deleted: change?.operation === 'delete',
-          };
-        })
-        .sort((a, b) => b.createdAt - a.createdAt);
-      // 分页加载：把新拉到的更早历史接到现有列表之后（都按时间倒序，追加即可）
-      const merged = append ? [...this.versions, ...next] : next;
-      this.versions = merged;
-      this.nextCursor = history.nextCursor;
+      const next = mapHistoryEntries(history);
+      const merged = next;
+      this.nextCursor = null;
       // silent 刷新且版本列表完全没变：不触碰 DOM，视觉零变化
       if (silent && merged.length > 0 && sameVersionSet(this.versions, next)) {
         this.versions = next;
@@ -122,7 +102,7 @@ export class HistoryPaneView extends ItemView {
       }
       this.versions = merged;
       this.renderVersions();
-      if (!append) void this.precache(path, requestId);
+      void this.precache(path, requestId);
     } catch (error) {
       if (requestId === this.requestId && !silent) this.renderError('加载历史失败', error);
     } finally {
@@ -145,7 +125,7 @@ export class HistoryPaneView extends ItemView {
   private renderEmpty() {
     this.contentEl.empty();
     this.contentEl.createEl('h4', { text: 'Synx 版本历史' });
-    if (!this.plugin.getWorkerClient()) this.contentEl.createEl('p', { text: '请先在设置中登录并选择存储。' });
+    if (!this.plugin.getRepositoryClient()) this.contentEl.createEl('p', { text: '请先在设置中登录并选择存储。' });
     else this.contentEl.createEl('p', { text: '打开一个文件以查看版本历史。' });
   }
 
@@ -262,9 +242,9 @@ export class HistoryPaneView extends ItemView {
     const key = `${path}\0${version.commitId}`;
     const cached = this.previewCache.get(key);
     if (cached !== undefined) return cached;
-    const client = this.plugin.getWorkerClient();
+    const client = await this.plugin.getRepositoryClientAsync();
     if (!client) throw new Error('尚未连接服务器');
-    const content = new TextDecoder().decode(await client.repoContent(version.commitId, path));
+    const content = new TextDecoder().decode(await client.repoContent(version.commitId, version.path || path));
     if (path === this.currentFile) this.previewCache.set(key, content);
     return content;
   }
@@ -287,36 +267,15 @@ export class HistoryPaneView extends ItemView {
   }
 
   private async rollbackTo(version: HistoryEntry) {
-    const client = this.plugin.getWorkerClient();
-    if (!client || !this.currentFile) return;
-    if (!confirm(`确认回滚到 ${version.commitId.slice(0, 8)}? 将产生一个新版本作为当前。`)) return;
+    const path = this.currentFile;
+    if (!path) return;
+    const targetCommitId = version.commitId;
+    const targetPath = version.path || path;
+    if (!confirm(`确认回滚到 ${targetCommitId.slice(0, 8)}? 将产生一个新版本作为当前。`)) return;
     try {
-      const fileUuid = await this.plugin.getFileUuid(this.currentFile);
-      // 文件级恢复：读目标提交内容 → 作为新 blob → 原子提交 modify 变更（不影响其他文件）
-      const content = await client.repoContent(version.commitId, this.currentFile);
-      const head = await client.repoHead();
-      if (!head.head) throw new Error('仓库尚未初始化');
-      const mtime = Date.now();
-      const blobId = await client.uploadBlob(this.currentFile, content, mtime);
-      await client.finalizeCommit({
-        baseCommitId: head.head.commitId,
-        baseGeneration: head.head.generation,
-        author: this.plugin.settings.deviceName,
-        message: `回滚到 ${version.commitId.slice(0, 8)}`,
-        changes: [{
-          identity: fileUuid ?? `path:${this.currentFile}`,
-          operation: 'modify',
-          path: this.currentFile,
-          blobId,
-          hash: await hashContent(content),
-          size: content.byteLength,
-          mtime,
-        }],
-      });
-      const file = this.plugin.app.vault.getAbstractFileByPath(this.currentFile);
-      if (file instanceof TFile) await this.plugin.app.vault.modifyBinary(file, content);
+      await this.plugin.rollbackFile({ path, targetCommitId, targetPath });
       this.currentTextCache.clear();
-      new Notice(`已回滚到 ${version.commitId.slice(0, 8)}`);
+      new Notice(`已回滚到 ${targetCommitId.slice(0, 8)}`);
       await this.refresh();
     } catch (error) {
       this.renderError('回滚失败', error);

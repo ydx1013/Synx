@@ -1,5 +1,6 @@
-﻿import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { WebDAVFs } from './webdavFs.js';
+import { StorageRequestError } from './storageRequestError.js';
 
 const config = {
   address: 'https://dav.example.com',
@@ -571,6 +572,27 @@ describe('WebDAVFs.list', () => {
     const fs = new WebDAVFs(config);
     const keys = await fs.list('');
     expect(keys).toEqual(['file&amp.txt']);
+  });
+});
+
+describe('WebDAVFs auth status propagation', () => {
+  it.each([
+    ['MKCOL base directory', new WebDAVFs(configWithBaseDir), (fs: WebDAVFs) => fs.put('file', new Uint8Array()), 401],
+    ['MKCOL parent directory', new WebDAVFs(config), (fs: WebDAVFs) => fs.put('dir/file', new Uint8Array()), 403],
+    ['DELETE', new WebDAVFs(config), (fs: WebDAVFs) => fs.delete('file'), 401],
+    ['HEAD', new WebDAVFs(config), (fs: WebDAVFs) => fs.head('file'), 403],
+    ['PROPFIND', new WebDAVFs(config), (fs: WebDAVFs) => fs.list(''), 401],
+  ] as const)('preserves auth status for %s', async (_name, fs, operation, status) => {
+    fetchMock.mockResolvedValue(mockResponse({ status }));
+    const error = await operation(fs).catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(status);
+  });
+
+  it('does not wrap network TypeError as a status error', async () => {
+    const networkError = new TypeError('network failed');
+    fetchMock.mockRejectedValue(networkError);
+    await expect(new WebDAVFs(config).get('file')).rejects.toBe(networkError);
   });
 });
 

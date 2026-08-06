@@ -1,10 +1,12 @@
 import { App, FuzzySuggestModal, MarkdownView, Notice, Platform, Plugin, requestUrl, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
-import type { RepoChange, RepoFile } from '@synx/shared';
+import type { RepoChange, RepoFile, RepoFinalizeRequest, RepoFinalizeResponse, StorageCredentialsResponse } from '@synx/shared';
 import { evaluateFile } from './fileFilter.js';
 import { conflictCopyPath, resolveConflict } from './conflict.js';
 import { HistoryPaneView, HISTORY_VIEW_TYPE } from './historyPane.js';
+import { HistoryIndex } from './historyIndex.js';
+import { syncHistoryIndex } from './historyIndexSync.js';
 import { ensureMarkdownUuid, extractMarkdownUuid, isMarkdownPath, replaceMarkdownUuid } from './markdownUuid.js';
 import { hideMarkdownUuidExtension } from './markdownUuidEditor.js';
 import { listObsConfigFiles } from './obsConfigLister.js';
@@ -18,13 +20,19 @@ import { formatStatusBar } from './syncPresentation.js';
 import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncStats, type SyncReport, type SyncReportItem, type SyncTrigger } from './syncReport.js';
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
-import { WorkerClient, WorkerApiError } from './workerClient.js';
-import { buildRepoChanges, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
+import { WorkerClient } from './workerClient.js';
+import { isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
+import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
+import { DirectRepositoryResolver } from './directRepositoryResolver.js';
+import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
+import { buildRepoChanges, commitAndIndex, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 import { uploadImageWithRetry } from './imageUpload.js';
 import { applyImageReplacements, buildFolderMigrationPlan, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl, type ImageCandidate } from './imageMigration.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
 import { parsePrivateImageUrl } from './privateImage.js';
 import { ConfirmModal } from './settingsTab.js';
+import { clearCredentialCacheForAuthFailure, createCredentialCache, createSerialStateWriter, decryptStorageCredentials, encryptStorageCredentials, handleStorageAuthFailures, isCredentialRequestCurrent, persistRefreshedStorageCredentials, readCredentialCacheFromState, reconcileCredentialCacheSession, writeCredentialCacheToState, type CredentialCacheState, type CredentialRequestIdentity } from './credentialCache.js';
+import { decideLocalWriteProtection, hasChangedMarkdownEditor, protectedPullConflictPath, withoutProtectedPrevSyncEntries, type LocalWriteProtection, type MarkdownEditorSnapshot, type SyncStartFileSnapshot } from './syncWriteGuard.js';
 
 class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
   constructor(app: App, private readonly folders: TFolder[], private readonly select: (folder: TFolder) => void) {
@@ -65,6 +73,7 @@ interface SynxStateData {
   knownRemoteFiles?: readonly { storageId: string; syncFolder: string; path: string; fileUuid?: string }[];
   prevSync?: PrevSyncState;
   pendingImageUploads?: readonly PendingImageUpload[];
+  credentialCache?: CredentialCacheState;
 }
 
 function isPersistedData(raw: unknown): raw is PersistedPluginData {
@@ -73,6 +82,11 @@ function isPersistedData(raw: unknown): raw is PersistedPluginData {
 
 function isStateData(raw: unknown): raw is SynxStateData {
   return typeof raw === 'object' && raw !== null && 'reports' in raw;
+}
+
+function changesRepositoryScope(patch: Partial<SynxPluginSettings>): boolean {
+  return patch.serverUrl !== undefined || patch.jwt !== undefined || patch.userId !== undefined
+    || patch.storageId !== undefined || patch.syncFolder !== undefined;
 }
 
 const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
@@ -103,7 +117,44 @@ function dbg(hyp: string, location: string, msg: string, data?: Record<string, u
 
 export default class SynxSyncPlugin extends Plugin {
   settings!: SynxPluginSettings;
-  private client: WorkerClient | null = null;
+  private workerClient: WorkerClient | null = null;
+  private repositoryClient: RepositoryClient | null = null;
+  private readonly repositoryWriteCoordinator = new RepositoryWriteCoordinator(() => this.selectSyncRepositoryClient());
+  private readonly directRepositoryResolver = new DirectRepositoryResolver(
+    async () => {
+      const credentials = await this.getStorageCredentials();
+      if (!credentials) throw new Error('存储凭证不可用');
+      return credentials;
+    },
+    undefined,
+    undefined,
+    (scope) => {
+      const captured: CredentialRequestIdentity = { ...scope, client: this.workerClient, generation: scope.credentialGeneration };
+      return {
+        onCredentialsChanged: (credentials) => persistRefreshedStorageCredentials(
+          credentials,
+          captured,
+          () => ({
+            jwt: this.settings.jwt,
+            userId: this.settings.userId ?? '',
+            storageId: this.settings.storageId ?? '',
+            client: this.workerClient,
+            generation: this.credentialCacheGeneration,
+          }),
+          this.credentialCache,
+          this.queueStateWrite,
+        ).then(() => undefined),
+      };
+    },
+  );
+  private readonly repositoryTransportSelector = new RepositoryTransportSelector(
+    this.directRepositoryResolver,
+    (status, storageId) => this.handleAuthFailure(status, storageId),
+  );
+  private readonly historyIndex = new HistoryIndex();
+  private historyIndexAbort: AbortController | null = null;
+  private historyIndexSyncTask: Promise<void> | null = null;
+  private indexedUserId: string | null = null;
   private scheduler!: SyncScheduler;
   private reportStore!: SyncReportStore;
   private statusBarItem: HTMLElement | null = null;
@@ -113,6 +164,12 @@ export default class SynxSyncPlugin extends Plugin {
   private knownRemoteFiles: { storageId: string; syncFolder: string; path: string; fileUuid?: string }[] = [];
   private prevSync: PrevSyncState | null = null;
   private pendingImageUploads: PendingImageUpload[] = [];
+  private credentialCache: CredentialCacheState = createCredentialCache();
+  private credentialCacheGeneration = 0;
+  private readonly queueStateWrite = createSerialStateWriter(
+    () => this.buildState(),
+    async (state) => this.app.vault.adapter.write(STATE_FILE, JSON.stringify(state)),
+  );
   private internalDeletes = new Set<string>();
   private folderImageMigrationRunning = false;
   private folderImageMigrationPreparing = false;
@@ -124,6 +181,10 @@ export default class SynxSyncPlugin extends Plugin {
   /** 提交时的基线 HEAD（用于 pull 内容与 finalize CAS） */
   private repoHeadCommitId: string | null = null;
   private repoHeadGeneration: number | null = null;
+  private syncStartSnapshot = new Map<string, SyncStartFileSnapshot>();
+  private protectedLocalPaths = new Set<string>();
+  private protectedConflictPaths = new Map<string, string>();
+  private protectedLocalCount = 0;
 
   private uuidEditorExtensions: Extension[] = [];
 
@@ -171,6 +232,7 @@ export default class SynxSyncPlugin extends Plugin {
     }
     this.registerEvent(this.app.vault.on('delete', (file) => void this.onLocalDelete(file)));
     this.rebuildClient();
+    await this.updateHistoryIndexScope();
     this.scheduler = new SyncScheduler(this.settings, async (trigger) => {
       // #region debug-point E:sync-timing
       const t0 = Date.now();
@@ -185,8 +247,10 @@ export default class SynxSyncPlugin extends Plugin {
     this.updateStatusBar();
   }
 
-  onunload(): void {
+  async onunload(): Promise<void> {
     this.scheduler?.dispose();
+    await this.stopHistoryIndexSync();
+    this.historyIndex.close();
   }
 
   private renderPrivateImages(element: HTMLElement): void {
@@ -206,7 +270,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   private imageUploadReady(): boolean {
-    return Boolean(this.settings.imageHostingEnabled && this.settings.imageGalleryId && this.settings.jwt && this.client);
+    return Boolean(this.settings.imageHostingEnabled && this.settings.imageGalleryId && this.settings.jwt && this.workerClient);
   }
 
   private selectImageMigrationFolder(): void {
@@ -256,7 +320,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   private async migrateFolderImages(notes: Array<{ path: string; content: string }>, plan: ReturnType<typeof buildFolderMigrationPlan>): Promise<void> {
-    const client = this.client;
+    const client = this.workerClient;
     if (!client || this.folderImageMigrationRunning) return;
     this.folderImageMigrationRunning = true;
     const uploadedUrls = new Map<string, string>();
@@ -383,7 +447,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   private async migrateCurrentNoteImages(view: MarkdownView, note: TFile, candidates: ImageCandidate[]): Promise<void> {
-    const client = this.client;
+    const client = this.workerClient;
     if (!client) return;
     if (view.file?.path !== note.path) {
       new Notice('当前笔记已切换，已取消图片迁移');
@@ -505,7 +569,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   private async uploadImageIntoEditor(file: File, view: MarkdownView): Promise<void> {
-    const client = this.client;
+    const client = this.workerClient;
     if (!client) return;
     const placeholder = `![上传中](synx-uploading://${crypto.randomUUID()})`;
     view.editor.replaceSelection(placeholder);
@@ -539,7 +603,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   private async retryPendingImageUploads(): Promise<void> {
-    if (!this.client || !this.settings.jwt || this.pendingImageUploads.length === 0) return;
+    if (!this.workerClient || !this.settings.jwt || this.pendingImageUploads.length === 0) return;
     let changed = false;
     for (const item of [...this.pendingImageUploads]) {
       const local = this.app.vault.getAbstractFileByPath(item.localPath);
@@ -547,7 +611,7 @@ export default class SynxSyncPlugin extends Plugin {
       if (!(local instanceof TFile) || !(note instanceof TFile)) continue;
       try {
         const bytes = await this.app.vault.readBinary(local);
-        const image = await uploadImageWithRetry(() => this.client!.uploadGalleryImage(item.galleryId, bytes, item.mimeType));
+        const image = await uploadImageWithRetry(() => this.workerClient!.uploadGalleryImage(item.galleryId, bytes, item.mimeType));
         const content = await this.app.vault.read(note);
         const updated = replaceExactEmbed(content, item.originalEmbed, `![](${image.markdownUrl})`);
         if (updated === null) continue;
@@ -605,6 +669,7 @@ export default class SynxSyncPlugin extends Plugin {
     this.knownRemoteFiles = [...(state.knownRemoteFiles ?? [])];
     this.prevSync = state.prevSync ?? null;
     this.pendingImageUploads = [...(state.pendingImageUploads ?? [])];
+    this.credentialCache = readCredentialCacheFromState(state) ?? createCredentialCache();
   }
 
   private async loadState(): Promise<SynxStateData> {
@@ -618,16 +683,38 @@ export default class SynxSyncPlugin extends Plugin {
         knownRemoteFiles: raw.knownRemoteFiles ?? [],
         prevSync: raw.prevSync,
         pendingImageUploads: raw.pendingImageUploads ?? [],
+        credentialCache: readCredentialCacheFromState(raw),
       };
     } catch { /* 文件不存在或解析失败，返回空状态 */ }
     return { reports: [], pendingDeletions: [], knownRemoteFiles: [] };
   }
 
   async saveSettings(patch: Partial<SynxPluginSettings>): Promise<void> {
+    if (changesRepositoryScope(patch)) {
+      return this.repositoryWriteCoordinator.runExclusive(() => this.saveSettingsUnlocked(patch));
+    }
+    return this.saveSettingsUnlocked(patch);
+  }
+
+  private async saveSettingsUnlocked(patch: Partial<SynxPluginSettings>): Promise<void> {
+    const previousUserId = this.settings.userId;
+    const previousSession = { jwt: this.settings.jwt, userId: this.settings.userId };
     this.settings = loadPluginSettings({ ...this.settings, ...patch }, Platform.isMobile);
+    const reconciledCache = reconcileCredentialCacheSession(this.credentialCache, previousSession, {
+      jwt: this.settings.jwt,
+      userId: this.settings.userId,
+    });
+    if (reconciledCache !== this.credentialCache) {
+      this.credentialCacheGeneration++;
+      this.directRepositoryResolver.invalidate();
+    }
+    this.credentialCache = reconciledCache;
     if (patch.reportRetention !== undefined) this.reportStore = new SyncReportStore([...this.reportStore.reports], this.settings.reportRetention);
     await this.persist();
-    if (patch.serverUrl !== undefined || patch.jwt !== undefined || patch.storageId !== undefined || patch.syncFolder !== undefined) this.rebuildClient();
+    if (patch.serverUrl !== undefined || patch.jwt !== undefined || patch.storageId !== undefined || patch.syncFolder !== undefined) {
+      this.rebuildClient();
+      await this.updateHistoryIndexScope(previousUserId);
+    }
     if (patch.showMarkdownUuid !== undefined) this.updateUuidEditorExtension();
     if (patch.historyStyle !== undefined) {
       for (const leaf of this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)) {
@@ -646,11 +733,21 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   getWorkerClient(): WorkerClient | null {
-    return this.client;
+    return this.workerClient;
+  }
+
+  getRepositoryClient(): RepositoryClient | null {
+    return this.repositoryClient;
+  }
+
+  async getRepositoryClientAsync(): Promise<RepositoryClient | null> {
+    if (!this.workerClient) return null;
+    const scope = this.getDirectRepositoryScope();
+    return scope ? this.repositoryTransportSelector.getHistory(scope, this.workerClient) : this.workerClient;
   }
 
   async scanUnusedImages(): Promise<void> {
-    if (!this.client || !this.settings.imageGalleryId) {
+    if (!this.workerClient || !this.settings.imageGalleryId) {
       new Notice('请先选择默认图库');
       return;
     }
@@ -659,7 +756,7 @@ export default class SynxSyncPlugin extends Plugin {
       const content = await this.app.vault.cachedRead(file);
       for (const path of collectReferencedImagePaths(content, this.settings.imageGalleryId)) referenced.add(path);
     }
-    const images = await this.client.scanGalleryOrphans(this.settings.imageGalleryId, [...referenced]);
+    const images = await this.workerClient.scanGalleryOrphans(this.settings.imageGalleryId, [...referenced]);
     new Notice(images.length ? `发现 ${images.length} 张疑似未使用图片。请前往 Synx 网页后台确认删除。` : '未发现超过 30 天的疑似未使用图片', 10000);
   }
 
@@ -689,10 +786,38 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   /** 从远端拉取当前 storage 的版本保留策略（远端为权威，覆盖本地显示） */
+  async getStorageCredentials(): Promise<StorageCredentialsResponse | null> {
+    const { jwt, userId, storageId } = this.settings;
+    const client = this.workerClient;
+    if (!jwt || !userId || !storageId || !client) return null;
+    const context = { jwt, userId, storageId };
+    const generation = this.credentialCacheGeneration;
+    const request = { ...context, client, generation };
+    const cached = this.credentialCache.entries[storageId];
+    if (cached) {
+      try {
+        return await decryptStorageCredentials(cached, context, this.credentialCache.salt);
+      } catch {
+        this.credentialCacheGeneration++;
+        delete this.credentialCache.entries[storageId];
+        await this.persistState();
+      }
+    }
+    const credentials = await client.getStorageCredentials();
+    const current = { jwt: this.settings.jwt, userId: this.settings.userId, storageId: this.settings.storageId, client: this.workerClient, generation: this.credentialCacheGeneration };
+    if (!current.userId || !current.storageId || !isCredentialRequestCurrent(request, { ...current, userId: current.userId, storageId: current.storageId })) return null;
+    const encrypted = await encryptStorageCredentials(credentials, context, this.credentialCache.salt);
+    const afterEncrypt = { jwt: this.settings.jwt, userId: this.settings.userId, storageId: this.settings.storageId, client: this.workerClient, generation: this.credentialCacheGeneration };
+    if (!afterEncrypt.userId || !afterEncrypt.storageId || !isCredentialRequestCurrent(request, { ...afterEncrypt, userId: afterEncrypt.userId, storageId: afterEncrypt.storageId })) return null;
+    this.credentialCache.entries[storageId] = encrypted;
+    await this.persistState();
+    return credentials;
+  }
+
   async syncRetentionFromRemote(): Promise<void> {
-    if (!this.client || !this.settings.storageId) return;
+    if (!this.workerClient || !this.settings.storageId) return;
     try {
-      const policy = await this.client.getRetentionPolicy();
+      const policy = await this.workerClient.getRetentionPolicy();
       this.settings.retention = policy;
       await this.persist();
     } catch (error) {
@@ -701,7 +826,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   async triggerSync(): Promise<void> {
-    if (!this.client) {
+    if (!this.repositoryClient) {
       new Notice('Synx: 请先登录并选择存储');
       return;
     }
@@ -715,12 +840,26 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   async retryReportItems(items: SyncReportItem[]): Promise<void> {
-    if (!this.client) {
+    if (!this.workerClient) {
       new Notice('Synx: 请先登录并选择存储');
       return;
     }
+    return this.repositoryWriteCoordinator.run((client) => this.retryReportItemsUnlocked(items, client));
+  }
+
+  private async retryReportItemsUnlocked(items: SyncReportItem[], client: RepositoryClient): Promise<void> {
     // 拉仓库树作为远端状态（未初始化时先 init）
-    const repo = await this.ensureRepoBase();
+    const repo = await this.ensureRepoBase(client);
+    const { files: retryFiles } = await this.enumerateLocalFiles(this.getPrevSyncMap());
+    this.syncStartSnapshot = new Map(retryFiles.map((file) => [file.path, {
+      exists: true,
+      mtime: file.mtime,
+      size: file.size,
+      hash: file.hash,
+    }]));
+    this.protectedLocalPaths.clear();
+    this.protectedConflictPaths.clear();
+    this.protectedLocalCount = 0;
     this.repoTree = repo.tree;
     this.repoHeadCommitId = repo.head.commitId;
     this.repoHeadGeneration = repo.head.generation;
@@ -737,7 +876,7 @@ export default class SynxSyncPlugin extends Plugin {
       evaluate: (path, size) => evaluateFile(path, size, this.settings),
     });
     this.reportStore.start('retry');
-    await this.executeActions(actions);
+    await this.executeActions(actions, client);
     // 部分动作再次失败时不产生原子提交（避免「报告失败但远端已部分变更」）
     const syncFailed = this.reportStore.current?.stats.failed ?? 0;
     // 重试产生的变更也走原子提交
@@ -747,16 +886,42 @@ export default class SynxSyncPlugin extends Plugin {
       treeToMap(this.repoTree),
     );
     if (syncFailed === 0 && changes.length > 0) {
-      await this.client.finalizeCommit({
+      const result = await this.finalizeMainCommit({
         baseCommitId: repo.head.commitId,
         baseGeneration: repo.head.generation,
         author: this.settings.deviceName,
         message: `重试同步 ${changes.length} 个文件`,
         changes,
-      });
+      }, client);
+      this.repoHeadCommitId = result.head.commitId;
+      this.repoHeadGeneration = result.head.generation;
+      this.refreshHistoryPanes(true);
     }
     this.finishSyncReport();
+    this.invalidateProtectedPrevSyncEntries();
     await this.persist();
+  }
+
+  async rollbackFile(request: { path: string; targetCommitId: string; targetPath: string }): Promise<void> {
+    return this.repositoryWriteCoordinator.run(async (client) => {
+      const content = await client.repoContent(request.targetCommitId, request.targetPath);
+      const repo = await this.ensureRepoBase(client);
+      const mtime = Date.now();
+      const hash = await hashContent(content);
+      const blobId = await uploadRepositoryBlob(client, request.path, content, mtime, hash, DIRECT_UPLOAD_THRESHOLD);
+      await this.finalizeMainCommit({
+        baseCommitId: repo.head.commitId,
+        baseGeneration: repo.head.generation,
+        author: this.settings.deviceName,
+        message: `回滚到 ${request.targetCommitId.slice(0, 8)}`,
+        changes: [{
+          identity: await this.getFileUuid(request.path) ?? `path:${request.path}`,
+          operation: 'modify', path: request.path, blobId, hash, size: content.byteLength, mtime,
+        }],
+      }, client);
+      const file = this.app.vault.getAbstractFileByPath(request.path);
+      if (file instanceof TFile) await this.app.vault.modifyBinary(file, content);
+    });
   }
 
   async clearSyncReports(): Promise<void> {
@@ -774,15 +939,101 @@ export default class SynxSyncPlugin extends Plugin {
     await this.activateView(SYNC_DETAILS_VIEW_TYPE);
   }
 
+  getHistoryIndex(): HistoryIndex {
+    return this.historyIndex;
+  }
+
+  private async finalizeMainCommit(input: RepoFinalizeRequest, client: RepositoryClient): Promise<RepoFinalizeResponse> {
+    return commitAndIndex(
+      () => client.finalizeCommit(input),
+      this.historyIndex,
+    );
+  }
+
+  private async updateHistoryIndexScope(previousUserId?: string | null): Promise<void> {
+    await this.stopHistoryIndexSync();
+    const userId = this.settings.userId;
+    const accountChanged = previousUserId !== undefined && previousUserId !== userId;
+    if (accountChanged && this.indexedUserId) {
+      await this.historyIndex.clearAccount();
+      this.indexedUserId = null;
+    }
+    if (!userId || !this.settings.jwt) {
+      if (this.indexedUserId) await this.historyIndex.clearAccount();
+      this.indexedUserId = null;
+      return;
+    }
+    if (this.indexedUserId !== userId) {
+      await this.historyIndex.openAccount(userId);
+      this.indexedUserId = userId;
+    }
+    if (!this.settings.storageId || !this.settings.syncFolder || !this.workerClient) return;
+    await this.historyIndex.setRepository(this.settings.storageId, this.settings.syncFolder);
+    this.startHistoryIndexSync();
+  }
+
+  private startHistoryIndexSync(): void {
+    const worker = this.workerClient;
+    const scope = this.getDirectRepositoryScope();
+    if (!worker || !scope || worker.storageId !== scope.storageId || worker.syncFolder !== scope.syncFolder) return;
+    const controller = new AbortController();
+    this.historyIndexAbort = controller;
+    const task = (async () => {
+      try {
+        const preferred = await this.repositoryTransportSelector.getHistory(scope, worker);
+        if (
+          controller.signal.aborted
+          || this.historyIndexAbort !== controller
+          || this.workerClient !== worker
+          || JSON.stringify(this.getDirectRepositoryScope()) !== JSON.stringify(scope)
+        ) return;
+        await syncHistoryIndex(preferred, worker, this.historyIndex, controller.signal);
+        if (!controller.signal.aborted && this.historyIndexAbort === controller) this.refreshHistoryPanes(true);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          console.warn('synx: history index update failed', error);
+        }
+      } finally {
+        if (this.historyIndexAbort === controller) this.historyIndexAbort = null;
+      }
+    })();
+    this.historyIndexSyncTask = task;
+    void task.finally(() => {
+      if (this.historyIndexSyncTask === task) this.historyIndexSyncTask = null;
+    });
+  }
+
+  private async stopHistoryIndexSync(): Promise<void> {
+    this.historyIndexAbort?.abort();
+    const task = this.historyIndexSyncTask;
+    if (task) await task;
+  }
+
+  private getDirectRepositoryScope() {
+    const { userId, jwt, storageId, syncFolder } = this.settings;
+    if (!userId || !jwt || !storageId || !syncFolder) return null;
+    return { userId, jwt, storageId, syncFolder, credentialGeneration: this.credentialCacheGeneration };
+  }
+
+  private async selectSyncRepositoryClient(): Promise<RepositoryClient> {
+    if (!this.workerClient) throw new Error('Synx 客户端未就绪');
+    const scope = this.getDirectRepositoryScope();
+    return scope ? this.repositoryTransportSelector.selectSync(scope, this.workerClient) : this.workerClient;
+  }
+
   private rebuildClient(): void {
+    this.directRepositoryResolver.invalidate();
+    this.repositoryTransportSelector.invalidate();
     const settings = this.settings;
-    this.client = settings.serverUrl && settings.jwt && settings.storageId && settings.syncFolder ? new WorkerClient({
+    this.workerClient = settings.serverUrl && settings.jwt && settings.storageId && settings.syncFolder ? new WorkerClient({
       serverUrl: settings.serverUrl,
       jwt: settings.jwt,
       storageId: settings.storageId,
       syncFolder: settings.syncFolder,
       onUnauthorized: () => this.handleUnauthorized(),
+      onAuthFailure: (status, storageId) => this.handleAuthFailure(status, storageId),
     }) : null;
+    this.repositoryClient = this.workerClient;
     this.updateStatusBar();
     this.updateRibbonIcon();
     this.refreshHistoryPanes();
@@ -821,7 +1072,7 @@ export default class SynxSyncPlugin extends Plugin {
   }
 
   private async flushPendingDeletions(): Promise<void> {
-    if (!this.client || !this.settings.storageId) return;
+    if (!this.repositoryClient || !this.settings.storageId) return;
     const target = { storageId: this.settings.storageId, syncFolder: this.settings.syncFolder };
     for (const entry of pendingForTarget(this.pendingDeletions, target)) {
       // git 模型下删除 = 提交中的 delete 变更（原子），不再单独 deleteFile
@@ -831,21 +1082,47 @@ export default class SynxSyncPlugin extends Plugin {
     await this.persist();
   }
 
+  private handleAuthFailure(status: 401 | 403, storageId: string): void {
+    this.credentialCacheGeneration++;
+    this.directRepositoryResolver.invalidate(status === 403 ? storageId : undefined);
+    this.credentialCache = clearCredentialCacheForAuthFailure(this.credentialCache, status, storageId);
+    void this.persistState();
+  }
+
   private handleUnauthorized(): void {
     new Notice('Synx: 登录已过期，请重新登录', 5000);
     void this.saveSettings({ jwt: '', userId: null, username: null, storageId: null, storageName: null });
   }
 
   private async runSync(trigger: SyncTrigger): Promise<void> {
-    if (!this.client) return;
+    if (!this.workerClient) return;
+    return this.repositoryWriteCoordinator.run((client) => {
+      const worker = this.workerClient;
+      if (!worker || worker.storageId !== this.settings.storageId || worker.syncFolder !== this.settings.syncFolder) {
+        throw new Error('repository scope changed before sync started');
+      }
+      return this.runSyncUnlocked(trigger, client, worker);
+    });
+  }
+
+  private async runSyncUnlocked(trigger: SyncTrigger, client: RepositoryClient, roundWorker: WorkerClient): Promise<void> {
     this.reportStore.start(trigger);
     this.updateProgress();
     try {
       const prevSyncMap = this.getPrevSyncMap();
       const { files, skipped } = await this.enumerateLocalFiles(prevSyncMap);
+      this.syncStartSnapshot = new Map(files.map((file) => [file.path, {
+        exists: true,
+        mtime: file.mtime,
+        size: file.size,
+        hash: file.hash,
+      }]));
+      this.protectedLocalPaths.clear();
+      this.protectedConflictPaths.clear();
+      this.protectedLocalCount = 0;
 
       // 拉取仓库基线：HEAD + 当前树。仓库未初始化时先 init（把现有远端收进 initial 提交）。
-      let repo = await this.ensureRepoBase();
+      let repo = await this.ensureRepoBase(client);
 
       let plan: SyncPlan | null = null;
       let skippedRemote: ExecutableSyncAction[] = [];
@@ -953,7 +1230,7 @@ export default class SynxSyncPlugin extends Plugin {
           ...guardedActions.map((action) => ({ ...action })) as ExecutableSyncAction[],
         ];
         this.reportStore.setPlannedCounts(plan.stats.push, plan.stats.pull);
-        await this.executeActions(actions);
+        await this.executeActions(actions, client);
 
         // 部分动作失败时不产生原子提交：成功的 push 会残留孤儿 blob（由 GC 清理），
         // 远端保持原状，避免「报告同步失败但远端已部分变更」的误判；下次同步会重试。
@@ -970,19 +1247,19 @@ export default class SynxSyncPlugin extends Plugin {
 
         // CAS 原子提交；HEAD 已被其他设备推进（409）→ 重拉基线重新计划
         try {
-          const result = await this.client.finalizeCommit({
+          const result = await this.finalizeMainCommit({
             baseCommitId: repo.head.commitId,
             baseGeneration: repo.head.generation,
             author: this.settings.deviceName,
             message: `同步 ${changes.length} 个文件`,
             changes,
-          });
+          }, client);
           this.repoHeadCommitId = result.head.commitId;
           this.repoHeadGeneration = result.head.generation;
           break;
         } catch (error) {
-          if (error instanceof WorkerApiError && error.status === 409) {
-            repo = await this.ensureRepoBase();
+          if (isRepoHeadConflict(error)) {
+            repo = await this.ensureRepoBase(client);
             continue;
           }
           throw error;
@@ -996,7 +1273,7 @@ export default class SynxSyncPlugin extends Plugin {
       // 绝不影响同步结果。
       try {
         for (let i = 0; i < MAX_GC_ROUNDS; i++) {
-          const gc = await this.client.repoGc();
+          const gc = await roundWorker.repoGc();
           if (gc.deleted > 0 || gc.deletedCommits > 0 || gc.more) {
             console.info('synx: gc progress', gc);
           }
@@ -1020,6 +1297,9 @@ export default class SynxSyncPlugin extends Plugin {
       // 备份结果写入持久化报告
       await this.persist();
     } catch (error) {
+      if (isStorageCredentialError(error) && this.settings.storageId) {
+        this.handleAuthFailure(error.status, this.settings.storageId);
+      }
       const now = Date.now();
       const normalized = normalizeSyncError(error);
       // #region debug-point B:sync-error
@@ -1122,18 +1402,32 @@ export default class SynxSyncPlugin extends Plugin {
    * push/delete-remote 只收集变更（blob 上传/删除记录），在 runSync 中一次性 finalize 提交；
    * pull/delete-local 立即执行（从仓库当前提交读内容写本地）。
    */
-  private async executeActions(actions: ExecutableSyncAction[]): Promise<void> {
+  private async executeActions(actions: ExecutableSyncAction[], client: RepositoryClient): Promise<void> {
     this.reportStore.setPhase('syncing');
     const push = actions.reduce((count, action) => count + (action.type === 'push' ? 1 : 0), 0);
     const pull = actions.reduce((count, action) => count + (action.type === 'pull' ? 1 : 0), 0);
     this.reportStore.setPlannedCounts(push, pull);
-    const executor = new SyncExecutor(this.settings.concurrency, (action) => this.executeAction(action), (event) => {
+    const executor = new SyncExecutor(this.settings.concurrency, (action) => this.executeAction(action, client), (event) => {
       if ('result' in event) {
         this.reportStore.addItem(this.toReportItem(event.result, event.action));
         this.updateProgress();
       }
     });
-    await executor.execute(actions);
+    const results = await executor.execute(actions);
+    const storageId = this.settings.storageId;
+    if (storageId) {
+      await handleStorageAuthFailures(
+        results,
+        storageId,
+        this.credentialCache,
+        (cache) => {
+          this.credentialCacheGeneration++;
+          this.credentialCache = cache;
+        },
+        (id) => this.repositoryTransportSelector.invalidate(id),
+        this.queueStateWrite,
+      );
+    }
   }
 
   /** 报告收尾：finish + 状态栏 + 通知（runSync / retry 共用） */
@@ -1143,6 +1437,8 @@ export default class SynxSyncPlugin extends Plugin {
     // 同步完成后仅极短提示，状态栏已显示详情
     if (report.stats.failed > 0) {
       new Notice(`Synx: ${report.stats.failed} 个文件失败`, 3000);
+    } else if (this.protectedLocalCount > 0) {
+      new Notice(`Synx: 已保护 ${this.protectedLocalCount} 个同步期间编辑的文件`, 2500);
     } else if (report.stats.success > 0) {
       new Notice(`Synx: 同步完成`, 1500);
     }
@@ -1153,12 +1449,14 @@ export default class SynxSyncPlugin extends Plugin {
    * 拉取仓库基线：HEAD + 当前树。
    * 仓库未初始化时先 init（服务端把现有远端状态完整收进 initial 提交）。
    */
-  private async ensureRepoBase(): Promise<{ head: { commitId: string; generation: number }; tree: RepoFile[] }> {
-    if (!this.client) throw new Error('Synx 客户端未就绪');
-    let resp = await this.client.repoHead();
+  private async ensureRepoBase(client: RepositoryClient): Promise<{ head: { commitId: string; generation: number }; tree: RepoFile[] }> {
+    let resp = await client.repoHead();
     if (!resp.head) {
-      await this.client.repoInit(this.settings.deviceName);
-      resp = await this.client.repoHead();
+      await commitAndIndex(
+        () => client.repoInit(this.settings.deviceName),
+        this.historyIndex,
+      );
+      resp = await client.repoHead();
     }
     if (!resp.head) throw new Error('仓库初始化失败，请重试');
     return { head: { commitId: resp.head.commitId, generation: resp.head.generation }, tree: resp.tree };
@@ -1196,6 +1494,7 @@ export default class SynxSyncPlugin extends Plugin {
       storageId,
       syncFolder: this.settings.syncFolder,
       onUnauthorized: () => this.handleUnauthorized(),
+      onAuthFailure: (status, failedStorageId) => this.handleAuthFailure(status, failedStorageId),
     });
 
     let stats: BackupSyncStats;
@@ -1247,22 +1546,27 @@ export default class SynxSyncPlugin extends Plugin {
     this.updateProgress();
   }
 
-  private async executeAction(action: Exclude<ExecutableSyncAction, { type: 'skip' }>): Promise<void> {
+  private async executeAction(action: Exclude<ExecutableSyncAction, { type: 'skip' }>, client: RepositoryClient): Promise<void | 'protected'> {
     if (action.type === 'push') {
       const original = action as SyncAction;
-      if (original.reason === 'conflict-keep-local') await this.executeOrdinaryConflict(action.path);
-      else await this.executePush(action.path);
+      if (original.reason === 'conflict-keep-local') await this.executeOrdinaryConflict(action.path, client);
+      else await this.executePush(action.path, client);
     } else if (action.type === 'pull') {
-      await this.executePull(action.path, action.fileUuid);
+      return this.executePull(action.path, client, action.fileUuid);
     } else if (action.type === 'delete-remote') {
       // git 模型下删除 = 提交中的 delete 变更（原子，不再单独 deleteFile）
       this.repoDeletes.set(action.path, action.fileUuid ?? `path:${action.path}`);
     } else {
-      await this.deleteLocalFile(action.path);
+      return this.deleteLocalFile(action.path);
     }
   }
 
-  private async deleteLocalFile(path: string): Promise<void> {
+  private async deleteLocalFile(path: string): Promise<void | 'protected'> {
+    const protection = await this.inspectLocalWriteProtection(path);
+    if (protection !== 'safe') {
+      this.recordProtectedLocalPath(path);
+      return 'protected';
+    }
     if (path.startsWith('.obsidian/')) {
       this.internalDeletes.add(path);
       if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path);
@@ -1275,8 +1579,7 @@ export default class SynxSyncPlugin extends Plugin {
     }
   }
 
-  private async executeOrdinaryConflict(path: string): Promise<void> {
-    if (!this.client) return;
+  private async executeOrdinaryConflict(path: string, client: RepositoryClient): Promise<void> {
     const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
     if (!remote) return;
 
@@ -1294,22 +1597,22 @@ export default class SynxSyncPlugin extends Plugin {
       if (resolution.outcome === 'keep-local') {
         try {
           if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
-          const remoteContent = await this.client.repoContent(this.repoHeadCommitId, path);
+          const remoteContent = await client.repoContent(this.repoHeadCommitId, path);
           await this.writeLocalViaAdapter(resolution.conflictPath, remoteContent);
         } catch {
           // 远端内容拉不到（提交被清理等），退化为直接推送本地
         }
-        await this.executePush(path);
+        await this.executePush(path, client);
       } else {
         try {
           const localContent = await this.app.vault.adapter.readBinary(path);
           await this.writeLocalViaAdapter(resolution.conflictPath, localContent);
-          await this.executePull(path);
+          await this.executePull(path, client);
           return;
         } catch {
           // 远端内容拉不到时，退化为推送本地，避免冲突处理阻塞同步
         }
-        await this.executePush(path);
+        await this.executePush(path, client);
       }
       return;
     }
@@ -1321,22 +1624,22 @@ export default class SynxSyncPlugin extends Plugin {
     if (resolution.outcome === 'keep-local') {
       try {
         if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
-        const remoteContent = await this.client.repoContent(this.repoHeadCommitId, path);
+        const remoteContent = await client.repoContent(this.repoHeadCommitId, path);
         await this.writeLocal(resolution.conflictPath, remoteContent);
       } catch {
         // 远端内容拉不到（提交被清理等），退化为直接推送本地
       }
-      await this.executePush(path);
+      await this.executePush(path, client);
     } else {
       try {
         const localContent = await this.app.vault.readBinary(local);
         await this.writeLocal(resolution.conflictPath, localContent);
-        await this.executePull(path);
+        await this.executePull(path, client);
         return;
       } catch {
         // 远端内容拉不到时，退化为推送本地
       }
-      await this.executePush(path);
+      await this.executePush(path, client);
     }
   }
 
@@ -1357,9 +1660,8 @@ export default class SynxSyncPlugin extends Plugin {
     }
   }
 
-  private async executePush(path: string): Promise<void> {
-    if (!this.client) return;
-    await this.uploadToClient(this.client, path, this.repoUploads);
+  private async executePush(path: string, client: RepositoryClient): Promise<void> {
+    await this.uploadToClient(client, path, this.repoUploads);
   }
 
   /**
@@ -1367,7 +1669,7 @@ export default class SynxSyncPlugin extends Plugin {
    * .obsidian/ 内的文件用底层 adapter 读取；其余用 vault API。
    * 不立即提交：变更集由调用方汇总后一次性 finalize。
    */
-  private async uploadToClient(client: WorkerClient, path: string, target: Map<string, RepoUploadedFile>): Promise<void> {
+  private async uploadToClient(client: RepositoryClient, path: string, target: Map<string, RepoUploadedFile>): Promise<void> {
     console.log('synx push start', { path });
     let content: ArrayBuffer;
     let mtime: number;
@@ -1406,15 +1708,7 @@ export default class SynxSyncPlugin extends Plugin {
     }
     const hash = await hashContent(content);
     try {
-      // 大文件走预签名 PUT 直传对象存储（文件内容不经过 Worker）；小文件保持 Worker 中转二进制直传
-      let blobId: string;
-      if (content.byteLength > DIRECT_UPLOAD_THRESHOLD) {
-        const session = await client.startDirectUpload({ path, size: content.byteLength, hash, mtime });
-        await client.uploadDirect(session.uploadUrl, content);
-        blobId = session.blobId;
-      } else {
-        blobId = await client.uploadBlob(path, content, mtime);
-      }
+      const blobId = await uploadRepositoryBlob(client, path, content, mtime, hash, DIRECT_UPLOAD_THRESHOLD);
       target.set(path, {
         path,
         blobId,
@@ -1457,12 +1751,21 @@ export default class SynxSyncPlugin extends Plugin {
   /** .obsidian 写入后回读的实际 mtime（诊断 iOS 写 mtime 是否生效） */
   private obsWriteBackMtimes: Record<string, { expected: number; actual: number | null }> = {};
 
-  private async executePull(path: string, _fileUuid?: string): Promise<void> {
-    if (!this.client) return;
+  private async executePull(path: string, client: RepositoryClient, _fileUuid?: string): Promise<void | 'protected'> {
     if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
     const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
     // 从仓库当前提交读取内容（git 模型下内容对象不可变，路径解引用）
-    const content = await this.client.repoContent(this.repoHeadCommitId, path);
+    const content = await client.repoContent(this.repoHeadCommitId, path);
+    const protection = await this.inspectLocalWriteProtection(path);
+    if (protection !== 'safe') {
+      const existingPaths = new Set(this.app.vault.getFiles().map((file) => file.path));
+      const copyPath = this.protectedConflictPaths.get(path)
+        ?? protectedPullConflictPath(path, this.settings.deviceName, Date.now(), existingPaths);
+      await this.writeLocal(copyPath, content);
+      this.protectedConflictPaths.set(path, copyPath);
+      this.recordProtectedLocalPath(path);
+      return 'protected';
+    }
     // .obsidian/ 内的文件用 adapter 写入
     if (path.startsWith('.obsidian/')) {
       // 显式设置 mtime（模仿 remotely-save 的 adapter.writeBinary(key, content, { mtime, ctime })）。
@@ -1487,6 +1790,40 @@ export default class SynxSyncPlugin extends Plugin {
     }
     if (target instanceof TFile) await this.app.vault.modifyBinary(target, content);
     else await this.writeLocal(path, content);
+  }
+
+  private async inspectLocalWriteProtection(path: string): Promise<LocalWriteProtection> {
+    const started = this.syncStartSnapshot.get(path) ?? { exists: false };
+    const current = await this.readCurrentFileSnapshot(path);
+    const editors: MarkdownEditorSnapshot[] = [];
+    if (!path.startsWith('.obsidian/')) {
+      for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+        if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) continue;
+        editors.push({
+          path: leaf.view.file.path,
+          contentHash: await hashContent(new TextEncoder().encode(leaf.view.editor.getValue())),
+        });
+      }
+    }
+    return decideLocalWriteProtection(started, current, hasChangedMarkdownEditor(path, current.hash, editors));
+  }
+
+  private async readCurrentFileSnapshot(path: string): Promise<SyncStartFileSnapshot> {
+    if (path.startsWith('.obsidian/')) {
+      const stat = await this.app.vault.adapter.stat(path);
+      if (!stat || stat.type !== 'file') return { exists: false };
+      const content = await this.app.vault.adapter.readBinary(path);
+      return { exists: true, mtime: stat.mtime > 0 ? stat.mtime : stat.ctime, size: stat.size, hash: await hashContent(content) };
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return { exists: false };
+    const content = await this.app.vault.readBinary(file);
+    return { exists: true, mtime: file.stat.mtime, size: file.stat.size, hash: await hashContent(content) };
+  }
+
+  private recordProtectedLocalPath(path: string): void {
+    if (!this.protectedLocalPaths.has(path)) this.protectedLocalCount++;
+    this.protectedLocalPaths.add(path);
   }
 
   private async writeLocal(path: string, content: ArrayBuffer): Promise<void> {
@@ -1627,17 +1964,20 @@ export default class SynxSyncPlugin extends Plugin {
     await this.persistState();
   }
 
-  private async persistState(): Promise<void> {
-    const state: SynxStateData = {
+  private buildState(): SynxStateData {
+    return writeCredentialCacheToState<SynxStateData>({
       deviceName: this.settings.deviceName,
       reports: this.reportStore.reports,
       pendingDeletions: this.pendingDeletions,
       knownRemoteFiles: this.knownRemoteFiles,
       prevSync: this.prevSync ?? undefined,
       pendingImageUploads: this.pendingImageUploads,
-    };
+    }, this.credentialCache);
+  }
+
+  private async persistState(): Promise<void> {
     try {
-      await this.app.vault.adapter.write(STATE_FILE, JSON.stringify(state));
+      await this.queueStateWrite();
     } catch (error) {
       console.error('synx: failed to persist state', error);
     }
@@ -1652,9 +1992,17 @@ export default class SynxSyncPlugin extends Plugin {
     return new Map(Object.entries(this.prevSync.entries));
   }
 
+  private invalidateProtectedPrevSyncEntries(): void {
+    if (!this.prevSync || this.protectedLocalPaths.size === 0) return;
+    this.prevSync = {
+      ...this.prevSync,
+      entries: withoutProtectedPrevSyncEntries(this.prevSync.entries, this.protectedLocalPaths),
+    };
+  }
+
   /** 同步成功后重建 prevSync 快照：重新枚举本地 + 用最近拉取的仓库树作为远端状态 */
   private async rebuildPrevSync(): Promise<void> {
-    if (!this.client || !this.settings.storageId) return;
+    if (!this.repositoryClient || !this.settings.storageId) return;
     // #region debug-point B:rebuild-prevsync
     const dbgT0 = Date.now();
     // #endregion
@@ -1669,7 +2017,9 @@ export default class SynxSyncPlugin extends Plugin {
         if (r.fileUuid) remoteUuidMap.set(r.fileUuid, r);
       }
       const entries: { [path: string]: PrevSyncEntry } = {};
+      const protectedConflictPaths = new Set(this.protectedConflictPaths.values());
       for (const l of files) {
+        if (this.protectedLocalPaths.has(l.path) || protectedConflictPaths.has(l.path)) continue;
         let r = remoteMap.get(l.path);
         if (!r && l.fileUuid) r = remoteUuidMap.get(l.fileUuid);
         entries[l.path] = {
@@ -1706,7 +2056,7 @@ export default class SynxSyncPlugin extends Plugin {
       return;
     }
     this.statusBarItem.show();
-    this.statusBarItem.setText(formatStatusBar(!!this.client, this.reportStore.current));
+    this.statusBarItem.setText(formatStatusBar(!!this.workerClient, this.reportStore.current));
   }
 
   private updateRibbonIcon(): void {
@@ -1720,7 +2070,7 @@ export default class SynxSyncPlugin extends Plugin {
     }
     this.ribbonIcon.removeClass('synx-ribbon-running');
     if (report?.phase === 'failed') this.ribbonIcon.setAttribute('aria-label', 'Synx 同步错误，点击重试');
-    else if (!this.client) this.ribbonIcon.setAttribute('aria-label', 'Synx 未连接');
+    else if (!this.workerClient) this.ribbonIcon.setAttribute('aria-label', 'Synx 未连接');
     else this.ribbonIcon.setAttribute('aria-label', 'Synx 就绪');
   }
 

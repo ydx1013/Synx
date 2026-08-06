@@ -8,7 +8,9 @@
     "noEmit": true,
     "paths": {
       "@synx/shared": ["../shared/src"],
-      "@synx/shared/*": ["../shared/src/*"]
+      "@synx/shared/*": ["../shared/src/*"],
+      "@synx/storage-core": ["../storage-core/src"],
+      "@synx/repo-core": ["../repo-core/src"]
     }
   },
   "include": ["src"]

@@ -486,6 +486,86 @@ describe('GET /api/storage/:id', () => {
   });
 });
 
+describe('GET /api/storage/:id/credentials', () => {
+  beforeEach(() => resetStorageRowCache());
+
+  it('超过用户 credentials 限制时返回 429 且不读取或解密存储', async () => {
+    const db = makeD1Mock({ first: { id: 's1', user_id: USER, name: 's3', type: 's3', config: 'not-valid-ciphertext', created_at: 1 } });
+    const kv = makeKvMock();
+    kv._map.set(`storage:credentials:${USER}`, '30');
+    const app = makeApp(db, kv);
+
+    const res = await app.request('/api/storage/s1/credentials', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+
+    expect(res.status).toBe(429);
+    await expect(res.json()).resolves.toEqual({ error: 'too many requests', code: 'RATE_LIMITED' });
+    expect(db.prepare).not.toHaveBeenCalled();
+  });
+
+  it('只向存储所有者返回完整 S3 直连配置并禁止缓存', async () => {
+    const encrypted = await encryptString(JSON.stringify(validS3), 'test-encryption-key');
+    const db = makeD1Mock({ first: { id: 's1', user_id: USER, name: 's3', type: 's3', config: encrypted, created_at: 1 } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+
+    const res = await app.request('/api/storage/s1/credentials', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Cache-Control')).toContain('no-store');
+    await expect(res.json()).resolves.toEqual({ storageId: 's1', type: 's3', config: validS3 });
+  });
+
+  it('在解密前拒绝其他用户的存储', async () => {
+    const db = makeD1Mock({ first: { id: 's1', user_id: OTHER, name: 's3', type: 's3', config: 'invalid', created_at: 1 } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+
+    const res = await app.request('/api/storage/s1/credentials', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden' });
+  });
+
+  it('过滤历史 WebDAV 禁止头但保留合法自定义头', async () => {
+    const config = { ...validWebdav, customHeaders: 'X-Tenant: demo\nAuthorization: Bearer old-secret\nCookie: session=old' };
+    const encrypted = await encryptString(JSON.stringify(config), 'test-encryption-key');
+    const db = makeD1Mock({ first: { id: 'w1', user_id: USER, name: 'webdav', type: 'webdav', config: encrypted, created_at: 1 } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+
+    const res = await app.request('/api/storage/w1/credentials', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+
+    expect(res.status).toBe(200);
+    const data = await res.json<any>();
+    expect(data.config.customHeaders).toBe('X-Tenant: demo');
+    expect(JSON.stringify(data)).not.toContain('old-secret');
+    expect(JSON.stringify(data)).not.toContain('session=old');
+  });
+
+  it('返回 OneDrive 本地刷新所需字段且不触发网络刷新', async () => {
+    const config = {
+      accessToken: 'access',
+      refreshToken: 'refresh',
+      accessTokenExpiresAt: 123,
+      clientId: 'client',
+      authority: 'https://login.microsoftonline.com/consumers',
+      remoteBaseDir: 'vault',
+    };
+    const encrypted = await encryptString(JSON.stringify(config), 'test-encryption-key');
+    const db = makeD1Mock({ first: { id: 'o1', user_id: USER, name: 'onedrive', type: 'onedrive', config: encrypted, created_at: 1 } });
+    const kv = makeKvMock();
+    const app = makeApp(db, kv);
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    const res = await app.request('/api/storage/o1/credentials', { headers: await authHeader() }, makeEnv({ DB: db, KV: kv }));
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ storageId: 'o1', type: 'onedrive', config });
+    expect(fetchMock).not.toHaveBeenCalled();
+    fetchMock.mockRestore();
+  });
+});
+
 describe('PATCH /api/storage/:id', () => {
   it('updates editable WebDAV fields while preserving the stored password', async () => {
     const encrypted = await encryptString(JSON.stringify(validWebdav), 'test-encryption-key');

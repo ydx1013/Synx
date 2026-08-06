@@ -1,4 +1,5 @@
 import { DEFAULT_RETENTION, type RetentionPolicy, type WorkerFs } from '@synx/shared';
+import { StorageRequestError } from '@synx/storage-core';
 import type { Env } from '../types.js';
 
 export class FileTooLarge extends Error {
@@ -101,7 +102,8 @@ async function readPolicyFromStorage(fs: WorkerFs): Promise<RetentionPolicy | nu
     const raw = await fs.get(RETENTION_KEY);
     const parsed = JSON.parse(new TextDecoder().decode(raw)) as Partial<RetentionPolicy>;
     return normalizePolicy(parsed);
-  } catch {
+  } catch (error) {
+    if (error instanceof StorageRequestError && (error.status === 401 || error.status === 403)) throw error;
     return null;
   }
 }

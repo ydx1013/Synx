@@ -7,23 +7,25 @@ export type ExecutableSyncAction =
 export interface SyncExecutionResult {
   path: string;
   operation: 'push' | 'pull' | 'delete-remote' | 'delete-local' | 'skip';
-  status: 'success' | 'failed' | 'skipped';
+  status: 'success' | 'failed' | 'skipped' | 'protected';
   startedAt: number;
   endedAt: number;
   attempts: number;
   size?: number;
   rule?: string;
   error?: SyncErrorInfo;
+  /** Internal-only original error; report conversion intentionally omits it. */
+  cause?: unknown;
 }
 
 export type SyncExecutorEvent =
   | { type: 'started'; action: ExecutableSyncAction }
-  | { type: 'success' | 'failed' | 'skipped'; action: ExecutableSyncAction; result: SyncExecutionResult };
+  | { type: 'success' | 'failed' | 'skipped' | 'protected'; action: ExecutableSyncAction; result: SyncExecutionResult };
 
 export class SyncExecutor {
   constructor(
     private concurrency: number,
-    private runAction: (action: Exclude<ExecutableSyncAction, { type: 'skip' }>) => Promise<void>,
+    private runAction: (action: Exclude<ExecutableSyncAction, { type: 'skip' }>) => Promise<void | 'protected'>,
     private onEvent?: (event: SyncExecutorEvent) => void,
   ) {}
 
@@ -65,13 +67,14 @@ export class SyncExecutor {
     const startedAt = Date.now();
     this.onEvent?.({ type: 'started', action });
     try {
-      await this.runAction(action);
-      const result: SyncExecutionResult = { path: action.path, operation: action.type, status: 'success', startedAt, endedAt: Date.now(), attempts: 1 };
-      this.onEvent?.({ type: 'success', action, result });
+      const outcome = await this.runAction(action);
+      const status = outcome === 'protected' ? 'protected' : 'success';
+      const result: SyncExecutionResult = { path: action.path, operation: action.type, status, startedAt, endedAt: Date.now(), attempts: 1 };
+      this.onEvent?.({ type: status, action, result });
       return result;
     } catch (error) {
       const normalized = normalizeSyncError(error);
-      const result: SyncExecutionResult = { path: action.path, operation: action.type, status: 'failed', startedAt, endedAt: Date.now(), attempts: normalized.attempts ?? 1, error: normalized };
+      const result: SyncExecutionResult = { path: action.path, operation: action.type, status: 'failed', startedAt, endedAt: Date.now(), attempts: normalized.attempts ?? 1, error: normalized, cause: error };
       this.onEvent?.({ type: 'failed', action, result });
       return result;
     }

@@ -3,6 +3,7 @@ import app from '../index.js';
 import { signJwt } from '../auth/jwt.js';
 import { makeEnv, makeD1Mock } from '../test/helpers.js';
 import { encryptString } from '../auth/crypto.js';
+import { resetRetentionPolicyCache } from '../services/retention.js';
 
 const SECRET = 'test-jwt-secret-min-32-characters-pls!';
 const USER = 'user-1';
@@ -78,10 +79,22 @@ describe('POST /api/repository/direct-upload/start', () => {
 
 describe('POST /api/repository/blobs', () => {
   beforeEach(() => {
+    resetRetentionPolicyCache();
     vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
       return Promise.resolve(new Response('', { status: url.includes('tombstone.json') ? 404 : 200 }));
     }));
+  });
+
+  it.each([401, 403])('preserves upstream storage %i without leaking response details', async (status) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('secret upstream body', { status })));
+    const res = await app.request(
+      '/api/repository/blobs?path=a.md&mtime=1',
+      { method: 'POST', headers: headers(), body: new Uint8Array([1]) },
+      await makeEnvWithStorage(),
+    );
+    expect(res.status).toBe(status);
+    expect(await res.text()).not.toContain('secret upstream body');
   });
 
   it('未认证返回 401', async () => {

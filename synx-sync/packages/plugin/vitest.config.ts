@@ -7,7 +7,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   resolve: {
     alias: {
+      '@synx/repo-core': resolve(__dirname, '../repo-core/src'),
       '@synx/shared': resolve(__dirname, '../shared/src'),
+      '@synx/storage-core': resolve(__dirname, '../storage-core/src'),
     },
   },
   test: {

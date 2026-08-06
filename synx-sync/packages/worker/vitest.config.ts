@@ -8,6 +8,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@synx/shared': resolve(__dirname, '../shared/src'),
+      '@synx/storage-core': resolve(__dirname, '../storage-core/src'),
     },
   },
   test: {

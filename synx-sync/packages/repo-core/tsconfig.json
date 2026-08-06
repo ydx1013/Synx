@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"],
+    "lib": ["ES2022"],
+    "moduleResolution": "Bundler",
+    "paths": {
+      "@synx/shared": ["../shared/src"],
+      "@synx/shared/*": ["../shared/src/*"]
+    }
+  },
+  "include": ["src"]
+}

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { OneDriveFs } from './onedriveFs.js';
+import { StorageRequestError } from './storageRequestError.js';
 import type { OnedriveConfig } from '@synx/shared';
 
 const config: OnedriveConfig = {
@@ -48,6 +49,77 @@ let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
+});
+
+describe('OneDriveFs token refresh', () => {
+  const expiredConfig = (): OnedriveConfig => ({ ...config, accessTokenExpiresAt: Date.now() - 1 });
+  const refreshedToken = (refreshToken?: string) => mockResponse({
+    json: {
+      token_type: 'Bearer',
+      expires_in: 3600,
+      scope: '',
+      access_token: 'rotated-access-token',
+      ...(refreshToken === undefined ? {} : { refresh_token: refreshToken }),
+    },
+  });
+
+  it('single-flights refresh for concurrent operations on the same instance', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.includes('/oauth2/v2.0/token')) return refreshedToken('rotated-refresh-token');
+      return mockResponse({ status: 200 });
+    });
+    const fs = new OneDriveFs(expiredConfig());
+
+    await Promise.all([fs.head('a'), fs.head('b'), fs.head('c')]);
+
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/oauth2/v2.0/token'))).toHaveLength(1);
+  });
+
+  it('reports the complete latest config after token rotation', async () => {
+    fetchMock
+      .mockResolvedValueOnce(refreshedToken('rotated-refresh-token'))
+      .mockResolvedValueOnce(mockResponse({ status: 200 }));
+    const changedConfigs: OnedriveConfig[] = [];
+    const onConfigChanged = vi.fn(async (latest: OnedriveConfig) => { changedConfigs.push(latest); });
+    const fs = new OneDriveFs(expiredConfig(), { onConfigChanged });
+
+    await fs.head('a');
+
+    expect(onConfigChanged).toHaveBeenCalledWith(expect.objectContaining({
+      accessToken: 'rotated-access-token',
+      refreshToken: 'rotated-refresh-token',
+      clientId: config.clientId,
+      authority: config.authority,
+    }));
+    expect(changedConfigs[0]?.accessTokenExpiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it('keeps the previous refresh token when the response omits a new one', async () => {
+    fetchMock
+      .mockResolvedValueOnce(refreshedToken())
+      .mockResolvedValueOnce(mockResponse({ status: 200 }));
+    const changedConfigs: OnedriveConfig[] = [];
+    const onConfigChanged = vi.fn(async (latest: OnedriveConfig) => { changedConfigs.push(latest); });
+
+    await new OneDriveFs(expiredConfig(), { onConfigChanged }).head('a');
+
+    expect(changedConfigs[0]?.refreshToken).toBe(config.refreshToken);
+  });
+
+  it('keeps the refreshed in-memory config but rejects the current operation when persistence fails', async () => {
+    fetchMock
+      .mockResolvedValueOnce(refreshedToken('rotated-refresh-token'))
+      .mockResolvedValueOnce(mockResponse({ status: 200 }));
+    const onConfigChanged = vi.fn(async () => { throw new Error('persist failed'); });
+    const fs = new OneDriveFs(expiredConfig(), { onConfigChanged });
+
+    await expect(fs.head('first')).rejects.toThrow('persist failed');
+    await expect(fs.head('second')).resolves.toBe(true);
+
+    expect(onConfigChanged).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/oauth2/v2.0/token'))).toHaveLength(1);
+    expect(callArgs(1).headers.Authorization).toBe('Bearer rotated-access-token');
+  });
 });
 
 describe('OneDriveFs constructor', () => {
@@ -415,6 +487,34 @@ describe('OneDriveFs.list', () => {
 
     const fs = new OneDriveFs(config);
     await expect(fs.list('')).rejects.toThrow('onedrive list failed');
+  });
+
+  it.each([
+    ['small put', (fs: OneDriveFs) => fs.put('file', new Uint8Array()), 401],
+    ['upload session', (fs: OneDriveFs) => fs.put('large', new Uint8Array(5 * 1024 * 1024)), 403],
+    ['metadata', (fs: OneDriveFs) => fs.get('file'), 401],
+    ['delete', (fs: OneDriveFs) => fs.delete('file'), 403],
+    ['head', (fs: OneDriveFs) => fs.head('file'), 401],
+  ] as const)('preserves auth status for %s', async (_name, operation, status) => {
+    fetchMock.mockResolvedValue(mockResponse({ status }));
+    const error = await operation(new OneDriveFs(config)).catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(status);
+  });
+
+  it('preserves auth status from the download URL request', async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ json: { '@microsoft.graph.downloadUrl': 'https://download.example/file' } }))
+      .mockResolvedValueOnce(mockResponse({ status: 403 }));
+    const error = await new OneDriveFs(config).get('file').catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(403);
+  });
+
+  it('does not wrap network TypeError as a status error', async () => {
+    const networkError = new TypeError('network failed');
+    fetchMock.mockRejectedValue(networkError);
+    await expect(new OneDriveFs(config).head('file')).rejects.toBe(networkError);
   });
 
   it('deduplicates keys', async () => {

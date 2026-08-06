@@ -26,7 +26,7 @@ export interface WorkerFs {
   /**
    * 可选：条件写（CAS）。仅当目标 key 当前值等于 etag 时写入。
    * 返回是否写入成功；etag 失配（412）返回 false，不抛错。
-   * 不支持条件写的后端可不实现（仓库层会降级为锁对象）。
+   * 不支持条件写的后端可不实现；仓库写入方必须提供外部串行化。
    */
   putIfMatch?(storageKey: string, content: ArrayBuffer | Uint8Array, etag: string): Promise<boolean>;
 

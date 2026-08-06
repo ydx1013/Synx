@@ -8,6 +8,8 @@
   "description": "Obsidian notes sync via CF Workers + multi-user S3 with version history",
   "workspaces": [
     "packages/shared",
+    "packages/storage-core",
+    "packages/repo-core",
     "packages/worker",
     "packages/plugin",
     "packages/web"

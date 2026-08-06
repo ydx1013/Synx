@@ -10,6 +10,7 @@ import {
   ONEDRIVE_SCOPES,
   DEFAULT_AUTHORITY,
 } from './onedriveAuth.js';
+import { StorageRequestError } from './storageRequestError.js';
 import type { OnedriveConfig } from '@synx/shared';
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -113,25 +114,27 @@ describe('exchangeCodeForToken', () => {
     expect(body.get('grant_type')).toBe('authorization_code');
   });
 
-  it('throws on error response', async () => {
+  it('preserves status and hides token endpoint details on error response', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false,
+      status: 403,
       json: async () => ({
         error: 'invalid_grant',
-        error_description: 'invalid authorization code',
+        error_description: 'invalid authorization code bad-code',
         error_codes: [500],
       }),
     } as unknown as Response);
 
-    await expect(
-      exchangeCodeForToken({
-        clientId: 'cid',
-        authority: 'https://login.microsoftonline.com/consumers',
-        code: 'bad-code',
-        redirectUri: 'https://example.com/callback',
-        verifier: 'verifier',
-      }),
-    ).rejects.toThrow('onedrive token exchange failed: invalid authorization code');
+    const error = await exchangeCodeForToken({
+      clientId: 'cid',
+      authority: 'https://login.microsoftonline.com/consumers',
+      code: 'bad-code',
+      redirectUri: 'https://example.com/callback',
+      verifier: 'verifier',
+    }).catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(403);
+    expect(error.message).not.toContain('bad-code');
   });
 });
 
@@ -168,6 +171,7 @@ describe('refreshAccessToken', () => {
   it('throws on error response', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false,
+      status: 401,
       json: async () => ({
         error: 'invalid_grant',
         error_description: 'refresh token expired',
@@ -175,13 +179,15 @@ describe('refreshAccessToken', () => {
       }),
     } as unknown as Response);
 
-    await expect(
-      refreshAccessToken({
-        clientId: 'cid',
-        authority: 'https://login.microsoftonline.com/consumers',
-        refreshToken: 'expired-token',
-      }),
-    ).rejects.toThrow('onedrive token refresh failed: refresh token expired');
+    const error = await refreshAccessToken({
+      clientId: 'cid',
+      authority: 'https://login.microsoftonline.com/consumers',
+      refreshToken: 'expired-token',
+    }).catch((caught) => caught);
+    expect(error).toBeInstanceOf(StorageRequestError);
+    expect(error.status).toBe(401);
+    expect(error.message).not.toContain('expired-token');
+    expect(error.message).not.toContain('refresh token expired');
   });
 });
 

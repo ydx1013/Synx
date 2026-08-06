@@ -7,6 +7,7 @@ import { enforceMaxFileSize, FileTooLarge, getRetentionPolicy } from '../service
 import { finalizeCommit, initRepository, readHead, readTree, RepoExistsError } from '../services/repositoryService.js';
 import type { AppVars, Env } from '../types.js';
 import { logError } from '../logger.js';
+import { RepositoryLockConflictError, withRepositoryLock } from '../services/repositoryLock.js';
 
 interface ApiTokenRow {
   id: string;
@@ -68,6 +69,11 @@ inbox.post('/notes', async c => {
   let reserved = false;
   try {
     const { fs } = await getFs(c.env, token.user_id, token.storage_id);
+    return await withRepositoryLock(
+      c.env.DB,
+      { userId: token.user_id, storageId: token.storage_id, syncFolder: token.sync_folder },
+      'inbox',
+      async () => {
     const policy = await getRetentionPolicy(c.env, token.storage_id, fs);
     enforceMaxFileSize(content.byteLength, policy);
     // 确保 git 仓库存在（init 零复制收旧数据；并发下 REPO_EXISTS 则重读 HEAD）
@@ -75,8 +81,8 @@ inbox.post('/notes', async c => {
     if (!head) {
       try {
         const init = await initRepository({
-          env: c.env, userId: token.user_id, storageId: token.storage_id,
-          syncFolder: token.sync_folder, fs, author: `api:${token.id}`,
+          storageId: token.storage_id,
+          syncFolder: token.sync_folder, fs, author: `api:${token.id}`, externalLock: true,
         });
         head = init.head;
       } catch (error) {
@@ -111,7 +117,7 @@ inbox.post('/notes', async c => {
     const hash = await sha256Hex(content);
     await fs.put(blobId, content);
     const { commit } = await finalizeCommit({
-      env: c.env, userId: token.user_id, storageId: token.storage_id, syncFolder: token.sync_folder, fs,
+      storageId: token.storage_id, syncFolder: token.sync_folder, fs, externalLock: true,
       baseCommitId: head.commitId, baseGeneration: head.generation,
       author: `api:${token.id}`, message: 'Inbox 收件箱',
       changes: [{ identity: fileUuid, operation: 'add', path, blobId, hash, size: content.byteLength, mtime }],
@@ -124,8 +130,11 @@ inbox.post('/notes', async c => {
     await c.env.DB.prepare('DELETE FROM api_note_paths WHERE storage_id = ? AND sync_folder = ? AND path = ?').bind(token.storage_id, token.sync_folder, path).run();
     reserved = false;
     return c.json({ note: { path, fileUuid, versionId: commit.commitId, createdAt: commit.createdAt } }, 201);
+      },
+    );
   } catch (error) {
     if (reserved) await c.env.DB.prepare('DELETE FROM api_note_paths WHERE storage_id = ? AND sync_folder = ? AND path = ?').bind(token.storage_id, token.sync_folder, path).run();
+    if (error instanceof RepositoryLockConflictError) return c.json({ error: error.message, code: 'REPOSITORY_LOCKED' }, 409);
     if (error instanceof FileTooLarge) return c.json({ error: error.message, code: 'FILE_TOO_LARGE' }, 413);
     if (error instanceof StorageError) return c.json({ error: error.message, code: 'STORAGE_ERROR' }, error.status as 400 | 403 | 404);
     logError(c, 'inbox_note_creation_failed', error, { tokenId: token.id, storageId: token.storage_id });

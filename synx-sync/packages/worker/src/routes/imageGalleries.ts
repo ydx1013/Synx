@@ -225,7 +225,7 @@ imageGalleries.get('/:id/images/content', async (c) => {
   if (!path.startsWith(`${config.folder}/`) || path.split('/').some((part) => part === '..')) return c.json({ error: '图片路径无效', code: 'INVALID_IMAGE_PATH' }, 400);
   try {
     const response = await readGitHubImage(config, path);
-    return new Response(response.body, { status: 200, headers: { 'Content-Type': response.headers.get('Content-Type') ?? 'application/octet-stream', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' } });
+    return new Response(response.body, { status: 200, headers: { 'Content-Type': response.headers.get('Content-Type') ?? 'application/octet-stream', 'Cache-Control': 'public, max-age=864000', 'Access-Control-Allow-Origin': '*' } });
   } catch (err) {
     return githubError(c, err);
   }
