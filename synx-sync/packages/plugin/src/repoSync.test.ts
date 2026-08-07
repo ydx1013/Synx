@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { RepoCommit, RepoFile, RepositoryHead } from '@synx/shared';
+import type { RepoChange, RepoCommit, RepoFile, RepositoryHead } from '@synx/shared';
 import { createSerialStateWriter } from './credentialCache.js';
 import {
+  applyRepoChanges,
   buildRepoChanges,
   clearAndQueuePersistSmartMergeBase,
   commitAndIndex,
@@ -72,14 +73,25 @@ describe('commitAndIndex', () => {
   });
 });
 
-describe('updateRepoBaseAfterFinalize', () => {
-  it('成功 finalize 后读取最终 HEAD 对应的树，避免继续使用旧树', async () => {
-    const repoTree = vi.fn().mockResolvedValue([file('new.md', 'uuid-new')]);
-    await expect(updateRepoBaseAfterFinalize({ commitId: 'c2', generation: 2 }, repoTree)).resolves.toEqual({
+describe('applyRepoChanges / updateRepoBaseAfterFinalize', () => {
+  it('finalize 后本地应用变更更新基线树，跳过全量树拉取', async () => {
+    const base = [file('a.md', 'uuid-a')];
+    const changes: RepoChange[] = [
+      { identity: 'uuid-a', operation: 'delete', path: 'a.md' },
+      { identity: 'uuid-b', operation: 'add', path: 'b.md', blobId: 'b-blob', hash: 'hb', size: 1, mtime: 2 },
+    ];
+    await expect(updateRepoBaseAfterFinalize({ commitId: 'c2', generation: 2 }, base, changes)).resolves.toEqual({
       head: { commitId: 'c2', generation: 2 },
-      tree: [file('new.md', 'uuid-new')],
+      tree: [{ path: 'b.md', identity: 'uuid-b', blobId: 'b-blob', hash: 'hb', size: 1, mtime: 2 }],
     });
-    expect(repoTree).toHaveBeenCalledWith('c2');
+  });
+
+  it('rename 移除旧路径并写入新路径', () => {
+    const tree = [file('old.md', 'uuid-a')];
+    const result = applyRepoChanges(tree, [
+      { identity: 'uuid-a', operation: 'rename', path: 'new.md', previousPath: 'old.md', blobId: 'b', hash: 'h', size: 1, mtime: 100 },
+    ]);
+    expect(result).toEqual([{ path: 'new.md', identity: 'uuid-a', blobId: 'b', hash: 'h', size: 1, mtime: 100 }]);
   });
 });
 

@@ -70,11 +70,41 @@ export function treeToMap(tree: RepoFile[]): Map<string, RepoFile> {
   return new Map(tree.map((f) => [f.path, f]));
 }
 
+/** 变更集 → 树条目（与服务端 toRepoFile 语义一致，供本地应用变更构造新树） */
+function toRepoFileFromChange(change: RepoChange): RepoFile {
+  return {
+    path: change.path,
+    identity: change.identity,
+    blobId: change.blobId ?? '',
+    hash: change.hash ?? '',
+    size: change.size ?? 0,
+    mtime: change.mtime ?? 0,
+  };
+}
+
+/** 把提交变更应用到现有树（与服务端 applyChanges 语义一致）。 */
+export function applyRepoChanges(tree: RepoFile[], changes: RepoChange[]): RepoFile[] {
+  const map = treeToMap(tree);
+  for (const change of changes) {
+    if (change.operation === 'delete') {
+      map.delete(change.path);
+    } else if (change.operation === 'rename') {
+      map.delete(change.previousPath!);
+      map.set(change.path, toRepoFileFromChange(change));
+    } else {
+      map.set(change.path, toRepoFileFromChange(change));
+    }
+  }
+  return [...map.values()];
+}
+
+/** finalize 成功后本地应用变更得到新基线树，避免整树网络拉取 */
 export async function updateRepoBaseAfterFinalize(
   head: { commitId: string; generation: number },
-  readTree: (commitId: string) => Promise<RepoFile[]>,
+  baseTree: RepoFile[],
+  changes: RepoChange[],
 ): Promise<{ head: { commitId: string; generation: number }; tree: RepoFile[] }> {
-  return { head, tree: await readTree(head.commitId) };
+  return { head, tree: applyRepoChanges(baseTree, changes) };
 }
 
 export function clearSmartMergeBase<T extends {

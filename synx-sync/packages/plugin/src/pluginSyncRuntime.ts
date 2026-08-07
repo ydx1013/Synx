@@ -183,7 +183,7 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
           await this.acknowledgePendingDeletions(changes);
           // 原子提交成功后，复用的未提交 blob 已被提交引用，移除对应待提交记录
           if (this.settings.storageId) this.acknowledgeCommittedBlobUploads(this.settings.storageId, changes.map((c) => c.path));
-          repo = await updateRepoBaseAfterFinalize(result.head, (commitId) => client.repoTree(commitId));
+          repo = await updateRepoBaseAfterFinalize(result.head, this.repoTree, changes);
           this.repoHeadCommitId = repo.head.commitId;
           this.repoHeadGeneration = repo.head.generation;
           this.repoTree = repo.tree;
@@ -203,30 +203,36 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
         }
       }
       if (attempt >= 2) throw new Error('同步冲突过多（远端提交被其他设备持续推进），请稍后重试');
-      // 提交成功后顺带触发一次垃圾回收：清理"任何提交都未引用"的孤儿内容对象 +
-      // 按保留策略做时间机器式历史裁剪。服务端单请求受子请求预算限制，长提交链
-      // 一次跑不完（返回 more=true）→ 循环多轮驱动同一批清理收敛；受上限保护，
-      // 剩余进度持久化在服务端，下次同步继续，不会卡死。静默执行，失败只记日志，
-      // 绝不影响同步结果。
-      try {
-        for (let i = 0; i < MAX_GC_ROUNDS; i++) {
-          const gc = await roundWorker.repoGc();
-          if (gc.deleted > 0 || gc.deletedCommits > 0 || gc.more) {
-            console.info('synx: gc progress', gc);
-          }
-          if (!gc.more) break;
-        }
-      } catch (error) {
-        console.warn('synx: gc after sync failed', error);
-      }
       // 同步完成后静默刷新历史面板（不显示 loading、不清空，避免闪烁），
       // 让当前笔记的历史记录立即反映最新版本（含本次 pull 下来的内容）
       this.refreshHistoryPanes(true);
       const report = this.finishSyncReport();
       // 写 .obsidian 同步诊断日志（移动端排查用）
       if (plan) await this.writeObsSyncDebug(files, skipped, skippedRemote, plan, report);
-      // 主存储同步完成后，把本地内容镜像到备份存储（仅 push，不 pull）
-      await this.mirrorToBackupStorages(files);
+      // 收尾任务互不依赖，并行执行，缩短"最后一个文件后"的等待：
+      // - 顺带触发一次垃圾回收：清理"任何提交都未引用"的孤儿内容对象 + 按保留
+      //   策略做时间机器式历史裁剪。服务端单请求受子请求预算限制，长提交链一次
+      //   跑不完（返回 more=true）→ 循环多轮驱动同一批清理收敛；受上限保护，
+      //   剩余进度持久化在服务端，下次同步继续，不会卡死。静默执行，失败只记日志。
+      // - 把本地内容镜像到备份存储（仅 push，不 pull）；多个备份存储之间仍串行，
+      //   避免本地磁盘读放大，单个失败不阻塞其他。
+      // 两者均为网络 IO 且失败都不影响主同步结果，故并行以缩短收尾等待。
+      await Promise.all([
+        (async () => {
+          try {
+            for (let i = 0; i < MAX_GC_ROUNDS; i++) {
+              const gc = await roundWorker.repoGc();
+              if (gc.deleted > 0 || gc.deletedCommits > 0 || gc.more) {
+                console.info('synx: gc progress', gc);
+              }
+              if (!gc.more) break;
+            }
+          } catch (error) {
+            console.warn('synx: gc after sync failed', error);
+          }
+        })(),
+        this.mirrorToBackupStorages(files),
+      ]);
       // 同步全部成功后重建 prevSync 快照（失败时不重建，下次同步重试）
       if (report?.stats.failed === 0) {
         await this.rebuildPrevSync();
