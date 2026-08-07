@@ -21,7 +21,7 @@ import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncSt
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient } from './workerClient.js';
-import { isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
+import { isBlobMissingError, isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
 import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
 import { DirectRepositoryResolver } from './directRepositoryResolver.js';
 import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginSettingsRuntime } from './pluginSettingsRuntime.js';
 import type { RuntimeHost } from './pluginRuntimeBase.js';
@@ -97,6 +97,8 @@ export class PluginConnectionRuntime extends PluginSettingsRuntime {
         message: `重试同步 ${changes.length} 个文件`,
         changes,
       }, client);
+      // 原子提交成功后，复用的未提交 blob 已被提交引用，移除对应待提交记录
+      if (this.settings.storageId) this.acknowledgeCommittedBlobUploads(this.settings.storageId, changes.map((c) => c.path));
       this.repoHeadCommitId = result.head.commitId;
       this.repoHeadGeneration = result.head.generation;
       this.refreshHistoryPanes(true);
@@ -148,10 +150,20 @@ export class PluginConnectionRuntime extends PluginSettingsRuntime {
   }
 
   public async finalizeMainCommit(input: RepoFinalizeRequest, client: RepositoryClient): Promise<RepoFinalizeResponse> {
-    return commitAndIndex(
-      () => client.finalizeCommit(input),
-      this.historyIndex,
-    );
+    try {
+      return await commitAndIndex(
+        () => client.finalizeCommit(input),
+        this.historyIndex,
+      );
+    } catch (error) {
+      // 复用的未提交 blob 已被服务端 GC 清理（BLOB_MISSING）：
+      // 作废该存储的待提交记录，让调用方重新规划并重新上传，而不是直接失败。
+      if (isBlobMissingError(error)) {
+        const storageId = (client as { storageId?: string }).storageId ?? this.settings.storageId;
+        if (storageId) this.invalidatePendingBlobUploads(storageId);
+      }
+      throw error;
+    }
   }
 
   public async updateHistoryIndexScope(previousUserId?: string | null): Promise<void> {
@@ -235,6 +247,7 @@ export class PluginConnectionRuntime extends PluginSettingsRuntime {
       jwt: settings.jwt,
       storageId: settings.storageId,
       syncFolder: settings.syncFolder,
+      abortSignal: this.syncAbort.signal,
       onUnauthorized: () => this.handleUnauthorized(session),
       onAuthFailure: (status, storageId) => this.handleAuthFailure(status, storageId, session),
     }) : null;

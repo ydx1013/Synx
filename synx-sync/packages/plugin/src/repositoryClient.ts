@@ -41,3 +41,8 @@ export function isRepoHeadConflict(error: unknown): boolean {
   return error instanceof HeadConflictError
     || (error instanceof WorkerApiError && error.status === 409);
 }
+
+/** 服务端返回 422 BLOB_MISSING：finalize 引用的不可变 blob 已不存在（可能被 GC 清理） */
+export function isBlobMissingError(error: unknown): boolean {
+  return error instanceof WorkerApiError && error.status === 422 && /BLOB_MISSING/.test(error.message);
+}

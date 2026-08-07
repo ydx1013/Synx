@@ -46,6 +46,8 @@ export interface WorkerClientOptions {
   fetchImpl?: typeof fetch;
   /** 最大重试次数（默认 3） */
   maxRetries?: number;
+  /** 插件卸载/重载时取消在途请求的信号（由 RuntimeBase.syncAbort 提供） */
+  abortSignal?: AbortSignal;
 }
 
 export function normalizeServerUrl(serverUrl: string): string {
@@ -277,12 +279,15 @@ export class WorkerClient {
     const timeoutMs = isUpload ? 120_000 : 30_000;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
+      // 外部取消信号（插件卸载/重载）链接到本次尝试的控制器：触发即中止当前请求
+      const onExternalAbort = () => controller.abort();
+      this.opts.abortSignal?.addEventListener('abort', onExternalAbort, { once: true });
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       const startedAt = Date.now();
       try {
         const headers = this.headers(body !== undefined, isBinary, binaryContentType);
         const bodyData = body !== undefined && !isBinary ? JSON.stringify(body) : body;
-        const bodyLen = typeof bodyData === 'string' ? bodyData.length : bodyData instanceof ArrayBuffer ? bodyData.byteLength : 0;
+        const bodyLen = typeof bodyData === 'string' ? bodyData.length : bodyData instanceof ArrayBuffer || bodyData instanceof Uint8Array ? bodyData.byteLength : 0;
         console.log('synx request', { method, url, attempt: attempt + 1, bodyLen, timeoutMs });
         const res = await this.fetchImpl(url, {
           method,
@@ -316,6 +321,11 @@ export class WorkerClient {
       } catch (e) {
         const elapsed = Date.now() - startedAt;
         const isTimeout = e instanceof DOMException && e.name === 'AbortError';
+        // 插件卸载/重载触发的外部取消：立即终止且不再重试，旧 Runtime 的在途请求必须尽快退出
+        if (this.opts.abortSignal?.aborted) {
+          lastErr = new Error('同步已取消（插件卸载/重载）');
+          break;
+        }
         console.error('synx request error', {
           method, url, attempt: attempt + 1, elapsedMs: elapsed,
           isTimeout,
@@ -343,6 +353,7 @@ export class WorkerClient {
         throw lastErr;
       } finally {
         clearTimeout(timer);
+        this.opts.abortSignal?.removeEventListener('abort', onExternalAbort);
       }
     }
     throw lastErr ?? new Error('request failed');

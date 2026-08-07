@@ -21,7 +21,7 @@ import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncSt
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient } from './workerClient.js';
-import { isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
+import { isBlobMissingError, isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
 import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
 import { DirectRepositoryResolver } from './directRepositoryResolver.js';
 import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginSyncRuntime } from './pluginSyncRuntime.js';
 
@@ -189,6 +189,7 @@ export class PluginInventoryRuntime extends PluginSyncRuntime {
       jwt: session.jwt,
       storageId,
       syncFolder: this.settings.syncFolder,
+      abortSignal: this.syncAbort.signal,
       onUnauthorized: () => this.handleUnauthorized(session),
       onAuthFailure: (status, failedStorageId) => this.handleAuthFailure(status, failedStorageId, session),
     });
@@ -225,13 +226,21 @@ export class PluginInventoryRuntime extends PluginSyncRuntime {
       // 有失败时不产生原子提交（避免「报告失败但备份已部分变更」），下次镜像重试
       if (uploads.size > 0 && failed === 0) {
         const changes = buildRepoChanges([...uploads.values()], [], treeToMap(tree));
-        await backupClient.finalizeCommit({
-          baseCommitId: resp.head.commitId,
-          baseGeneration: resp.head.generation,
-          author: this.settings.deviceName,
-          message: `镜像 ${changes.length} 个文件`,
-          changes,
-        });
+        try {
+          await backupClient.finalizeCommit({
+            baseCommitId: resp.head.commitId,
+            baseGeneration: resp.head.generation,
+            author: this.settings.deviceName,
+            message: `镜像 ${changes.length} 个文件`,
+            changes,
+          });
+          // 备份提交成功后，复用的未提交 blob 已被提交引用，移除对应待提交记录
+          this.acknowledgeCommittedBlobUploads(storageId, changes.map((c) => c.path));
+        } catch (error) {
+          // 复用的未提交 blob 已被服务端 GC 清理（BLOB_MISSING）：作废记录，下次镜像重新上传
+          if (isBlobMissingError(error)) this.invalidatePendingBlobUploads(storageId);
+          throw error;
+        }
       }
       stats = { storageId, storageName, push: pushActions.length, success, failed, skipped: skippedCount };
     } catch (error) {

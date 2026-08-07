@@ -21,7 +21,7 @@ import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncSt
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient } from './workerClient.js';
-import { isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
+import { isBlobMissingError, isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
 import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
 import { DirectRepositoryResolver } from './directRepositoryResolver.js';
 import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginConnectionRuntime } from './pluginConnectionRuntime.js';
 
@@ -101,40 +101,7 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
 
         this.reportStore.setPhase('planning');
         this.updateProgress();
-        // #region debug-point B:plan-inputs
-        dbg('B', 'main.ts:runSync', 'plan inputs', {
-          trigger,
-          localCount: files.length,
-          remoteCount: this.remoteEntities.length,
-          hasPrevSync: !!prevSyncMap,
-          prevSyncCount: prevSyncMap ? prevSyncMap.size : 0,
-          storageId: this.settings.storageId,
-          prevStorageId: this.prevSync?.storageId ?? null,
-          syncFolder: this.settings.syncFolder,
-          prevSyncFolder: this.prevSync?.syncFolder ?? null,
-          syncConfigDir: this.settings.syncConfigDir,
-        });
-        // #endregion
         plan = planSync(files, this.remoteEntities, 1000, prevSyncMap);
-        // #region debug-point C:plan-per-file
-        {
-          const localByPath = new Map(files.map((f) => [f.path, f]));
-          const remoteByPath = new Map(this.remoteEntities.map((e) => [e.key.replace(/^\/+/, ''), e]));
-          for (const a of plan.actions) {
-            if (a.type === 'skip') continue;
-            const l = localByPath.get(a.path);
-            const r = remoteByPath.get(a.path);
-            const p = prevSyncMap?.get(a.path);
-            dbg('C', 'main.ts:runSync', `plan ${a.type} ${a.reason}`, {
-              path: a.path,
-              lHash: l?.hash ?? null, lMtime: l?.mtime ?? null, lSize: l?.size ?? null, lUuid: l?.fileUuid ?? null,
-              rHash: r?.hash ?? r?.etag ?? null, rMtime: r?.mtime ?? null, rSize: r?.size ?? null,
-              pLocalHash: p?.localHash ?? null, pRemoteHash: p?.remoteHash ?? null,
-              pLocalMtime: p?.localMtime ?? null, pRemoteMtime: p?.remoteMtime ?? null,
-            });
-          }
-        }
-        // #endregion
         // 防清空 vault 误删远端：本地文件数比上次同步骤降（低于设置阈值）时，
         // 默认把所有 delete-remote 转为 pull（拉回，不删）。只有用户在设置中打开
         // 「允许批量删除远端」开关，才真正执行 delete-remote。
@@ -182,9 +149,6 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
         this.flushPendingDeletions(!remoteDeletionProtected);
         if (guardedDeletes > 0 || guardedLocalDeletes > 0) {
           console.warn('synx: mass deletion detected, protected data from deletion', { local: files.length, prevSync: prevSyncCount, guardedRemoteDeletes: guardedDeletes, guardedLocalDeletes, protectPercent });
-          // #region debug-point B:mass-deletion-guard
-          dbg('B', 'main.ts:runSync', 'MASS DELETION GUARDED', { localCount: files.length, prevSyncCount, guardedRemoteDeletes: guardedDeletes, guardedLocalDeletes, protectPercent });
-          // #endregion
         }
         const actions: ExecutableSyncAction[] = [
           ...(skipped as ExecutableSyncAction[]),
@@ -217,6 +181,8 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
             changes,
           }, client);
           await this.acknowledgePendingDeletions(changes);
+          // 原子提交成功后，复用的未提交 blob 已被提交引用，移除对应待提交记录
+          if (this.settings.storageId) this.acknowledgeCommittedBlobUploads(this.settings.storageId, changes.map((c) => c.path));
           repo = await updateRepoBaseAfterFinalize(result.head, (commitId) => client.repoTree(commitId));
           this.repoHeadCommitId = repo.head.commitId;
           this.repoHeadGeneration = repo.head.generation;
@@ -224,6 +190,12 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
           break;
         } catch (error) {
           if (isRepoHeadConflict(error)) {
+            repo = await this.ensureRepoBase(client);
+            continue;
+          }
+          if (isBlobMissingError(error)) {
+            // 复用的未提交 blob 已被服务端 GC 清理：finalizeMainCommit 已作废记录，
+            // 这里重新拉基线并重新规划（重新上传），而不是让本次同步直接失败。
             repo = await this.ensureRepoBase(client);
             continue;
           }
@@ -267,17 +239,6 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
       }
       const now = Date.now();
       const normalized = normalizeSyncError(error);
-      // #region debug-point B:sync-error
-      dbg('B', 'main.ts:runSync', 'runSync FAILED', {
-        trigger,
-        category: normalized.category,
-        message: normalized.message,
-        detail: normalized.detail ?? null,
-        status: (normalized as { status?: number }).status ?? null,
-        attempts: (normalized as { attempts?: number }).attempts ?? null,
-        raw: error instanceof Error ? error.stack ?? error.message : String(error),
-      });
-      // #endregion
       this.reportStore.setPhase('failed');
       this.reportStore.addItem({ path: '', operation: 'skip', status: 'failed', startedAt: now, endedAt: now, attempts: 1, error: normalized });
       this.reportStore.finish();

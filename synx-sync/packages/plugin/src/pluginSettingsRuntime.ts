@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, isPersistedData, isStateData, changesRepositoryScope, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, isPersistedData, isStateData, changesRepositoryScope, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginImageRuntime } from './pluginImageRuntime.js';
 
@@ -61,6 +61,7 @@ export class PluginSettingsRuntime extends PluginImageRuntime {
     this.knownRemoteFiles = [...(state.knownRemoteFiles ?? [])];
     this.prevSync = state.prevSync ?? null;
     this.pendingImageUploads = [...(state.pendingImageUploads ?? [])];
+    this.pendingBlobUploads = [...(state.pendingBlobUploads ?? [])];
     this.credentialCache = readCredentialCacheFromState(state) ?? createCredentialCache();
     (this.host as { settings?: SynxPluginSettings }).settings = this.settings;
   }
@@ -76,6 +77,7 @@ export class PluginSettingsRuntime extends PluginImageRuntime {
         knownRemoteFiles: raw.knownRemoteFiles ?? [],
         prevSync: raw.prevSync,
         pendingImageUploads: raw.pendingImageUploads ?? [],
+        pendingBlobUploads: raw.pendingBlobUploads ?? [],
         credentialCache: readCredentialCacheFromState(raw),
       };
     } catch { /* 文件不存在或解析失败，返回空状态 */ }

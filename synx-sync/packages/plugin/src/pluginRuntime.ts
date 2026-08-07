@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, MarkdownView, Notice, Platform, Plugin, requestUrl, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { App, FuzzySuggestModal, MarkdownView, Notice, Platform, Plugin, requestUrl, TAbstractFile, TFolder, WorkspaceLeaf } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
 import type { RepoChange, RepoFile, RepoFinalizeRequest, RepoFinalizeResponse, StorageCredentialsResponse } from '@synx/shared';
@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginUiRuntime } from './pluginUiRuntime.js';
 export class PluginRuntime extends PluginUiRuntime {
@@ -72,14 +72,6 @@ export class PluginRuntime extends PluginUiRuntime {
         // 诊断日志写入 vault 根目录会触发 modify/create 事件，
         // 必须忽略，否则每次同步写日志 → 触发同步 → 再写日志，无限循环
         if (file?.path && (file.path === OBS_DEBUG_FILE || file.path.startsWith('synx-debug-'))) return;
-        // #region debug-point A:vault-event
-        dbg('A', 'main.ts:onload', `${event} vault event`, {
-          path: file?.path ?? null,
-          mtime: file instanceof TFile ? file.stat.mtime : null,
-          size: file instanceof TFile ? file.stat.size : null,
-          now: Date.now(),
-        });
-        // #endregion
         this.scheduler.notifySave();
       }));
     }
@@ -87,14 +79,7 @@ export class PluginRuntime extends PluginUiRuntime {
     this.rebuildClient();
     await this.updateHistoryIndexScope();
     this.scheduler = new SyncScheduler(this.settings, async (trigger) => {
-      // #region debug-point E:sync-timing
-      const t0 = Date.now();
-      dbg('E', 'main.ts:onload', 'runSync START', { trigger, ts: t0 });
-      // #endregion
       await this.runSync(trigger);
-      // #region debug-point E:sync-timing
-      dbg('E', 'main.ts:onload', 'runSync END', { trigger, elapsedMs: Date.now() - t0, ts: Date.now() });
-      // #endregion
     });
     this.scheduler.start();
     this.updateStatusBar();
@@ -102,6 +87,9 @@ export class PluginRuntime extends PluginUiRuntime {
 
   async unload(): Promise<void> {
     this.scheduler?.dispose();
+    // 中止所有在途同步请求（上传/拉取/历史索引），防止旧 Runtime 的请求继续上传到远端
+    this.syncAbort.abort();
+    this.syncAbort = new AbortController();
     await this.stopHistoryIndexSync();
     this.historyIndex.close();
   }

@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginActionsRuntime } from './pluginActionsRuntime.js';
 
@@ -125,12 +125,6 @@ export class PluginStateRuntime extends PluginActionsRuntime {
   }
 
   public async persist(): Promise<void> {
-    // #region debug-point A:persist
-    dbg('A', 'main.ts:persist', 'persist (saveData + state)', {
-      ts: Date.now(),
-      settingsJsonLen: JSON.stringify(this.settings).length,
-    });
-    // #endregion
     // data.json 只保存 settings（不随同步报告频繁变化）。
     // deviceName 是每设备独立状态，剥离出去存 state，避免 data.json 跨设备同步时
     // 互相覆盖设备名（否则会导致"本地新→push→远端新→pull"的同步抖动）。
@@ -148,6 +142,7 @@ export class PluginStateRuntime extends PluginActionsRuntime {
       knownRemoteFiles: this.knownRemoteFiles,
       prevSync: this.prevSync ?? undefined,
       pendingImageUploads: this.pendingImageUploads,
+      pendingBlobUploads: this.pendingBlobUploads,
     }, this.credentialCache);
   }
 
@@ -179,9 +174,6 @@ export class PluginStateRuntime extends PluginActionsRuntime {
   /** 同步成功后重建 prevSync 快照：重新枚举本地 + 用最近拉取的仓库树作为远端状态 */
   public async rebuildPrevSync(): Promise<void> {
     if (!this.repositoryClient || !this.settings.storageId) return;
-    // #region debug-point B:rebuild-prevsync
-    const dbgT0 = Date.now();
-    // #endregion
     try {
       const { files } = await this.enumerateLocalFiles(this.getPrevSyncMap());
       const remote = repoTreeToRemote(this.repoTree);
@@ -216,9 +208,6 @@ export class PluginStateRuntime extends PluginActionsRuntime {
         syncFolder: this.settings.syncFolder,
         entries,
       };
-      // #region debug-point B:rebuild-prevsync
-      dbg('B', 'main.ts:rebuildPrevSync', 'prevSync REBUILT', { entryCount: Object.keys(entries).length, elapsedMs: Date.now() - dbgT0 });
-      // #endregion
     } catch (error) {
       console.error('synx: failed to rebuild prevSync', error);
       if (this.prevSync?.version === 3) {
@@ -228,9 +217,6 @@ export class PluginStateRuntime extends PluginActionsRuntime {
           this.queueStateWrite,
         );
       }
-      // #region debug-point B:rebuild-prevsync
-      dbg('B', 'main.ts:rebuildPrevSync', 'prevSync REBUILD FAILED', { error: error instanceof Error ? error.message : String(error) });
-      // #endregion
     }
   }
 }

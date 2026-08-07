@@ -414,9 +414,7 @@ function handleError(c: any, e: unknown): Response {
   if (e instanceof BlobMissingError) return c.json({ error: e.message, code: 'BLOB_MISSING' }, 422);
   if (e instanceof EmptyChangesError) return c.json({ error: e.message, code: 'EMPTY_CHANGES' }, 400);
   if (e instanceof RepoIntegrityError) {
-    // #region debug-point A:repo-integrity
     logError(c, 'repository_integrity_error', e);
-    // #endregion
     return c.json({ error: e.message, code: 'REPO_INTEGRITY' }, 500);
   }
   logError(c, 'repository_route_error', e);

@@ -59,7 +59,24 @@ export interface SynxStateData {
   knownRemoteFiles?: readonly { storageId: string; syncFolder: string; path: string; fileUuid?: string }[];
   prevSync?: PrevSyncState;
   pendingImageUploads?: readonly PendingImageUpload[];
+  pendingBlobUploads?: readonly PendingBlobUpload[];
   credentialCache?: CredentialCacheState;
+}
+
+/**
+ * 已上传到对象存储、但尚未被任何提交引用的不可变 blob。
+ * 持久化于 synx-state.json：整批同步因部分文件失败而未 finalize 时，
+ * 下次同步按 storageId+path+hash 复用，避免把已成功上传的文件重新上传一遍。
+ * 若 blob 已被 GC 清理（服务端返回 BLOB_MISSING），作废该存储全部记录并重新上传。
+ */
+export interface PendingBlobUpload {
+  storageId: string;
+  path: string;
+  hash: string;
+  blobId: string;
+  size: number;
+  mtime: number;
+  identity: string;
 }
 
 export function isPersistedData(raw: unknown): raw is PersistedPluginData {
@@ -78,6 +95,10 @@ export function changesRepositoryScope(patch: Partial<SynxPluginSettings>): bool
 export const STATE_FILE = '.obsidian/plugins/synx-sync/synx-state.json';
 /** 大文件直传阈值：超过该大小（字节）的文件走预签名 PUT 直传对象存储（不经过 Worker） */
 export const DIRECT_UPLOAD_THRESHOLD = 20 * 1024 * 1024;
+/** Worker 代理模式下二进制上传的最大并发数：大量 POST 共享同一条 HTTP/2 连接时容易触发连接重置，需收紧 */
+export const WORKER_PROXY_MAX_CONCURRENCY = 3;
+/** 未提交 blob 记录的持久化上限（超出丢弃最旧，避免 synx-state.json 无限膨胀） */
+export const MAX_PENDING_BLOB_UPLOADS = 2000;
 // .obsidian 同步诊断日志：每次同步后写入 vault 根目录。
 // 注意：必须写成 .md 后缀——iOS 文件 App / Obsidian 内只显示 .md 文件，
 // .log 等附件后缀在移动端不可见（实测 iOS 只能看到 .md）。
@@ -90,16 +111,6 @@ export const OBS_DEBUG_FILE = 'synx-debug.md'; // 兼容旧版本号（用于事
 // 仍跑不完时进度持久化在服务端 .synx/gc-state.json，下次同步继续，不会卡死。
 export const MAX_GC_ROUNDS = 8;
 
-// #region debug-point Z:helper
-// 之前版本把日志 POST 到 http://127.0.0.1:7777/event（本地调试服务器），
-// 手机上该地址无人监听，日志全部丢失 → 排查 .obsidian 同步问题时"没有日志"。
-// 改为 console.log：Obsidian 移动端开发者控制台 / 桌面端控制台可见。
-export function dbg(hyp: string, location: string, msg: string, data?: Record<string, unknown>): void {
-  try {
-    console.log(`[synx:dbg] [${hyp}] ${location}: ${msg}`, data ?? '');
-  } catch { /* ignore */ }
-}
-// #endregion
 export class RuntimeBase {
   settings!: SynxPluginSettings;
   protected workerClient: WorkerClient | null = null;
@@ -120,7 +131,10 @@ export class RuntimeBase {
   protected knownRemoteFiles: { storageId: string; syncFolder: string; path: string; fileUuid?: string }[] = [];
   protected prevSync: PrevSyncState | null = null;
   protected pendingImageUploads: PendingImageUpload[] = [];
+  protected pendingBlobUploads: PendingBlobUpload[] = [];
   protected credentialCache: CredentialCacheState = createCredentialCache();
+  /** 插件卸载/重载时中止所有在途同步请求，避免旧 Runtime 与新 Runtime 同时上传 */
+  protected syncAbort = new AbortController();
   protected credentialCacheGeneration = 0;
   protected readonly queueStateWrite = createSerialStateWriter(
     () => this.buildState(),
@@ -164,6 +178,60 @@ export class RuntimeBase {
   protected addCommand(command: unknown): void { this.host.addCommand(command); }
   protected registerDomEvent(target: Document, type: string, callback: EventListenerOrEventListenerObject, capture?: boolean): void { this.host.registerDomEvent(target, type, callback, capture); }
   protected registerEvent(event: unknown): void { this.host.registerEvent(event); }
+
+  /** 查找可复用的未提交 blob：同一存储、同一路径、内容 hash 一致才复用（hash 保证内容相同） */
+  protected findPendingBlobUpload(storageId: string, path: string, hash: string): PendingBlobUpload | undefined {
+    return this.pendingBlobUploads.find(
+      (entry) => entry.storageId === storageId && entry.path === path && entry.hash === hash,
+    );
+  }
+
+  /** 记录一次成功上传的未提交 blob；同 path+hash 覆盖旧记录；超出上限丢弃最旧 */
+  protected recordPendingBlobUpload(entry: PendingBlobUpload): void {
+    const index = this.pendingBlobUploads.findIndex(
+      (existing) => existing.storageId === entry.storageId && existing.path === entry.path && existing.hash === entry.hash,
+    );
+    if (index >= 0) this.pendingBlobUploads[index] = entry;
+    else this.pendingBlobUploads.push(entry);
+    if (this.pendingBlobUploads.length > MAX_PENDING_BLOB_UPLOADS) {
+      this.pendingBlobUploads = this.pendingBlobUploads.slice(-MAX_PENDING_BLOB_UPLOADS);
+    }
+  }
+
+  /** 原子提交成功后，移除已被提交引用的未提交 blob 记录 */
+  protected acknowledgeCommittedBlobUploads(storageId: string, paths: Iterable<string>): void {
+    const committed = new Set(paths);
+    this.pendingBlobUploads = this.pendingBlobUploads.filter(
+      (entry) => !(entry.storageId === storageId && committed.has(entry.path)),
+    );
+  }
+
+  /** 该存储的 blob 已缺失（可能被 GC 清理）时作废全部记录，下次同步重新上传，避免反复复用已删除的对象 */
+  protected invalidatePendingBlobUploads(storageId: string): void {
+    this.pendingBlobUploads = this.pendingBlobUploads.filter((entry) => entry.storageId !== storageId);
+  }
+
+  // ===== Worker 代理二进制上传并发信号量 =====
+  // 大量二进制 POST 共享同一条 HTTP/2 连接，并发过高会触发连接重置（ERR_HTTP2_PROTOCOL_ERROR）。
+  // 仅对 Worker 代理路由（uploadBlob 走 Worker）限流；S3 直连 / 预签名直传不受限。
+  private workerProxyUploadPermits = WORKER_PROXY_MAX_CONCURRENCY;
+  private readonly workerProxyUploadWaiters: Array<() => void> = [];
+
+  /** 获取一个 Worker 代理上传并发位；无空位时排队等待（许可证由 release 直接移交） */
+  protected async acquireWorkerProxyUploadSlot(): Promise<void> {
+    if (this.workerProxyUploadPermits > 0) {
+      this.workerProxyUploadPermits--;
+      return;
+    }
+    await new Promise<void>((resolve) => this.workerProxyUploadWaiters.push(resolve));
+  }
+
+  /** 释放并发位：先唤醒等待者移交许可证；无等待者时归还许可计数 */
+  protected releaseWorkerProxyUploadSlot(): void {
+    const next = this.workerProxyUploadWaiters.shift();
+    if (next) next();
+    else this.workerProxyUploadPermits++;
+  }
 }
 export interface RuntimeBase { [key: string]: any; }
 export interface RuntimeHost {

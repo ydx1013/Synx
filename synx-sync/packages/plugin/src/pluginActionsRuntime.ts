@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, dbg, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginInventoryRuntime } from './pluginInventoryRuntime.js';
 
@@ -226,8 +226,26 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
       }
     }
     const hash = await hashContent(content);
+    // 复用未提交 blob：同一存储 + 路径 + 内容 hash 已上传过（上次整批同步失败残留）则直接引用，避免重复上传。
+    // hash 一致保证内容相同；若 blob 已被服务端 GC 清理，finalize 会返回 BLOB_MISSING → 作废记录后重新上传。
+    const storageId = (client as { storageId?: string }).storageId ?? this.settings.storageId ?? '';
+    if (storageId) {
+      const pending = this.findPendingBlobUpload(storageId, path, hash);
+      if (pending) {
+        target.set(path, {
+          path,
+          blobId: pending.blobId,
+          hash,
+          size: pending.size,
+          mtime: pending.mtime,
+          identity: pending.identity,
+        });
+        console.log('synx push reuse pending blob', { path, blobId: pending.blobId });
+        return;
+      }
+    }
     try {
-      const blobId = await uploadRepositoryBlob(client, path, content, mtime, hash, DIRECT_UPLOAD_THRESHOLD);
+      const blobId = await this.uploadWorkerBlob(client, path, content, mtime, hash);
       target.set(path, {
         path,
         blobId,
@@ -236,6 +254,7 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
         mtime,
         identity: fileUuid ?? `path:${path}`,
       });
+      if (storageId) this.recordPendingBlobUpload({ storageId, path, hash, blobId, size: content.byteLength, mtime, identity: fileUuid ?? `path:${path}` });
       console.log('synx push done', { path, blobId });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -256,6 +275,21 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
         errorStack: error instanceof Error ? error.stack?.split('\n').slice(0, 8).join('\n') : undefined,
       });
       throw error;
+    }
+  }
+
+  /**
+   * 上传 blob 并应用 Worker 代理并发限流：仅限 Worker 代理模式的二进制 POST（并发 ≤ WORKER_PROXY_MAX_CONCURRENCY），
+   * 超过阈值走预签名直传、以及 S3 直连路由，均保持原有并发不受限。
+   */
+  private async uploadWorkerBlob(client: RepositoryClient, path: string, content: ArrayBuffer, mtime: number, hash: string): Promise<string> {
+    const workerProxyRoute = client instanceof WorkerClient && content.byteLength <= DIRECT_UPLOAD_THRESHOLD;
+    if (!workerProxyRoute) return uploadRepositoryBlob(client, path, content, mtime, hash, DIRECT_UPLOAD_THRESHOLD);
+    await this.acquireWorkerProxyUploadSlot();
+    try {
+      return await uploadRepositoryBlob(client, path, content, mtime, hash, DIRECT_UPLOAD_THRESHOLD);
+    } finally {
+      this.releaseWorkerProxyUploadSlot();
     }
   }
 
