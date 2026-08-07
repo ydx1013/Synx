@@ -62,4 +62,9 @@ export default class SynxSyncPlugin extends Plugin {
   activateHistoryPane(): Promise<void> { return this.runtime.activateHistoryPane(); }
   activateSyncDetails(): Promise<void> { return this.runtime.activateSyncDetails(); }
   getHistoryIndex(): HistoryIndex { return this.runtime.getHistoryIndex(); }
+  /** 清除本地缓存的版本历史索引（IndexedDB）并刷新已打开的历史面板 */
+  async clearHistoryIndex(): Promise<void> {
+    await this.getHistoryIndex().clearCurrentRepositoryHistory();
+    this.runtime.refreshHistoryPanes(false);
+  }
 }

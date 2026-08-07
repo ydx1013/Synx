@@ -176,6 +176,24 @@ export class HistoryIndex {
     await Dexie.delete(db.name);
   }
 
+  /**
+   * 清除本地缓存的历史索引（IndexedDB）。优先清除当前仓库作用域；
+   * 未选择仓库时清空整个账号的历史缓存。下次同步会从云端 HEAD 重新建立。
+   */
+  async clearCurrentRepositoryHistory(): Promise<void> {
+    const db = this.requireDb();
+    const repository = this.repository;
+    if (repository) {
+      await this.clearRepository(db, repository);
+      return;
+    }
+    await db.transaction('rw', db.commits, db.changes, db.meta, async () => {
+      await db.commits.clear();
+      await db.changes.clear();
+      await db.meta.clear();
+    });
+  }
+
   close(): void {
     this.db?.close();
     this.db = null;
