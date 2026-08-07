@@ -10,6 +10,7 @@ const credentials = (storageId: string): StorageCredentialsResponse => ({
 });
 
 const scope = (patch: Partial<DirectRepositoryScope> = {}): DirectRepositoryScope => ({
+  serverUrl: 'https://old.example.com',
   userId: 'user-1',
   jwt: 'jwt-1',
   storageId: 'storage-1',
@@ -53,6 +54,7 @@ describe('DirectRepositoryResolver', () => {
   });
 
   it.each([
+    ['serverUrl', { serverUrl: 'https://new.example.com' }],
     ['storageId', { storageId: 'storage-2' }],
     ['syncFolder', { syncFolder: 'Other' }],
     ['jwt', { jwt: 'jwt-2' }],

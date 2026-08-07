@@ -6,7 +6,7 @@ import { HybridRepositoryClient } from './hybridRepositoryClient.js';
 import { RepositoryTransportSelector } from './repositoryTransportSelector.js';
 
 const scope = {
-  userId: 'user-1', jwt: 'jwt-1', storageId: 'storage-1', syncFolder: 'Vault', credentialGeneration: 0,
+  serverUrl: 'https://old.example.com', userId: 'user-1', jwt: 'jwt-1', storageId: 'storage-1', syncFolder: 'Vault', credentialGeneration: 0,
 };
 
 function client(repoHead: () => Promise<any>): RepositoryClient {
@@ -57,11 +57,36 @@ describe('RepositoryTransportSelector', () => {
     await expect(corruption.selector.selectSync(scope, corruption.worker)).rejects.toBeInstanceOf(SyntaxError);
   });
 
-  it('invalidates direct credentials and does not fallback on storage auth failure', async () => {
+  it('invalidates direct credentials and reports the request scope on sync auth failure', async () => {
     const auth = new StorageRequestError(403, 'webdav head failed');
-    const { selector, resolver, worker } = setup(vi.fn().mockRejectedValue(auth));
+    const probe = vi.fn().mockRejectedValue(auth);
+    const direct = client(probe);
+    const worker = client(vi.fn());
+    const resolver = { resolve: vi.fn(async () => ({ client: direct, type: 'webdav' as const } as any)), invalidate: vi.fn() };
+    const onAuthFailure = vi.fn();
+    const selector = new RepositoryTransportSelector(resolver, onAuthFailure);
+
     await expect(selector.selectSync(scope, worker)).rejects.toBe(auth);
+
     expect(resolver.invalidate).toHaveBeenCalledWith('storage-1');
+    expect(onAuthFailure).toHaveBeenCalledWith(403, 'storage-1', scope);
+  });
+
+  it('reports the original history scope when an old request fails after a new session starts', async () => {
+    let rejectOld!: (error: unknown) => void;
+    const probe = vi.fn(() => new Promise<any>((_resolve, reject) => { rejectOld = reject; }));
+    const direct = client(probe);
+    const worker = client(vi.fn());
+    const resolver = { resolve: vi.fn(async () => ({ client: direct, type: 'webdav' as const } as any)), invalidate: vi.fn() };
+    const onAuthFailure = vi.fn();
+    const selector = new RepositoryTransportSelector(resolver, onAuthFailure);
+    const oldRequest = selector.getHistory(scope, worker);
+
+    await Promise.resolve();
+    rejectOld(new StorageRequestError(401, 'late old-account failure'));
+    await expect(oldRequest).rejects.toBeInstanceOf(StorageRequestError);
+
+    expect(onAuthFailure).toHaveBeenCalledWith(401, 'storage-1', scope);
   });
 
   it('single-flights history selection and probes only once for concurrent consumers', async () => {

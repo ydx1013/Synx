@@ -21,7 +21,7 @@ export class RepositoryTransportSelector {
 
   constructor(
     private readonly resolver: DirectResolver,
-    private readonly onStorageCredentialError?: (status: 401 | 403, storageId: string) => void,
+    private readonly onStorageCredentialError?: (status: 401 | 403, storageId: string, scope: DirectRepositoryScope) => void,
   ) {}
 
   async selectSync(scope: DirectRepositoryScope, worker: RepositoryClient): Promise<RepositoryClient> {
@@ -55,7 +55,7 @@ export class RepositoryTransportSelector {
     } catch (error) {
       if (isStorageCredentialError(error)) {
         this.resolver.invalidate(error.status === 403 ? scope.storageId : undefined);
-        this.onStorageCredentialError?.(error.status, scope.storageId);
+        this.onStorageCredentialError?.(error.status, scope.storageId, scope);
         throw error;
       }
       if (isDirectTransportIncompatible(error)) return worker;

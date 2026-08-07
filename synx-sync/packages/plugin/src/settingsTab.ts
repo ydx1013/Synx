@@ -71,16 +71,17 @@ export class SynxSettingTab extends PluginSettingTab {
   private renderStorage(container: HTMLElement, settings: SynxPluginSettings): void {
     container.createEl('h3', { text: '存储选择' });
     new Setting(container).setName('主存储').setDesc(settings.storageName ?? '未选择').addDropdown(async (dropdown) => {
+      dropdown.addOption('', '请选择主存储');
       try {
         const storages = await WorkerClient.listStorages(settings.serverUrl, settings.jwt);
         for (const storage of storages) dropdown.addOption(storage.id, `${storage.name} (${storage.type})`);
-        if (settings.storageId) dropdown.setValue(settings.storageId);
+        dropdown.setValue(settings.storageId ?? '');
         dropdown.onChange(async (id) => {
           const storage = storages.find((item) => item.id === id);
           // 切换主存储时，从备份列表中移除该存储（避免主备相同）
           const backupIds = settings.backupStorageIds.filter((bid) => bid !== id);
-          await this.applyPatch({ storageId: id, storageName: storage?.name ?? null, backupStorageIds: backupIds });
-          await this.plugin.onStorageChanged();
+          await this.applyPatch({ storageId: storage?.id ?? null, storageName: storage?.name ?? null, backupStorageIds: backupIds });
+          if (storage) await this.plugin.onStorageChanged();
           this.display();
         });
       } catch (error) {

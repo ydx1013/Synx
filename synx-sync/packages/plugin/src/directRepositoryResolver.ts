@@ -4,6 +4,7 @@ import { createStorageFs } from './storageFs.js';
 import { DirectRepositoryClient } from './directRepositoryClient.js';
 
 export interface DirectRepositoryScope {
+  serverUrl: string;
   userId: string;
   jwt: string;
   storageId: string;
@@ -39,6 +40,7 @@ export class DirectRepositoryResolver {
 
   resolve(scope: DirectRepositoryScope): Promise<ResolvedDirectRepository> {
     const key = JSON.stringify([
+      scope.serverUrl,
       scope.userId,
       scope.jwt,
       scope.storageId,
