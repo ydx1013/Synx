@@ -307,10 +307,6 @@ export class SynxSettingTab extends PluginSettingTab {
       dropdown.setValue(settings.historyStyle).onChange(async (value) => this.applyPatch({ historyStyle: value as HistoryStyle }));
     });
     this.addToggle(container, '生成诊断日志', settings.enableDebugLog, async (value) => this.applyPatch({ enableDebugLog: value }), '写入 synx-debug-<设备名>.md，用于排查移动端同步问题；默认关闭');
-    new Setting(container).setName('清除本地历史索引').setDesc('删除本机缓存的版本历史记录（IndexedDB）。存储已删除时可清理残留；下次同步会从云端重新建立。').addButton((button) => button.setButtonText('清除').setWarning().onClick(async () => {
-      await this.plugin.clearHistoryIndex();
-      new Notice('已清除本地历史索引');
-    }));
     new Setting(container).addButton((button) => button.setButtonText('打开版本历史').onClick(async () => this.plugin.activateHistoryPane())).addButton((button) => button.setButtonText('打开同步详情').onClick(async () => this.plugin.activateSyncDetails())).addButton((button) => button.setButtonText('立即同步').setCta().onClick(async () => this.plugin.triggerSync()));
   }
 

@@ -159,19 +159,6 @@ describe('HistoryIndex', () => {
     expect(progress).toEqual([2]);
   });
 
-  it('清除当前仓库历史索引后该仓库历史为空，其他仓库不受影响', async () => {
-    const index = makeIndex(`history-index-clear-${crypto.randomUUID()}`);
-    await index.openAccount('user-a');
-    await index.setRepository('storage-a', 'Vault');
-    await index.putCommits([commit(1, null), commit(2, 'c1')], 'c2');
-    expect((await index.getFileHistory('file-1')).commits.length).toBe(1);
-
-    await index.clearCurrentRepositoryHistory();
-    const cleared = await index.getFileHistory('file-1');
-    expect(cleared.commits).toEqual([]);
-    expect(cleared.headCommitId).toBeNull();
-  });
-
   it('readCommit pending 期间 abort 后不写入提交或 indexedHead', async () => {
     const index = makeIndex(`history-index-pending-abort-${crypto.randomUUID()}`);
     await index.openAccount('user-a');
