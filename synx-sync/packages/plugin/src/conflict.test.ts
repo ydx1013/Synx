@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { conflictCopyPath, resolveConflict } from './conflict.js';
+import { conflictCopyPath, preserveRemoteConflictCopy, resolveConflict } from './conflict.js';
 
 describe('conflictCopyPath', () => {
   it('creates sanitized stable names and avoids existing paths', () => {
@@ -7,6 +7,18 @@ describe('conflictCopyPath', () => {
     expect(first).toBe('.synx-conflicts/notes/a.conflict-my-phone-20231114-221320.md');
     const second = conflictCopyPath('notes/a.md', 'My Phone!', 1700000000000, new Set([first]));
     expect(second).toBe('.synx-conflicts/notes/a.conflict-my-phone-20231114-221320-2.md');
+  });
+});
+
+describe('preserveRemoteConflictCopy', () => {
+  it('仅 repoContent 读取失败可安全回退', async () => {
+    const writeCopy = async () => { throw new Error('不应调用'); };
+    await expect(preserveRemoteConflictCopy(async () => { throw new Error('GC'); }, writeCopy)).resolves.toBe(false);
+  });
+
+  it('冲突副本写入失败必须传播，不能继续覆盖或 push', async () => {
+    const diskFull = new Error('disk full');
+    await expect(preserveRemoteConflictCopy(async () => new ArrayBuffer(1), async () => { throw diskFull; })).rejects.toBe(diskFull);
   });
 });
 

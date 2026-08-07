@@ -29,6 +29,20 @@ export function conflictCopyPath(path: string, device: string, timestamp: number
   return candidate;
 }
 
+export async function preserveRemoteConflictCopy(
+  readRemote: () => Promise<ArrayBuffer>,
+  writeCopy: (content: ArrayBuffer) => Promise<void>,
+): Promise<boolean> {
+  let content: ArrayBuffer;
+  try {
+    content = await readRemote();
+  } catch {
+    return false;
+  }
+  await writeCopy(content);
+  return true;
+}
+
 export function resolveConflict(input: ConflictInput, strategy: ConflictStrategy, device: string, timestamp: number, existing: ReadonlySet<string>): ConflictResolution {
   if (strategy === 'pause') return { outcome: 'pause', preserve: 'both', paused: true };
   let outcome: 'keep-local' | 'keep-remote';

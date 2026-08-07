@@ -19,7 +19,7 @@ import type { Entity } from '@synx/shared';
  */
 
 export type SyncAction =
-  | { type: 'push'; path: string; reason: 'local-only' | 'local-newer' | 'conflict-keep-local' }
+  | { type: 'push'; path: string; reason: 'local-only' | 'local-newer' | 'conflict-keep-local'; fileUuid?: string; basePath?: string }
   | { type: 'pull'; path: string; reason: 'remote-only' | 'remote-newer'; fileUuid?: string }
   | { type: 'delete-remote'; path: string; reason: 'local-deleted'; fileUuid?: string }
   | { type: 'delete-local'; path: string; reason: 'remote-deleted'; fileUuid?: string }
@@ -56,6 +56,8 @@ export interface PrevSyncEntry {
   remoteHash?: string;
   remoteVersionId?: string;
   fileUuid?: string;
+  /** 该条目在 baseCommitId 中的路径；旧状态缺失时视为无 base */
+  basePath?: string;
 }
 
 /** prevSync 查找表：key = vault 内相对路径 */
@@ -163,8 +165,8 @@ export function planSync(
         stats.pull++;
         continue;
       }
-      // 两端都改了 → 冲突，保留本地
-      actions.push({ type: 'push', path: l.path, reason: 'conflict-keep-local' });
+      // 两端都改了 → 冲突；执行层根据独立策略处理
+      actions.push({ type: 'push', path: l.path, reason: 'conflict-keep-local', fileUuid: r.fileUuid ?? undefined, basePath: p.basePath });
       stats.push++;
       stats.conflict++;
       continue;

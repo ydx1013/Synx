@@ -1,11 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RepoCommit, RepoFile, RepositoryHead } from '@synx/shared';
+import { createSerialStateWriter } from './credentialCache.js';
 import {
   buildRepoChanges,
+  clearAndQueuePersistSmartMergeBase,
   commitAndIndex,
   identityToFileUuid,
   repoTreeToRemote,
   treeToMap,
+  updateRepoBaseAfterFinalize,
+  refreshLocalSyncState,
+  clearSmartMergeBase,
+  clearAndPersistSmartMergeBase,
 } from './repoSync.js';
 
 function file(path: string, identity: string, hash = 'h', blobId = `b-${path}`): RepoFile {
@@ -63,6 +69,70 @@ describe('commitAndIndex', () => {
 
     await expect(commitAndIndex(operation, index)).rejects.toBe(error);
     expect(index.putCommits).not.toHaveBeenCalled();
+  });
+});
+
+describe('updateRepoBaseAfterFinalize', () => {
+  it('成功 finalize 后读取最终 HEAD 对应的树，避免继续使用旧树', async () => {
+    const repoTree = vi.fn().mockResolvedValue([file('new.md', 'uuid-new')]);
+    await expect(updateRepoBaseAfterFinalize({ commitId: 'c2', generation: 2 }, repoTree)).resolves.toEqual({
+      head: { commitId: 'c2', generation: 2 },
+      tree: [file('new.md', 'uuid-new')],
+    });
+    expect(repoTree).toHaveBeenCalledWith('c2');
+  });
+});
+
+describe('clearSmartMergeBase', () => {
+  it('重建失败时保留 entries 元数据但清除旧共同祖先和所有 basePath', () => {
+    expect(clearSmartMergeBase({
+      version: 3,
+      storageId: 's',
+      syncFolder: 'vault/',
+      baseCommitId: 'stale-commit',
+      entries: {
+        'a.md': { localMtime: 1, remoteMtime: 1, size: 1, basePath: 'old/a.md' },
+      },
+    })).toEqual({
+      version: 3,
+      storageId: 's',
+      syncFolder: 'vault/',
+      entries: {
+        'a.md': { localMtime: 1, remoteMtime: 1, size: 1 },
+      },
+    });
+  });
+
+  it('清除后的状态必须持久化', async () => {
+    const persist = vi.fn().mockResolvedValue(undefined);
+    const state = { version: 3, baseCommitId: 'stale', entries: {} };
+    const cleared = await clearAndPersistSmartMergeBase(state, persist);
+    expect(cleared).toEqual({ version: 3, entries: {} });
+    expect(persist).toHaveBeenCalledWith(cleared);
+  });
+
+  it('关键清理通过实际队列 writer 写盘并向上传播失败', async () => {
+    let current = { version: 3, baseCommitId: 'stale', entries: {} };
+    const writerError = new Error('disk full');
+    const diskWrite = vi.fn(async () => { throw writerError; });
+    const queueStateWrite = createSerialStateWriter(() => current, diskWrite);
+
+    await expect(clearAndQueuePersistSmartMergeBase(current, (state) => { current = state; }, queueStateWrite)).rejects.toBe(writerError);
+    expect(diskWrite).toHaveBeenCalledWith({ version: 3, entries: {} });
+  });
+});
+
+describe('refreshLocalSyncState', () => {
+  it('CAS 重试重新枚举第一轮写入后的本地实体并重建保护快照', async () => {
+    const current = [{ path: 'pulled.md', mtime: 200, size: 3, hash: 'new-hash', fileUuid: 'uuid-pulled' }];
+    const enumerate = vi.fn().mockResolvedValue({ files: current, skipped: [] });
+
+    await expect(refreshLocalSyncState(enumerate)).resolves.toEqual({
+      files: current,
+      skipped: [],
+      snapshot: new Map([['pulled.md', { exists: true, mtime: 200, size: 3, hash: 'new-hash' }]]),
+    });
+    expect(enumerate).toHaveBeenCalledOnce();
   });
 });
 
@@ -124,5 +194,17 @@ describe('buildRepoChanges', () => {
       current,
     );
     expect(changes.map((c) => c.operation)).toEqual(['add', 'delete']);
+  });
+
+  it.each([
+    ['add', { path: 'revived.md', blobId: 'b', hash: 'h', size: 1, mtime: 1, identity: 'new-id' }],
+    ['modify', { path: 'note.md', blobId: 'b', hash: 'h', size: 1, mtime: 1, identity: 'uuid-note' }],
+    ['rename target', { path: 'revived.md', previousPath: 'old.md', blobId: 'b', hash: 'h', size: 1, mtime: 1, identity: 'new-id' }],
+  ])('同一路径不得同时输出 %s 与 delete', (_kind, upload) => {
+    expect(() => buildRepoChanges(
+      [upload],
+      [{ path: upload.path, identity: 'deleted-id' }],
+      current,
+    )).toThrow(`同一路径不能同时上传和删除: ${upload.path}`);
   });
 });

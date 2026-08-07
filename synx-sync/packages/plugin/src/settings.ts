@@ -1,6 +1,6 @@
 import type { RetentionPolicy, StorageSummary } from '@synx/shared';
 
-export type ConflictStrategy = 'newer-with-copy' | 'keep-local' | 'keep-remote' | 'pause';
+export type ConflictStrategy = 'newer-with-copy' | 'smart-merge' | 'keep-local' | 'keep-remote' | 'pause';
 export type HistoryStyle = 'cards' | 'timeline';
 
 export interface SynxPluginSettings {
@@ -98,7 +98,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   },
 };
 
-const conflictStrategies = new Set<ConflictStrategy>(['newer-with-copy', 'keep-local', 'keep-remote', 'pause']);
+const conflictStrategies = new Set<ConflictStrategy>(['newer-with-copy', 'smart-merge', 'keep-local', 'keep-remote', 'pause']);
 const historyStyles = new Set<HistoryStyle>(['cards', 'timeline']);
 const saveDelays = new Set([0, 5, 10, 30]);
 const concurrencyValues = new Set([1, 2, 3, 5, 10]);

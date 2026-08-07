@@ -67,6 +67,10 @@ describe('loadPluginSettings', () => {
     expect(settings.conflictStrategy).toBe('newer-with-copy');
   });
 
+  it('接受独立 Markdown 智能合并冲突策略', () => {
+    expect(loadPluginSettings({ conflictStrategy: 'smart-merge' }, false).conflictStrategy).toBe('smart-merge');
+  });
+
   it('uses a lower concurrency default on mobile', () => {
     expect(loadPluginSettings({}, true).concurrency).toBe(2);
     expect(loadPluginSettings({}, false).concurrency).toBe(5);

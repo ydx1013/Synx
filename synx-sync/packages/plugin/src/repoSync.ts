@@ -1,5 +1,6 @@
 import type { RepoChange, RepoCommit, RepoFile } from '@synx/shared';
-import type { RemoteEntity } from './syncAlgo.js';
+import type { LocalFile, PrevSyncEntry, RemoteEntity } from './syncAlgo.js';
+import type { SyncStartFileSnapshot } from './syncWriteGuard.js';
 
 /**
  * 仓库同步纯逻辑：仓库树 ↔ 计划用远端实体、上传结果组装 finalize 变更集。
@@ -69,6 +70,62 @@ export function treeToMap(tree: RepoFile[]): Map<string, RepoFile> {
   return new Map(tree.map((f) => [f.path, f]));
 }
 
+export async function updateRepoBaseAfterFinalize(
+  head: { commitId: string; generation: number },
+  readTree: (commitId: string) => Promise<RepoFile[]>,
+): Promise<{ head: { commitId: string; generation: number }; tree: RepoFile[] }> {
+  return { head, tree: await readTree(head.commitId) };
+}
+
+export function clearSmartMergeBase<T extends {
+  baseCommitId?: string;
+  entries: Record<string, PrevSyncEntry>;
+}>(state: T): T {
+  const { baseCommitId: _baseCommitId, ...withoutBase } = state;
+  return {
+    ...withoutBase,
+    entries: Object.fromEntries(Object.entries(state.entries).map(([path, entry]) => {
+      const { basePath: _basePath, ...metadata } = entry;
+      return [path, metadata];
+    })),
+  } as T;
+}
+
+export async function clearAndPersistSmartMergeBase<T extends {
+  baseCommitId?: string;
+  entries: Record<string, PrevSyncEntry>;
+}>(state: T, persist: (state: T) => Promise<void>): Promise<T> {
+  const cleared = clearSmartMergeBase(state);
+  await persist(cleared);
+  return cleared;
+}
+
+export async function clearAndQueuePersistSmartMergeBase<T extends {
+  baseCommitId?: string;
+  entries: Record<string, PrevSyncEntry>;
+}>(state: T, update: (state: T) => void, queueStateWrite: () => Promise<void>): Promise<T> {
+  return clearAndPersistSmartMergeBase(state, async (cleared) => {
+    update(cleared);
+    await queueStateWrite();
+  });
+}
+
+export async function refreshLocalSyncState<TSkipped>(
+  enumerate: () => Promise<{ files: LocalFile[]; skipped: TSkipped[] }>,
+): Promise<{ files: LocalFile[]; skipped: TSkipped[]; snapshot: Map<string, SyncStartFileSnapshot> }> {
+  const { files, skipped } = await enumerate();
+  return {
+    files,
+    skipped,
+    snapshot: new Map(files.map((file) => [file.path, {
+      exists: true,
+      mtime: file.mtime,
+      size: file.size,
+      hash: file.hash,
+    }])),
+  };
+}
+
 /**
  * 组装 finalize 变更集：
  * - 已上传 blob 的 path 在远端树中 → modify，否则 add
@@ -81,6 +138,10 @@ export function buildRepoChanges(
   deletes: RepoDelete[],
   currentTree: ReadonlyMap<string, RepoFile>,
 ): RepoChange[] {
+  const uploadPaths = new Set(uploads.map((upload) => upload.path));
+  for (const deletion of deletes) {
+    if (uploadPaths.has(deletion.path)) throw new Error(`同一路径不能同时上传和删除: ${deletion.path}`);
+  }
   const changes: RepoChange[] = [];
   for (const u of uploads) {
     if (u.previousPath) {

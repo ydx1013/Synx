@@ -182,10 +182,10 @@ describe('planSync - prevSync 三方比较', () => {
     expect(plan.stats.pull).toBe(1);
   });
 
-  it('两端都改了（!=prevSync）→ 冲突', () => {
-    const prev = new Map([prevEntry('a.md', 1000, 1000)]);
-    const plan = planSync([localFile('a.md', 5000)], [remoteEntity('a.md', 6000)], 1000, prev);
-    expect(plan.actions[0]).toMatchObject({ type: 'push', reason: 'conflict-keep-local' });
+  it('两端都改了（!=prevSync）→ 带远端身份和 basePath 的冲突 action', () => {
+    const prev = new Map<string, PrevSyncEntry>([['a.md', { ...prevEntry('a.md', 1000, 1000)[1], basePath: 'base/a.md' }]]);
+    const plan = planSync([localFile('a.md', 5000)], [{ ...remoteEntity('a.md', 6000), fileUuid: 'uuid-a' }], 1000, prev);
+    expect(plan.actions[0]).toMatchObject({ type: 'push', reason: 'conflict-keep-local', fileUuid: 'uuid-a', basePath: 'base/a.md' });
     expect(plan.stats.conflict).toBe(1);
   });
 

@@ -3,7 +3,7 @@ import type { Extension } from '@codemirror/state';
 import type { Entity } from '@synx/shared';
 import type { RepoChange, RepoFile, RepoFinalizeRequest, RepoFinalizeResponse, StorageCredentialsResponse } from '@synx/shared';
 import { evaluateFile } from './fileFilter.js';
-import { conflictCopyPath, resolveConflict } from './conflict.js';
+import { conflictCopyPath, preserveRemoteConflictCopy, resolveConflict } from './conflict.js';
 import { HistoryPaneView, HISTORY_VIEW_TYPE } from './historyPane.js';
 import { HistoryIndex } from './historyIndex.js';
 import { syncHistoryIndex } from './historyIndexSync.js';
@@ -13,7 +13,7 @@ import { listObsConfigFiles } from './obsConfigLister.js';
 import { loadPluginSettings, DEFAULT_REPORT_RETENTION, type SynxPluginSettings } from './settings.js';
 import { SynxSettingTab } from './settingsTab.js';
 import { hashContent, isLocalFileUnchangedFromPrev, planSync, shouldProtectAgainstMassDeletion, shouldProtectAgainstMassLocalDeletion, type LocalFile, type PrevSyncEntry, type PrevSyncMap, type SyncAction, type SyncPlan } from './syncAlgo.js';
-import { enqueueDeletion, pendingForTarget, type PendingDeletion } from './deletionQueue.js';
+import { acknowledgePendingDeletionsDurably, cancelRevivedPendingDeletions, collectPendingDeletions, enqueueDeletion, type PendingDeletion } from './deletionQueue.js';
 import { SyncDetailsView, SYNC_DETAILS_VIEW_TYPE } from './syncDetailsView.js';
 import { SyncExecutor, type ExecutableSyncAction, type SyncExecutionResult } from './syncExecutor.js';
 import { formatStatusBar } from './syncPresentation.js';
@@ -25,7 +25,7 @@ import { isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from 
 import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
 import { DirectRepositoryResolver } from './directRepositoryResolver.js';
 import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
-import { buildRepoChanges, commitAndIndex, repoTreeToRemote, treeToMap, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
+import { buildRepoChanges, clearAndQueuePersistSmartMergeBase, commitAndIndex, refreshLocalSyncState, repoTreeToRemote, treeToMap, updateRepoBaseAfterFinalize, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 import { uploadImageWithRetry } from './imageUpload.js';
 import { applyImageReplacements, buildFolderMigrationPlan, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl, type ImageCandidate } from './imageMigration.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
@@ -33,6 +33,7 @@ import { parsePrivateImageUrl } from './privateImage.js';
 import { ConfirmModal } from './settingsTab.js';
 import { clearCredentialCacheForAuthFailure, createCredentialCache, createSerialStateWriter, decryptStorageCredentials, encryptStorageCredentials, handleStorageAuthFailures, isCredentialRequestCurrent, persistRefreshedStorageCredentials, readCredentialCacheFromState, reconcileCredentialCacheSession, writeCredentialCacheToState, type CredentialCacheState, type CredentialRequestIdentity } from './credentialCache.js';
 import { decideLocalWriteProtection, hasChangedMarkdownEditor, protectedPullConflictPath, withoutProtectedPrevSyncEntries, type LocalWriteProtection, type MarkdownEditorSnapshot, type SyncStartFileSnapshot } from './syncWriteGuard.js';
+import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 
 class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
   constructor(app: App, private readonly folders: TFolder[], private readonly select: (folder: TFolder) => void) {
@@ -59,8 +60,10 @@ interface PersistedPluginData {
 }
 
 interface PrevSyncState {
-  version: 2;
+  version: 2 | 3;
   storageId: string;
+  /** version 3 起保存用于智能三方合并的准确共同基线提交 */
+  baseCommitId?: string;
   syncFolder: string;
   entries: { [path: string]: PrevSyncEntry };
 }
@@ -1071,15 +1074,26 @@ export default class SynxSyncPlugin extends Plugin {
     this.scheduler.notifySave();
   }
 
-  private async flushPendingDeletions(): Promise<void> {
-    if (!this.repositoryClient || !this.settings.storageId) return;
-    const target = { storageId: this.settings.storageId, syncFolder: this.settings.syncFolder };
-    for (const entry of pendingForTarget(this.pendingDeletions, target)) {
-      // git 模型下删除 = 提交中的 delete 变更（原子），不再单独 deleteFile
-      this.repoDeletes.set(entry.path, entry.fileUuid ?? `path:${entry.path}`);
-      this.pendingDeletions = this.pendingDeletions.filter((item) => item !== entry);
-    }
-    await this.persist();
+  private flushPendingDeletions(allowed: boolean): PendingDeletion[] {
+    if (!this.repositoryClient || !this.settings.storageId) return [];
+    return collectPendingDeletions(
+      this.pendingDeletions,
+      { storageId: this.settings.storageId, syncFolder: this.settings.syncFolder },
+      this.repoDeletes,
+      allowed,
+    );
+  }
+
+  private async acknowledgePendingDeletions(changes: readonly RepoChange[]): Promise<void> {
+    if (!this.settings.storageId) return;
+    await acknowledgePendingDeletionsDurably(
+      this.pendingDeletions,
+      { storageId: this.settings.storageId, syncFolder: this.settings.syncFolder },
+      changes,
+      (queue) => { this.pendingDeletions = queue; },
+      this.queueStateWrite,
+      () => this.pendingDeletions,
+    );
   }
 
   private handleAuthFailure(status: 401 | 403, storageId: string): void {
@@ -1110,13 +1124,8 @@ export default class SynxSyncPlugin extends Plugin {
     this.updateProgress();
     try {
       const prevSyncMap = this.getPrevSyncMap();
-      const { files, skipped } = await this.enumerateLocalFiles(prevSyncMap);
-      this.syncStartSnapshot = new Map(files.map((file) => [file.path, {
-        exists: true,
-        mtime: file.mtime,
-        size: file.size,
-        hash: file.hash,
-      }]));
+      let { files, skipped, snapshot } = await refreshLocalSyncState(() => this.enumerateLocalFiles(prevSyncMap));
+      this.syncStartSnapshot = snapshot;
       this.protectedLocalPaths.clear();
       this.protectedConflictPaths.clear();
       this.protectedLocalCount = 0;
@@ -1128,13 +1137,15 @@ export default class SynxSyncPlugin extends Plugin {
       let skippedRemote: ExecutableSyncAction[] = [];
       let attempt = 0;
       for (; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          ({ files, skipped, snapshot } = await refreshLocalSyncState(() => this.enumerateLocalFiles(prevSyncMap)));
+          this.syncStartSnapshot = snapshot;
+        }
         this.repoUploads.clear();
         this.repoDeletes.clear();
         this.repoTree = repo.tree;
         this.repoHeadCommitId = repo.head.commitId;
         this.repoHeadGeneration = repo.head.generation;
-        // 消化本地删除队列 → 收集进本次提交的 delete 变更
-        await this.flushPendingDeletions();
 
         // 远端树 → 过滤（被过滤的远端文件不参与同步计划，保留现有行为）
         const remoteEntities = repoTreeToRemote(repo.tree);
@@ -1198,7 +1209,9 @@ export default class SynxSyncPlugin extends Plugin {
         const protectPercent = this.settings.massDeleteProtectPercent;
         const prevSyncCount = prevSyncMap?.size ?? 0;
         const protectMass = !!prevSyncMap && !this.settings.allowBatchRemoteDelete;
-        if (protectMass && shouldProtectAgainstMassDeletion(files.length, prevSyncCount, protectPercent)) {
+        const remoteDeletionProtected = protectMass
+          && shouldProtectAgainstMassDeletion(files.length, prevSyncCount, protectPercent);
+        if (remoteDeletionProtected) {
           guardedActions = plan.actions.map((a) => {
             if (a.type !== 'delete-remote') return a;
             guardedDeletes++;
@@ -1218,6 +1231,21 @@ export default class SynxSyncPlugin extends Plugin {
             });
           }
         }
+        const revivedPaths = new Set(files.map((file) => file.path));
+        for (const action of guardedActions) {
+          if (action.type === 'push') revivedPaths.add(action.path);
+        }
+        await cancelRevivedPendingDeletions(
+          this.pendingDeletions,
+          { storageId: this.settings.storageId!, syncFolder: this.settings.syncFolder },
+          revivedPaths,
+          (queue) => { this.pendingDeletions = queue; },
+          this.queueStateWrite,
+          () => this.pendingDeletions,
+        );
+        // durable pending deletions 与计划 delete-remote 使用同一批量删除保护；
+        // 受保护时不加入本轮提交，finalize 后自然也不会被确认移除。
+        this.flushPendingDeletions(!remoteDeletionProtected);
         if (guardedDeletes > 0 || guardedLocalDeletes > 0) {
           console.warn('synx: mass deletion detected, protected data from deletion', { local: files.length, prevSync: prevSyncCount, guardedRemoteDeletes: guardedDeletes, guardedLocalDeletes, protectPercent });
           // #region debug-point B:mass-deletion-guard
@@ -1254,8 +1282,11 @@ export default class SynxSyncPlugin extends Plugin {
             message: `同步 ${changes.length} 个文件`,
             changes,
           }, client);
-          this.repoHeadCommitId = result.head.commitId;
-          this.repoHeadGeneration = result.head.generation;
+          await this.acknowledgePendingDeletions(changes);
+          repo = await updateRepoBaseAfterFinalize(result.head, (commitId) => client.repoTree(commitId));
+          this.repoHeadCommitId = repo.head.commitId;
+          this.repoHeadGeneration = repo.head.generation;
+          this.repoTree = repo.tree;
           break;
         } catch (error) {
           if (isRepoHeadConflict(error)) {
@@ -1549,8 +1580,10 @@ export default class SynxSyncPlugin extends Plugin {
   private async executeAction(action: Exclude<ExecutableSyncAction, { type: 'skip' }>, client: RepositoryClient): Promise<void | 'protected'> {
     if (action.type === 'push') {
       const original = action as SyncAction;
-      if (original.reason === 'conflict-keep-local') await this.executeOrdinaryConflict(action.path, client);
-      else await this.executePush(action.path, client);
+      if (original.reason === 'conflict-keep-local') {
+        if (this.settings.conflictStrategy === 'smart-merge') return this.executeSmartConflict(original, client);
+        await this.executeOrdinaryConflict(action.path, client);
+      } else await this.executePush(action.path, client);
     } else if (action.type === 'pull') {
       return this.executePull(action.path, client, action.fileUuid);
     } else if (action.type === 'delete-remote') {
@@ -1579,6 +1612,41 @@ export default class SynxSyncPlugin extends Plugin {
     }
   }
 
+  private async executeSmartConflict(action: Extract<SyncAction, { type: 'push' }>, client: RepositoryClient): Promise<void | 'protected'> {
+    const path = action.path;
+    const local = this.app.vault.getAbstractFileByPath(path);
+    if (!(local instanceof TFile) || !this.repoHeadCommitId) {
+      await this.executeOrdinaryConflict(path, client);
+      return;
+    }
+    const existingPaths = new Set(this.app.vault.getFiles().map((file) => file.path));
+    const conflictPath = conflictCopyPath(path, this.settings.deviceName, Date.now(), existingPaths);
+    const protectedPath = protectedPullConflictPath(path, this.settings.deviceName, Date.now(), existingPaths);
+    const result = await attemptSmartMarkdownMerge({
+      path,
+      baseCommitId: this.prevSync?.version === 3 ? this.prevSync.baseCommitId : undefined,
+      basePath: action.basePath,
+      readBase: (commitId, basePath) => client.repoContent(commitId, basePath),
+      readLocal: () => this.app.vault.readBinary(local),
+      readRemote: () => client.repoContent(this.repoHeadCommitId!, path),
+      inspectProtection: () => this.inspectLocalWriteProtection(path),
+      writeMerged: (content) => this.app.vault.modifyBinary(local, content),
+      writeConflictCopy: (content) => this.writeLocal(conflictPath, content),
+      writeProtectedCopy: (content) => this.writeLocal(protectedPath, content),
+    });
+    if (result.outcome === 'unavailable') {
+      await this.executeOrdinaryConflict(path, client);
+      return;
+    }
+    if (result.outcome === 'protected') {
+      this.protectedConflictPaths.set(path, protectedPath);
+      this.recordProtectedLocalPath(path);
+      return 'protected';
+    }
+    if (result.outcome === 'conflicted') throw new Error(`Markdown 智能合并存在重叠冲突，候选内容已保存到 ${conflictPath}`);
+    await this.executePush(path, client);
+  }
+
   private async executeOrdinaryConflict(path: string, client: RepositoryClient): Promise<void> {
     const remote = this.remoteEntities.find((entity) => entity.key.replace(/^\/+/, '') === path);
     if (!remote) return;
@@ -1595,24 +1663,17 @@ export default class SynxSyncPlugin extends Plugin {
       const resolution = resolveConflict({ path, localMtime, remoteMtime: remote.mtime, localType: 'file', remoteType: 'file' }, this.settings.conflictStrategy, this.settings.deviceName, Date.now(), existingPaths);
       if (resolution.paused) throw new Error('冲突策略要求暂停并报告');
       if (resolution.outcome === 'keep-local') {
-        try {
-          if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
-          const remoteContent = await client.repoContent(this.repoHeadCommitId, path);
-          await this.writeLocalViaAdapter(resolution.conflictPath, remoteContent);
-        } catch {
-          // 远端内容拉不到（提交被清理等），退化为直接推送本地
+        if (this.repoHeadCommitId) {
+          await preserveRemoteConflictCopy(
+            () => client.repoContent(this.repoHeadCommitId!, path),
+            (content) => this.writeLocalViaAdapter(resolution.conflictPath, content),
+          );
         }
         await this.executePush(path, client);
       } else {
-        try {
-          const localContent = await this.app.vault.adapter.readBinary(path);
-          await this.writeLocalViaAdapter(resolution.conflictPath, localContent);
-          await this.executePull(path, client);
-          return;
-        } catch {
-          // 远端内容拉不到时，退化为推送本地，避免冲突处理阻塞同步
-        }
-        await this.executePush(path, client);
+        const localContent = await this.app.vault.adapter.readBinary(path);
+        await this.writeLocalViaAdapter(resolution.conflictPath, localContent);
+        await this.executePull(path, client);
       }
       return;
     }
@@ -1622,24 +1683,17 @@ export default class SynxSyncPlugin extends Plugin {
     const resolution = resolveConflict({ path, localMtime: local.stat.mtime, remoteMtime: remote.mtime, localType: 'file', remoteType: 'file' }, this.settings.conflictStrategy, this.settings.deviceName, Date.now(), new Set(this.app.vault.getFiles().map((file) => file.path)));
     if (resolution.paused) throw new Error('冲突策略要求暂停并报告');
     if (resolution.outcome === 'keep-local') {
-      try {
-        if (!this.repoHeadCommitId) throw new Error('仓库基线未就绪');
-        const remoteContent = await client.repoContent(this.repoHeadCommitId, path);
-        await this.writeLocal(resolution.conflictPath, remoteContent);
-      } catch {
-        // 远端内容拉不到（提交被清理等），退化为直接推送本地
+      if (this.repoHeadCommitId) {
+        await preserveRemoteConflictCopy(
+          () => client.repoContent(this.repoHeadCommitId!, path),
+          (content) => this.writeLocal(resolution.conflictPath, content),
+        );
       }
       await this.executePush(path, client);
     } else {
-      try {
-        const localContent = await this.app.vault.readBinary(local);
-        await this.writeLocal(resolution.conflictPath, localContent);
-        await this.executePull(path, client);
-        return;
-      } catch {
-        // 远端内容拉不到时，退化为推送本地
-      }
-      await this.executePush(path, client);
+      const localContent = await this.app.vault.readBinary(local);
+      await this.writeLocal(resolution.conflictPath, localContent);
+      await this.executePull(path, client);
     }
   }
 
@@ -2030,11 +2084,13 @@ export default class SynxSyncPlugin extends Plugin {
           remoteHash: r?.hash ?? r?.etag ?? l.hash,
           remoteVersionId: r?.versionId,
           fileUuid: l.fileUuid,
+          basePath: r ? r.key.replace(/^\/+/, '') : undefined,
         };
       }
       this.prevSync = {
-        version: 2,
+        version: 3,
         storageId: this.settings.storageId,
+        baseCommitId: this.repoHeadCommitId ?? undefined,
         syncFolder: this.settings.syncFolder,
         entries,
       };
@@ -2043,6 +2099,13 @@ export default class SynxSyncPlugin extends Plugin {
       // #endregion
     } catch (error) {
       console.error('synx: failed to rebuild prevSync', error);
+      if (this.prevSync?.version === 3) {
+        this.prevSync = await clearAndQueuePersistSmartMergeBase(
+          this.prevSync,
+          (state) => { this.prevSync = state; },
+          this.queueStateWrite,
+        );
+      }
       // #region debug-point B:rebuild-prevsync
       dbg('B', 'main.ts:rebuildPrevSync', 'prevSync REBUILD FAILED', { error: error instanceof Error ? error.message : String(error) });
       // #endregion

@@ -216,7 +216,7 @@ export class SynxSettingTab extends PluginSettingTab {
   private renderConflicts(container: HTMLElement, settings: SynxPluginSettings): void {
     container.createEl('h3', { text: '冲突处理' });
     new Setting(container).setName('冲突策略').addDropdown((dropdown) => {
-      dropdown.addOption('newer-with-copy', '较新优先并保留副本').addOption('keep-local', '始终保留本地').addOption('keep-remote', '始终保留远端').addOption('pause', '暂停并报告');
+      dropdown.addOption('newer-with-copy', '较新优先并保留副本').addOption('smart-merge', 'Markdown 智能三方合并').addOption('keep-local', '始终保留本地').addOption('keep-remote', '始终保留远端').addOption('pause', '暂停并报告');
       dropdown.setValue(settings.conflictStrategy).onChange(async (value) => this.applyPatch({ conflictStrategy: value as ConflictStrategy }));
     });
   }
