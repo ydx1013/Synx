@@ -125,18 +125,23 @@ export class PluginStateRuntime extends PluginActionsRuntime {
   }
 
   public async persist(): Promise<void> {
-    // data.json 只保存 settings（不随同步报告频繁变化）。
-    // deviceName 是每设备独立状态，剥离出去存 state，避免 data.json 跨设备同步时
-    // 互相覆盖设备名（否则会导致"本地新→push→远端新→pull"的同步抖动）。
-    const { deviceName: _deviceName, ...syncableSettings } = this.settings;
+    // data.json 只保存账号级 settings（不随同步报告频繁变化）。
+    // 每设备独立状态（deviceName + 同步开关）剥离出去存 state，避免 data.json 跨设备同步时
+    // 互相覆盖（否则会导致"本地新→push→远端新→pull"的同步抖动）。
+    const { deviceName: _deviceName, periodicSyncEnabled: _periodicSyncEnabled, autoSyncIntervalMin: _autoSyncIntervalMin, startupSyncEnabled: _startupSyncEnabled, startupDelaySec: _startupDelaySec, saveSyncDelaySec: _saveSyncDelaySec, ...syncableSettings } = this.settings;
     await this.saveData({ settings: syncableSettings } satisfies PersistedPluginData);
-    // 运行时状态 + 设备名单独存储，永不被同步
+    // 运行时状态 + 设备名 + 同步开关单独存储，永不被同步
     await this.persistState();
   }
 
   public buildState(): SynxStateData {
     return writeCredentialCacheToState<SynxStateData>({
       deviceName: this.settings.deviceName,
+      periodicSyncEnabled: this.settings.periodicSyncEnabled,
+      autoSyncIntervalMin: this.settings.autoSyncIntervalMin,
+      startupSyncEnabled: this.settings.startupSyncEnabled,
+      startupDelaySec: this.settings.startupDelaySec,
+      saveSyncDelaySec: this.settings.saveSyncDelaySec,
       reports: this.reportStore.reports,
       pendingDeletions: this.pendingDeletions,
       knownRemoteFiles: this.knownRemoteFiles,

@@ -52,10 +52,15 @@ export class PluginSettingsRuntime extends PluginImageRuntime {
     if (this.settings.reportRetention === 1) this.settings.reportRetention = DEFAULT_REPORT_RETENTION;
     // reports / pendingDeletions / knownRemoteFiles / deviceName 从独立状态文件加载
     const state = await this.loadState();
-    // deviceName 是每设备独立状态，保存在 state（不同步）。优先取本机保存的设备名；
-    // 若 state 还没有（首次拆分或旧版升级），沿用旧版 data.json / 默认随机名，
+    // deviceName / 同步开关是每设备独立状态，保存在 state（不同步）。优先取本机保存的值；
+    // 若 state 还没有（首次拆分或旧版升级），沿用旧版 data.json / 默认值，
     // 并随下一次 persist 写入 state 完成迁移。
     if (state.deviceName) this.settings.deviceName = state.deviceName;
+    this.settings.periodicSyncEnabled = state.periodicSyncEnabled ?? this.settings.periodicSyncEnabled;
+    this.settings.autoSyncIntervalMin = state.autoSyncIntervalMin ?? this.settings.autoSyncIntervalMin;
+    this.settings.startupSyncEnabled = state.startupSyncEnabled ?? this.settings.startupSyncEnabled;
+    this.settings.startupDelaySec = state.startupDelaySec ?? this.settings.startupDelaySec;
+    this.settings.saveSyncDelaySec = state.saveSyncDelaySec ?? this.settings.saveSyncDelaySec;
     this.reportStore = new SyncReportStore([...state.reports], this.settings.reportRetention);
     this.pendingDeletions = [...(state.pendingDeletions ?? [])];
     this.knownRemoteFiles = [...(state.knownRemoteFiles ?? [])];
@@ -72,6 +77,11 @@ export class PluginSettingsRuntime extends PluginImageRuntime {
       const raw = JSON.parse(text) as unknown;
       if (isStateData(raw)) return {
         deviceName: raw.deviceName,
+        periodicSyncEnabled: raw.periodicSyncEnabled,
+        autoSyncIntervalMin: raw.autoSyncIntervalMin,
+        startupSyncEnabled: raw.startupSyncEnabled,
+        startupDelaySec: raw.startupDelaySec,
+        saveSyncDelaySec: raw.saveSyncDelaySec,
         reports: raw.reports,
         pendingDeletions: raw.pendingDeletions ?? [],
         knownRemoteFiles: raw.knownRemoteFiles ?? [],

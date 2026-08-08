@@ -203,6 +203,9 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
         }
       }
       if (attempt >= 2) throw new Error('同步冲突过多（远端提交被其他设备持续推进），请稍后重试');
+      // 拉取可能更新了 data.json（账号级配置同步）：重新加载设置，
+      // 让内存与磁盘一致，避免 persist() 用内存旧设置覆盖刚拉取的配置
+      if (this.wasDataFilePulled()) await this.reloadAccountSettingsFromDisk();
       // 同步完成后静默刷新历史面板（不显示 loading、不清空，避免闪烁），
       // 让当前笔记的历史记录立即反映最新版本（含本次 pull 下来的内容）
       this.refreshHistoryPanes(true);
@@ -260,6 +263,8 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
         console.warn('synx: failed to write sync failure log', writeError);
       }
       new Notice(`Synx 同步失败：${normalized.message}`, 5000);
+      // 失败也可能已拉取 data.json：同样重新加载，避免 persist() 用内存旧设置覆盖
+      if (this.wasDataFilePulled()) await this.reloadAccountSettingsFromDisk();
       await this.persist();
       this.updateProgress();
     }

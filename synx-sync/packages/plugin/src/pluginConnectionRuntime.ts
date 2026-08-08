@@ -37,7 +37,7 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
-import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
+import { RuntimeBase, STATE_FILE, DIRECT_UPLOAD_THRESHOLD, OBS_DEBUG_FILE, MAX_GC_ROUNDS, PLUGIN_DATA_FILE, isPersistedData, type PersistedPluginData, type PrevSyncState, type SynxStateData } from './pluginRuntimeBase.js';
 
 import { PluginSettingsRuntime } from './pluginSettingsRuntime.js';
 import type { RuntimeHost } from './pluginRuntimeBase.js';
@@ -105,7 +105,43 @@ export class PluginConnectionRuntime extends PluginSettingsRuntime {
     }
     this.finishSyncReport();
     this.invalidateProtectedPrevSyncEntries();
+    // 拉取可能更新了 data.json（账号级配置同步）：重新加载设置，避免 persist() 覆盖刚拉取的配置
+    if (this.wasDataFilePulled()) await this.reloadAccountSettingsFromDisk();
     await this.persist();
+  }
+
+  /** 本次同步是否拉取了插件数据文件（data.json）：拉取后需重新加载设置，避免内存旧值写回覆盖 */
+  protected wasDataFilePulled(): boolean {
+    const items = this.reportStore.current?.items ?? [];
+    return items.some((item) => item.path === PLUGIN_DATA_FILE && item.operation === 'pull' && item.status === 'success');
+  }
+
+  /** 重新从磁盘读取 data.json 的账号级设置（保留每设备独立状态），使内存与磁盘一致。
+   *  用于同步拉取更新了 data.json 之后，避免 persist() 把内存里的旧设置写回，
+   *  覆盖刚拉取的配置（否则会形成"拉取→写回→互相覆盖"的死循环）。 */
+  protected async reloadAccountSettingsFromDisk(): Promise<void> {
+    try {
+      const raw = await this.loadData() as unknown;
+      const structured = isPersistedData(raw);
+      const fresh = loadPluginSettings(structured ? raw.settings : raw, Platform.isMobile);
+      // 每设备独立状态以内存（state 来源）为权威：data.json 不含这些字段
+      fresh.deviceName = this.settings.deviceName;
+      fresh.periodicSyncEnabled = this.settings.periodicSyncEnabled;
+      fresh.autoSyncIntervalMin = this.settings.autoSyncIntervalMin;
+      fresh.startupSyncEnabled = this.settings.startupSyncEnabled;
+      fresh.startupDelaySec = this.settings.startupDelaySec;
+      fresh.saveSyncDelaySec = this.settings.saveSyncDelaySec;
+      const scopeChanged = fresh.serverUrl !== this.settings.serverUrl || fresh.jwt !== this.settings.jwt
+        || fresh.userId !== this.settings.userId || fresh.storageId !== this.settings.storageId
+        || fresh.syncFolder !== this.settings.syncFolder;
+      this.settings = fresh;
+      (this.host as { settings?: SynxPluginSettings }).settings = this.settings;
+      this.scheduler?.updateSettings(this.settings);
+      // 拉取到的配置切换了仓库作用域：重建客户端，让后续同步/历史使用新作用域
+      if (scopeChanged) this.rebuildClient();
+    } catch (error) {
+      console.warn('synx: failed to reload settings after data.json pull', error);
+    }
   }
 
   async rollbackFile(request: { path: string; targetCommitId: string; targetPath: string }): Promise<void> {

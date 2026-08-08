@@ -37,9 +37,23 @@ import { attemptSmartMarkdownMerge } from './smartMergeOrchestration.js';
 import { getRepositoryReadinessNotice, loadLoginStorages } from './connectionReadiness.js';
 import { loginSessionFromRepositoryScope, runForLoginSession, type LoginSessionSnapshot } from './loginSessionGuard.js';
 
+/** 每设备独立的同步开关（存 synx-state.json，不同步）：避免 data.json 跨设备同步时
+ *  互相覆盖这些开关（否则一台设备开启自动同步会连带所有设备开启，并引发同步抖动） */
+export const DEVICE_SYNC_PREF_KEYS = [
+  'periodicSyncEnabled',
+  'autoSyncIntervalMin',
+  'startupSyncEnabled',
+  'startupDelaySec',
+  'saveSyncDelaySec',
+] as const;
+export type DeviceSyncPrefKey = (typeof DEVICE_SYNC_PREF_KEYS)[number];
+
+/** Synx 插件数据文件（参与同步，仅含账号级设置） */
+export const PLUGIN_DATA_FILE = '.obsidian/plugins/synx-sync/data.json';
+
 export interface PersistedPluginData {
-  /** data.json 中不含 deviceName：它属于每设备独立状态，存 synx-state.json（不同步） */
-  settings: Omit<SynxPluginSettings, 'deviceName'>;
+  /** data.json 不含每设备独立状态（deviceName + 同步开关）：它们存 synx-state.json（不同步） */
+  settings: Omit<SynxPluginSettings, 'deviceName' | DeviceSyncPrefKey>;
 }
 
 export interface PrevSyncState {
@@ -54,6 +68,12 @@ export interface PrevSyncState {
 export interface SynxStateData {
   /** 每设备独立的设备名：存 state（不同步），避免 data.json 跨设备互相覆盖设备名 */
   deviceName?: string;
+  /** 每设备独立的同步开关（不同步）：避免 data.json 跨设备互相覆盖，导致一台设备开启自动同步连带所有设备开启 */
+  periodicSyncEnabled?: boolean;
+  autoSyncIntervalMin?: number;
+  startupSyncEnabled?: boolean;
+  startupDelaySec?: number;
+  saveSyncDelaySec?: number;
   reports: readonly SyncReport[];
   pendingDeletions?: readonly PendingDeletion[];
   knownRemoteFiles?: readonly { storageId: string; syncFolder: string; path: string; fileUuid?: string }[];
