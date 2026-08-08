@@ -8,7 +8,7 @@ import {
 } from './repositoryLock.js';
 
 function makeLockDb() {
-  const locks = new Map<string, string>();
+  const locks = new Map<string, { ownerToken: string; acquiredAt: number }>();
   const calls: Array<{ sql: string; values: unknown[] }> = [];
   return {
     prepare(sql: string) {
@@ -23,12 +23,17 @@ function makeLockDb() {
           if (sql.startsWith('INSERT OR IGNORE')) {
             const key = JSON.stringify(statement.values.slice(0, 3));
             if (locks.has(key)) return { success: true, meta: { changes: 0 } };
-            locks.set(key, String(statement.values[3]));
+            locks.set(key, { ownerToken: String(statement.values[3]), acquiredAt: Number(statement.values[5]) });
             return { success: true, meta: { changes: 1 } };
           }
           if (sql.startsWith('DELETE')) {
             const key = JSON.stringify(statement.values.slice(0, 3));
-            if (statement.values.length === 4 && locks.get(key) !== String(statement.values[3])) {
+            const current = locks.get(key);
+            if (sql.includes('acquired_at < ?')) {
+              const changed = current && current.acquiredAt < Number(statement.values[3]) && locks.delete(key) ? 1 : 0;
+              return { success: true, meta: { changes: changed } };
+            }
+            if (statement.values.length === 4 && current?.ownerToken !== String(statement.values[3])) {
               return { success: true, meta: { changes: 0 } };
             }
             const changed = locks.delete(key) ? 1 : 0;
@@ -41,7 +46,7 @@ function makeLockDb() {
     },
     locks,
     calls,
-  } as unknown as D1Database & { locks: Map<string, string>; calls: Array<{ sql: string; values: unknown[] }> };
+  } as unknown as D1Database & { locks: Map<string, { ownerToken: string; acquiredAt: number }>; calls: Array<{ sql: string; values: unknown[] }> };
 }
 
 const scope = { userId: 'user-1', storageId: 'storage-1', syncFolder: ' /Vault//Notes/ ' };
@@ -52,7 +57,7 @@ describe('repository D1 coordination lock', () => {
     expect(normalizeRepositoryScope('Vault\\Notes')).toBe('Vault/Notes');
   });
 
-  it('atomically rejects a competing owner and keeps the lock without TTL takeover', async () => {
+  it('atomically rejects a competing owner while the lock is fresh', async () => {
     const db = makeLockDb();
     let releaseFirst!: () => void;
     const first = withRepositoryLock(db, scope, 'finalize', () => new Promise<void>((resolve) => { releaseFirst = resolve; }));
@@ -67,13 +72,27 @@ describe('repository D1 coordination lock', () => {
     await first;
   });
 
+  it('removes an abandoned lock after its lease expires', async () => {
+    const db = makeLockDb();
+    let releaseFirst!: () => void;
+    const first = withRepositoryLock(db, scope, 'finalize', () => new Promise<void>((resolve) => { releaseFirst = resolve; }));
+    await vi.waitFor(() => expect(db.locks.size).toBe(1));
+    const key = [...db.locks.keys()][0];
+    const lock = db.locks.get(key)!;
+    db.locks.set(key, { ...lock, acquiredAt: Date.now() - 20 * 60_000 });
+
+    await expect(withRepositoryLock(db, scope, 'gc', async () => 'recovered')).resolves.toBe('recovered');
+    releaseFirst();
+    await first;
+  });
+
   it('retries transient owner-token release failures', async () => {
     const db = makeLockDb();
     const originalPrepare = db.prepare.bind(db);
     let deleteAttempts = 0;
     db.prepare = ((sql: string) => {
       const statement = originalPrepare(sql) as any;
-      if (!sql.startsWith('DELETE')) return statement;
+      if (!sql.includes('owner_token = ?')) return statement;
       const originalRun = statement.run.bind(statement);
       statement.run = async () => {
         deleteAttempts++;
@@ -93,7 +112,7 @@ describe('repository D1 coordination lock', () => {
     const originalPrepare = db.prepare.bind(db);
     db.prepare = ((sql: string) => {
       const statement = originalPrepare(sql) as any;
-      if (sql.startsWith('DELETE')) statement.run = async () => { throw new Error('D1 unavailable'); };
+      if (sql.includes('owner_token = ?')) statement.run = async () => { throw new Error('D1 unavailable'); };
       return statement;
     }) as D1Database['prepare'];
     await expect(withRepositoryLock(db, scope, 'gc', async () => 'ok')).rejects.toBeInstanceOf(RepositoryLockReleaseError);
@@ -104,7 +123,7 @@ describe('repository D1 coordination lock', () => {
     const originalPrepare = db.prepare.bind(db);
     db.prepare = ((sql: string) => {
       const statement = originalPrepare(sql) as any;
-      if (sql.startsWith('DELETE')) statement.run = async () => { throw new Error('D1 unavailable'); };
+      if (sql.includes('owner_token = ?')) statement.run = async () => { throw new Error('D1 unavailable'); };
       return statement;
     }) as D1Database['prepare'];
     const taskError = new Error('task failed');
@@ -130,11 +149,11 @@ describe('repository D1 coordination lock', () => {
 
     await withRepositoryLock(db, scope, 'finalize', async () => {
       const key = [...db.locks.keys()][0];
-      db.locks.set(key, 'new-owner');
+      db.locks.set(key, { ownerToken: 'new-owner', acquiredAt: Date.now() });
     });
-    expect([...db.locks.values()]).toEqual(['new-owner']);
+    expect([...db.locks.values()].map((lock) => lock.ownerToken)).toEqual(['new-owner']);
 
-    const deleteCall = db.calls.find(({ sql }) => sql.startsWith('DELETE'))!;
+    const deleteCall = db.calls.find(({ sql }) => sql.includes('owner_token = ?'))!;
     expect(deleteCall.sql).toContain('owner_token = ?');
     expect(deleteCall.values[3]).toEqual(expect.any(String));
   });

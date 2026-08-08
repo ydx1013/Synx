@@ -39,7 +39,13 @@ export async function uploadRepositoryBlob(
 
 export function isRepoHeadConflict(error: unknown): boolean {
   return error instanceof HeadConflictError
-    || (error instanceof WorkerApiError && error.status === 409);
+    || (error instanceof WorkerApiError && error.status === 409 && /HEAD_CONFLICT/.test(error.message));
+}
+
+export function isRepositoryLocked(error: unknown): boolean {
+  return error instanceof WorkerApiError
+    && error.status === 409
+    && /REPOSITORY_LOCKED/.test(error.message);
 }
 
 /** 服务端返回 422 BLOB_MISSING：finalize 引用的不可变 blob 已不存在（可能被 GC 清理） */

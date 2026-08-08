@@ -21,7 +21,7 @@ import { SyncReportStore, labelSyncReason, normalizeSyncError, type BackupSyncSt
 import { buildRetryActions } from './syncRetry.js';
 import { SyncScheduler } from './syncScheduler.js';
 import { WorkerClient } from './workerClient.js';
-import { isBlobMissingError, isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
+import { isBlobMissingError, isRepositoryLocked, isRepoHeadConflict, uploadRepositoryBlob, type RepositoryClient } from './repositoryClient.js';
 import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
 import { DirectRepositoryResolver } from './directRepositoryResolver.js';
 import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
@@ -189,6 +189,9 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
           this.repoTree = repo.tree;
           break;
         } catch (error) {
+          if (isRepositoryLocked(error)) {
+            throw new Error('远端仓库正在执行其他同步或维护操作，请稍后重试');
+          }
           if (isRepoHeadConflict(error)) {
             repo = await this.ensureRepoBase(client);
             continue;

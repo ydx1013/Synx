@@ -25,6 +25,7 @@ export function normalizeRepositoryScope(syncFolder: string): string {
 }
 
 const RELEASE_ATTEMPTS = 3;
+const LOCK_LEASE_MS = 15 * 60_000;
 
 async function releaseRepositoryLock(db: D1Database, scope: RepositoryLockScope, ownerToken: string): Promise<void> {
   let lastError: unknown;
@@ -58,6 +59,10 @@ export async function withRepositoryLock<T>(
 ): Promise<T> {
   const normalizedScope = { ...scope, syncFolder: normalizeRepositoryScope(scope.syncFolder) };
   const ownerToken = crypto.randomUUID();
+  const now = Date.now();
+  await db.prepare(
+    'DELETE FROM repository_locks WHERE user_id = ? AND storage_id = ? AND sync_folder = ? AND acquired_at < ?',
+  ).bind(normalizedScope.userId, normalizedScope.storageId, normalizedScope.syncFolder, now - LOCK_LEASE_MS).run();
   const acquired = await db.prepare(
     'INSERT OR IGNORE INTO repository_locks (user_id, storage_id, sync_folder, owner_token, operation, acquired_at) VALUES (?, ?, ?, ?, ?, ?)',
   ).bind(normalizedScope.userId, normalizedScope.storageId, normalizedScope.syncFolder, ownerToken, operation, Date.now()).run();

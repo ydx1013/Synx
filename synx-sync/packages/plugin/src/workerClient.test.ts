@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { WorkerClient } from './workerClient.js';
+import { WorkerApiError, WorkerClient } from './workerClient.js';
+import { isRepositoryLocked, isRepoHeadConflict } from './repositoryClient.js';
 
 const SERVER = 'https://synx.example.com';
 const JWT = 'jwt-token';
@@ -168,6 +169,20 @@ describe('direct upload', () => {
     const directInit = fetchMock.mock.calls[1][1] as RequestInit;
     expect(directInit.method).toBe('PUT');
     expect(directInit.headers).toBeUndefined();
+  });
+});
+
+describe('repository conflict classification', () => {
+  it('does not mistake a repository lock for a HEAD conflict', () => {
+    const locked = new WorkerApiError(409, '{"error":"repository operation is already in progress","code":"REPOSITORY_LOCKED"}');
+    expect(isRepositoryLocked(locked)).toBe(true);
+    expect(isRepoHeadConflict(locked)).toBe(false);
+  });
+
+  it('recognizes an explicit HEAD conflict response', () => {
+    const conflict = new WorkerApiError(409, '{"error":"repository head changed","code":"HEAD_CONFLICT"}');
+    expect(isRepositoryLocked(conflict)).toBe(false);
+    expect(isRepoHeadConflict(conflict)).toBe(true);
   });
 });
 
