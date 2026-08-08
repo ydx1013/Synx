@@ -80,7 +80,7 @@ export const DEFAULT_SETTINGS: SynxPluginSettings = {
   syncUnderscorePaths: false,
   ignorePatterns: [],
   allowPatterns: [],
-  conflictStrategy: 'newer-with-copy',
+  conflictStrategy: 'smart-merge',
   showStatusBar: true,
   reportRetention: DEFAULT_REPORT_RETENTION,
   showMarkdownUuid: false,
@@ -143,7 +143,11 @@ export function loadPluginSettings(raw: unknown, isMobile: boolean): SynxPluginS
     syncUnderscorePaths: booleanValue(source.syncUnderscorePaths, defaults.syncUnderscorePaths),
     ignorePatterns: normalizeRules(source.ignorePatterns),
     allowPatterns: normalizeRules(source.allowPatterns),
-    conflictStrategy: typeof source.conflictStrategy === 'string' && conflictStrategies.has(source.conflictStrategy as ConflictStrategy) ? source.conflictStrategy as ConflictStrategy : defaults.conflictStrategy,
+    conflictStrategy: source.conflictStrategy === 'newer-with-copy'
+      ? 'smart-merge'
+      : typeof source.conflictStrategy === 'string' && conflictStrategies.has(source.conflictStrategy as ConflictStrategy)
+        ? source.conflictStrategy as ConflictStrategy
+        : defaults.conflictStrategy,
     showStatusBar: booleanValue(source.showStatusBar, defaults.showStatusBar),
     reportRetention: validPositiveNumber(source.reportRetention) ? Math.min(MAX_REPORT_RETENTION, Math.floor(source.reportRetention)) : defaults.reportRetention,
     showMarkdownUuid: booleanValue(source.showMarkdownUuid, defaults.showMarkdownUuid),

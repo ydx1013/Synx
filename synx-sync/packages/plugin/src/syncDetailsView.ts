@@ -141,9 +141,17 @@ export class SyncDetailsView extends ItemView {
       reasonCounts.set(r, (reasonCounts.get(r) ?? 0) + 1);
     }
     const reasonStr = [...reasonCounts.entries()].map(([r, n]) => `${r} ${n}`).join(' · ');
-    const phase = reports[0]?.phase;
-    const head = phase ? `${phase} · ` : '';
-    const base = `${head}日志 ${visible.length} 条 · 成功 ${success} · 失败 ${failed} · 冲突 ${conflicts}${deletions > 0 ? ` · 删除 ${deletions}` : ''}`;
+    const latest = reports[0];
+    const phase = latest?.phase;
+    const result = phase === 'completed'
+      ? latest.commitStatus === 'committed'
+        ? '同步成功 · 远端原子提交已确认'
+        : latest.commitStatus === 'not-needed'
+          ? '同步成功 · 无需远端提交'
+          : '同步成功 · 同步已完成'
+      : phase === 'partial-failure' ? '部分失败' : phase ?? '';
+    const head = result ? `${result} · ` : '';
+    const base = `${head}日志 ${visible.length} 条 · 成功 ${success} · 失败 ${failed} · 已自动处理冲突 ${conflicts}${deletions > 0 ? ` · 删除 ${deletions}` : ''}`;
     return reasonStr ? `${base} | ${reasonStr}` : base;
   }
 

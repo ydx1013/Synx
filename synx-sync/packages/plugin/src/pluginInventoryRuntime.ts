@@ -133,9 +133,13 @@ export class PluginInventoryRuntime extends PluginSyncRuntime {
     if (report.stats.failed > 0) {
       new Notice(`Synx: ${report.stats.failed} 个文件失败`, 3000);
     } else if (this.protectedLocalCount > 0) {
-      new Notice(`Synx: 已保护 ${this.protectedLocalCount} 个同步期间编辑的文件`, 2500);
+      new Notice(`Synx: 同步成功，已保护 ${this.protectedLocalCount} 个同步期间编辑的文件`, 2500);
+    } else if (report.stats.conflicts > 0) {
+      new Notice(`Synx: 同步成功，已自动处理 ${report.stats.conflicts} 个冲突`, 2500);
+    } else if (report.commitStatus === 'committed') {
+      new Notice('Synx: 远端原子提交成功', 1800);
     } else if (report.stats.success > 0) {
-      new Notice(`Synx: 同步完成`, 1500);
+      new Notice('Synx: 同步成功，无需远端提交', 1800);
     }
     return report;
   }

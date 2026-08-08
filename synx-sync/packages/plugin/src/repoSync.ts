@@ -32,6 +32,12 @@ interface CommitIndexWriter {
   putCommits(commits: RepoCommit[], headCommitId: string): Promise<void>;
 }
 
+export const HEAD_CONFLICT_MAX_ATTEMPTS = 4;
+
+export function headConflictBackoffMs(conflictCount: number): number {
+  return Math.min(1000, 100 * Math.pow(2, conflictCount));
+}
+
 /** 主仓库操作成功后即时更新本地索引；索引故障不能反向破坏已成功的远端提交。 */
 export async function commitAndIndex<T extends CommitResult>(
   operation: () => Promise<T>,

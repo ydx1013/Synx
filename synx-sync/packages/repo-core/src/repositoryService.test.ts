@@ -453,6 +453,20 @@ describe('finalizeCommit（原子提交）', () => {
     ).rejects.toThrow(EmptyChangesError);
   });
 
+  it('已有外部锁时 If-Match 假冲突不依赖对象锁', async () => {
+    const fs = new MemFs(true, true);
+    const initial = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true });
+    const blob = makeStorageKey(SYNC_FOLDER, 'a.md', 'v1');
+    await fs.putText(blob, 'a');
+    fs.putIfNoneMatch = async () => false;
+
+    await expect(finalizeCommit({
+      storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true,
+      baseCommitId: initial.head.commitId, baseGeneration: initial.head.generation,
+      changes: [{ identity: 'u1', operation: 'add', path: 'a.md', blobId: blob, hash: 'h1', size: 1, mtime: 1 }],
+    })).resolves.toMatchObject({ head: { generation: 2 } });
+  });
+
   it('无条件写后端没有外部锁时拒绝 finalize，显式外部锁下仍检查基线', async () => {
     const fs = new MemFs(false);
     const initial = await initRepository({ storageId: 's1', syncFolder: SYNC_FOLDER, fs, externalLock: true });

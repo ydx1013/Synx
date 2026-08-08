@@ -254,6 +254,18 @@ describe('error handling', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
+
+  it('does not blindly retry finalize after an ambiguous network failure', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('response lost'));
+    const client = makeClient(fetchMock, { maxRetries: 2 });
+
+    await expect(client.finalizeCommit({
+      baseCommitId: 'c1',
+      baseGeneration: 1,
+      changes: [{ identity: 'u1', operation: 'delete', path: 'a.md' }],
+    })).rejects.toThrow('response lost');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('static methods', () => {

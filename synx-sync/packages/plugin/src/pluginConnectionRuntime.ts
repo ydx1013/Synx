@@ -97,11 +97,14 @@ export class PluginConnectionRuntime extends PluginSettingsRuntime {
         message: `重试同步 ${changes.length} 个文件`,
         changes,
       }, client);
+      this.reportStore.setCommitStatus('committed');
       // 原子提交成功后，复用的未提交 blob 已被提交引用，移除对应待提交记录
       if (this.settings.storageId) this.acknowledgeCommittedBlobUploads(this.settings.storageId, changes.map((c) => c.path));
       this.repoHeadCommitId = result.head.commitId;
       this.repoHeadGeneration = result.head.generation;
       this.refreshHistoryPanes(true);
+    } else if (syncFailed === 0) {
+      this.reportStore.setCommitStatus('not-needed');
     }
     this.finishSyncReport();
     this.invalidateProtectedPrevSyncEntries();

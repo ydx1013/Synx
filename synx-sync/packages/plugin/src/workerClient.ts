@@ -148,7 +148,8 @@ export class WorkerClient {
 
   /** 原子提交变更集（CAS）。HEAD 已被推进时抛 WorkerApiError(409) */
   async finalizeCommit(input: RepoFinalizeRequest): Promise<RepoFinalizeResponse> {
-    return this.request<RepoFinalizeResponse>('POST', API.repoFinalize, input);
+    const res = await this.requestResponse('POST', API.repoFinalize, input, false, 'application/octet-stream', 0);
+    return res.json() as Promise<RepoFinalizeResponse>;
   }
 
   /** 读取某提交下的文件内容（二进制，路径与 blob 解引用） */
@@ -287,8 +288,6 @@ export class WorkerClient {
       try {
         const headers = this.headers(body !== undefined, isBinary, binaryContentType);
         const bodyData = body !== undefined && !isBinary ? JSON.stringify(body) : body;
-        const bodyLen = typeof bodyData === 'string' ? bodyData.length : bodyData instanceof ArrayBuffer || bodyData instanceof Uint8Array ? bodyData.byteLength : 0;
-        console.log('synx request', { method, url, attempt: attempt + 1, bodyLen, timeoutMs });
         const res = await this.fetchImpl(url, {
           method,
           headers,
@@ -296,7 +295,6 @@ export class WorkerClient {
           signal: controller.signal,
         });
         const elapsed = Date.now() - startedAt;
-        console.log('synx response', { status: res.status, attempt: attempt + 1, elapsedMs: elapsed });
         if (res.status === 401) {
           this.opts.onAuthFailure?.(401, this.opts.storageId);
           this.opts.onUnauthorized?.();

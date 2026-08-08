@@ -77,6 +77,29 @@ describe('SyncReportStore', () => {
     expect(report.stats).toMatchObject({ success: 0, failed: 0, protected: 1, deleteLocal: 0 });
   });
 
+  it('归一化旧报告中缺失的统计字段和备份列表', () => {
+    const legacy = {
+      id: 'legacy', trigger: 'manual', startedAt: 1, phase: 'completed', items: [],
+      stats: { success: 1, failed: 0, skipped: 2, conflicts: 0, push: 0, pull: 0 },
+    } as unknown as SyncReport;
+
+    const report = new SyncReportStore([legacy], 20).current!;
+
+    expect(report.stats).toMatchObject({ protected: 0, deleteLocal: 0, deleteRemote: 0 });
+    expect(report.backups).toEqual([]);
+  });
+
+  it('持久记录远端原子提交是否已确认', () => {
+    const store = new SyncReportStore([], 20);
+    store.start('manual', 1);
+    store.setCommitStatus('committed');
+    expect(store.finish(2).commitStatus).toBe('committed');
+
+    store.start('save', 3);
+    store.setCommitStatus('not-needed');
+    expect(store.finish(4).commitStatus).toBe('not-needed');
+  });
+
   it('records backup storage results and replaces duplicates', () => {
     const store = new SyncReportStore([], 20);
     store.start('manual', 1);

@@ -13,6 +13,8 @@ import {
   refreshLocalSyncState,
   clearSmartMergeBase,
   clearAndPersistSmartMergeBase,
+  HEAD_CONFLICT_MAX_ATTEMPTS,
+  headConflictBackoffMs,
 } from './repoSync.js';
 
 function file(path: string, identity: string, hash = 'h', blobId = `b-${path}`): RepoFile {
@@ -131,6 +133,14 @@ describe('clearSmartMergeBase', () => {
 
     await expect(clearAndQueuePersistSmartMergeBase(current, (state) => { current = state; }, queueStateWrite)).rejects.toBe(writerError);
     expect(diskWrite).toHaveBeenCalledWith({ version: 3, entries: {} });
+  });
+});
+
+describe('HEAD 冲突自动收敛参数', () => {
+  it('允许初次提交加三次重新规划，并使用有界指数退避', () => {
+    expect(HEAD_CONFLICT_MAX_ATTEMPTS).toBe(4);
+    expect([0, 1, 2].map(headConflictBackoffMs)).toEqual([100, 200, 400]);
+    expect(headConflictBackoffMs(10)).toBe(1000);
   });
 });
 

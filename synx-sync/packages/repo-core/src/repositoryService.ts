@@ -216,6 +216,10 @@ async function casWriteHead(
     // 锁路径内部会再次校验，仍可保证并发下不覆盖他人提交。
     const latest = await readHead(fs, syncFolder);
     if (latest && latest.generation === expected.generation && latest.commitId === expected.commitId) {
+      if (externalLock) {
+        await fs.put(key, encoded);
+        return true;
+      }
       return withRepoLock(fs, syncFolder, async () => {
         const again = await readHead(fs, syncFolder);
         if (!again || again.generation !== expected.generation || again.commitId !== expected.commitId) return false;

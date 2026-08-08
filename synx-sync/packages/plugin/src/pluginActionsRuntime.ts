@@ -189,7 +189,6 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
    * 不立即提交：变更集由调用方汇总后一次性 finalize。
    */
   public async uploadToClient(client: RepositoryClient, path: string, target: Map<string, RepoUploadedFile>): Promise<void> {
-    console.log('synx push start', { path });
     let content: ArrayBuffer;
     let mtime: number;
     let fileUuid: string | undefined;
@@ -199,7 +198,6 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
       if (!stat || stat.type !== 'file') throw Object.assign(new Error('本地文件已不存在'), { code: 'ENOENT' });
       content = await this.app.vault.adapter.readBinary(path);
       mtime = stat.mtime > 0 ? stat.mtime : stat.ctime;
-      console.log('synx push .obsidian file', { path, size: content.byteLength });
     } else {
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) throw Object.assign(new Error('本地文件已不存在'), { code: 'ENOENT' });
@@ -219,10 +217,8 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
         }
         if (finalText !== text) await this.app.vault.modify(file, finalText);
         content = new TextEncoder().encode(finalText).buffer;
-        console.log('synx push markdown', { path, uuid: fileUuid, size: content.byteLength });
       } else {
         content = await this.app.vault.readBinary(file);
-        console.log('synx push binary', { path, size: content.byteLength });
       }
     }
     const hash = await hashContent(content);
@@ -240,7 +236,6 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
           mtime: pending.mtime,
           identity: pending.identity,
         });
-        console.log('synx push reuse pending blob', { path, blobId: pending.blobId });
         return;
       }
     }
@@ -255,7 +250,6 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
         identity: fileUuid ?? `path:${path}`,
       });
       if (storageId) this.recordPendingBlobUpload({ storageId, path, hash, blobId, size: content.byteLength, mtime, identity: fileUuid ?? `path:${path}` });
-      console.log('synx push done', { path, blobId });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       // "Failed to fetch" 通常是服务端 503/CORS 被浏览器拦截，给用户更明确的提示
@@ -383,6 +377,7 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
     await this.ensureParentDir(path);
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, content);
+    else if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.writeBinary(path, content);
     else await this.app.vault.createBinary(path, content);
   }
 
@@ -403,7 +398,9 @@ export class PluginActionsRuntime extends PluginInventoryRuntime {
     for (const part of parts) {
       if (!part) continue;
       current = current ? `${current}/${part}` : part;
-      if (!this.app.vault.getAbstractFileByPath(current)) await this.app.vault.createFolder(current);
+      const indexed = this.app.vault.getAbstractFileByPath(current) !== null;
+      const adapterExists = await this.app.vault.adapter.exists(current);
+      if (!indexed && !adapterExists) await this.app.vault.createFolder(current);
     }
   }
 

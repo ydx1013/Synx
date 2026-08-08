@@ -25,7 +25,7 @@ import { isBlobMissingError, isRepositoryLocked, isRepoHeadConflict, uploadRepos
 import { isStorageCredentialError, RepositoryTransportSelector } from './repositoryTransportSelector.js';
 import { DirectRepositoryResolver } from './directRepositoryResolver.js';
 import { RepositoryWriteCoordinator } from './repositoryWriteCoordinator.js';
-import { buildRepoChanges, clearAndQueuePersistSmartMergeBase, commitAndIndex, refreshLocalSyncState, repoTreeToRemote, treeToMap, updateRepoBaseAfterFinalize, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
+import { buildRepoChanges, clearAndQueuePersistSmartMergeBase, commitAndIndex, HEAD_CONFLICT_MAX_ATTEMPTS, headConflictBackoffMs, refreshLocalSyncState, repoTreeToRemote, treeToMap, updateRepoBaseAfterFinalize, type RepoDelete, type RepoUploadedFile } from './repoSync.js';
 import { uploadImageWithRetry } from './imageUpload.js';
 import { applyImageReplacements, buildFolderMigrationPlan, containsAttachmentReference, findImageCandidates, isCurrentGalleryUrl, isSafeExternalImageUrl, type ImageCandidate } from './imageMigration.js';
 import { collectReferencedImagePaths, pendingUploadKey, replaceExactEmbed, type PendingImageUpload } from './pendingImageUploads.js';
@@ -70,7 +70,9 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
       let plan: SyncPlan | null = null;
       let skippedRemote: ExecutableSyncAction[] = [];
       let attempt = 0;
-      for (; attempt < 2; attempt++) {
+      let headConflictCount = 0;
+      let retryExhausted = false;
+      for (; attempt < HEAD_CONFLICT_MAX_ATTEMPTS; attempt++) {
         if (attempt > 0) {
           ({ files, skipped, snapshot } = await refreshLocalSyncState(() => this.enumerateLocalFiles(prevSyncMap)));
           this.syncStartSnapshot = snapshot;
@@ -169,7 +171,10 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
           [...this.repoDeletes.entries()].map(([path, identity]) => ({ path, identity }) as RepoDelete),
           treeToMap(this.repoTree),
         );
-        if (changes.length === 0) break;
+        if (changes.length === 0) {
+          this.reportStore.setCommitStatus('not-needed');
+          break;
+        }
 
         // CAS 原子提交；HEAD 已被其他设备推进（409）→ 重拉基线重新计划
         try {
@@ -180,6 +185,7 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
             message: `同步 ${changes.length} 个文件`,
             changes,
           }, client);
+          this.reportStore.setCommitStatus('committed');
           await this.acknowledgePendingDeletions(changes);
           // 原子提交成功后，复用的未提交 blob 已被提交引用，移除对应待提交记录
           if (this.settings.storageId) this.acknowledgeCommittedBlobUploads(this.settings.storageId, changes.map((c) => c.path));
@@ -193,6 +199,12 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
             throw new Error('远端仓库正在执行其他同步或维护操作，请稍后重试');
           }
           if (isRepoHeadConflict(error)) {
+            headConflictCount++;
+            if (attempt + 1 >= HEAD_CONFLICT_MAX_ATTEMPTS) {
+              retryExhausted = true;
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, headConflictBackoffMs(headConflictCount - 1)));
             repo = await this.ensureRepoBase(client);
             continue;
           }
@@ -205,7 +217,7 @@ export class PluginSyncRuntime extends PluginConnectionRuntime {
           throw error;
         }
       }
-      if (attempt >= 2) throw new Error('同步冲突过多（远端提交被其他设备持续推进），请稍后重试');
+      if (retryExhausted) throw new Error('同步冲突自动处理未能收敛，请稍后重试');
       // 拉取可能更新了 data.json（账号级配置同步）：重新加载设置，
       // 让内存与磁盘一致，避免 persist() 用内存旧设置覆盖刚拉取的配置
       if (this.wasDataFilePulled()) await this.reloadAccountSettingsFromDisk();

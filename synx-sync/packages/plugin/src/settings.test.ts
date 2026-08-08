@@ -64,11 +64,18 @@ describe('loadPluginSettings', () => {
     expect(settings.maxFileSizeMb).toBe(20);
     expect(settings.concurrency).toBe(5);
     expect(settings.reportRetention).toBe(100);
-    expect(settings.conflictStrategy).toBe('newer-with-copy');
+    expect(settings.conflictStrategy).toBe('smart-merge');
   });
 
-  it('接受独立 Markdown 智能合并冲突策略', () => {
-    expect(loadPluginSettings({ conflictStrategy: 'smart-merge' }, false).conflictStrategy).toBe('smart-merge');
+  it('默认自动合并 Markdown 冲突', () => {
+    expect(loadPluginSettings({}, false).conflictStrategy).toBe('smart-merge');
+  });
+
+  it('将旧默认冲突策略迁移为智能合并，同时保留显式覆盖策略', () => {
+    expect(loadPluginSettings({ conflictStrategy: 'newer-with-copy' }, false).conflictStrategy).toBe('smart-merge');
+    expect(loadPluginSettings({ conflictStrategy: 'keep-local' }, false).conflictStrategy).toBe('keep-local');
+    expect(loadPluginSettings({ conflictStrategy: 'keep-remote' }, false).conflictStrategy).toBe('keep-remote');
+    expect(loadPluginSettings({ conflictStrategy: 'pause' }, false).conflictStrategy).toBe('pause');
   });
 
   it('uses a lower concurrency default on mobile', () => {

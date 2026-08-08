@@ -45,6 +45,8 @@ export interface BackupSyncStats {
 export interface SyncReport {
   id: string;
   trigger: SyncTrigger;
+  /** 主仓库本轮是否完成了已确认的原子提交 */
+  commitStatus?: 'committed' | 'not-needed';
   startedAt: number;
   endedAt?: number;
   phase: SyncPhase;
@@ -59,7 +61,16 @@ export class SyncReportStore {
   private history: SyncReport[];
 
   constructor(saved: SyncReport[], private retention: number) {
-    this.history = saved.slice(0, retention);
+    this.history = saved.slice(0, retention).map((report) => ({
+      ...report,
+      stats: {
+        ...report.stats,
+        protected: report.stats.protected ?? 0,
+        deleteLocal: report.stats.deleteLocal ?? 0,
+        deleteRemote: report.stats.deleteRemote ?? 0,
+      },
+      backups: report.backups ?? [],
+    }));
     this.active = this.history[0] ?? null;
   }
 
@@ -92,6 +103,10 @@ export class SyncReportStore {
     if (!this.active) return;
     this.active.stats.push = push;
     this.active.stats.pull = pull;
+  }
+
+  setCommitStatus(status: 'committed' | 'not-needed'): void {
+    if (this.active) this.active.commitStatus = status;
   }
 
   /** 记录一个备份存储的镜像结果（成功或整体失败） */
